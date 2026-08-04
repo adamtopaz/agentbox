@@ -178,6 +178,25 @@ its ciphertext.
   limit gateway logging in the Cloudflare dashboard. Host-side logs stay
   metadata-only regardless.
 
+## Agents in the image
+
+`claude` and `codex` are wired through the proxy and verified working.
+Provisioning fails the build if any agent installs without producing its
+binary — npm exiting 0 does not prove the command exists, as a package can
+install cleanly and ship a differently-named one.
+
+`pi` is installed but **not yet routed through the proxy**. Its
+`cloudflare-ai-gateway` provider constructs Cloudflare URLs itself and would
+go direct; the only key inside the container is a dummy, so it fails rather
+than leaking, but it will not work until its provider baseUrl is overridden
+(see spec §10.3 for the leads). `claude` and `codex` are unaffected.
+
+Check what an image actually shipped:
+
+```sh
+incus exec <container> -- cat /etc/agentbox-image
+```
+
 ## Rebuild the base image
 
 ```sh

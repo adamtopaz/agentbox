@@ -65,10 +65,24 @@ chmod 0440 /etc/sudoers.d/agent
 visudo -c >/dev/null
 
 echo "==> coding agents (root-owned npm globals; self-update disabled by construction)"
-npm install -g @anthropic-ai/claude-code @openai/codex
-# pi (badlogic/pi-mono). Package name to verify at build time (spec §10.3);
-# a failed install must not sink the whole image.
-npm install -g @mariozechner/pi || echo "WARN: pi install failed — check the package name in badlogic/pi-mono"
+# pi lives under @earendil-works now (it moved from @mariozechner, whose
+# @mariozechner/pi still exists but ships a `pi-pods` binary — installing it
+# succeeds and leaves no `pi` command, which is how this went unnoticed).
+npm install -g @anthropic-ai/claude-code @openai/codex @earendil-works/pi-coding-agent
+
+# Verify each agent actually produced the binary it is supposed to. npm exiting
+# 0 is not evidence: the wrong package installs cleanly and simply provides a
+# differently-named command. Failing here beats publishing an image that is
+# quietly short a tool.
+missing=""
+for cmd in claude codex pi; do
+    command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
+done
+if [ -n "$missing" ]; then
+    echo "ERROR: these agents installed but produced no binary:$missing" >&2
+    echo "       check the package names — a package can install fine and ship a different command" >&2
+    exit 1
+fi
 
 echo "==> proxy wiring: environment"
 # Login shells (agentbox shell) read profile.d; PAM-less exec paths read
@@ -155,9 +169,9 @@ echo "==> image marker"
 {
     echo "agentbox-base built ${AGENTBOX_BUILD_DATE:-unknown}"
     echo "node: $(node --version 2>/dev/null || echo none)"
-    echo "claude: $(command -v claude >/dev/null && claude --version 2>/dev/null || echo none)"
-    echo "codex: $(command -v codex >/dev/null && codex --version 2>/dev/null || echo none)"
-    echo "pi: $(command -v pi >/dev/null && pi --version 2>/dev/null || echo none)"
+    echo "claude: $(claude --version 2>/dev/null | head -1)"
+    echo "codex: $(codex --version 2>/dev/null | head -1)"
+    echo "pi: $(pi --version 2>/dev/null | head -1)"
 } > /etc/agentbox-image
 
 echo "==> provision complete"
