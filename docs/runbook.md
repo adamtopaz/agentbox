@@ -178,10 +178,23 @@ incus exec <container> -- su - agent -c 'curl -sS -X POST \
        \"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"'
 ```
 
-**Why both exist:** the newest models are served only on the REST endpoint. On
-the provider-native passthrough they get no credential attached and are
-forwarded bare, so the provider answers `401 x-api-key header is required` —
-see the 401 note above. Confirmed 2026-08-04 with `claude-fable-5`.
+**Why both exist:** on the provider-native passthrough, some models get no
+credential attached and are forwarded bare, so the provider answers
+`401 x-api-key header is required` — see the 401 note above. Confirmed
+2026-08-04: `claude-fable-5` behaves identically there to an invented
+`claude-bogus-99`, while `claude-opus-5` and `claude-sonnet-5` return 200 over
+the same route with the same token. Cloudflare's model page for `claude-fable-5`
+lists only `env.AI.run()` and the REST endpoint as ways to call it, which is why
+this route exists.
+
+> **Status: unverified.** The REST route is built and renders correctly, but as
+> of 2026-08-04 it has *not* been observed serving `claude-fable-5`
+> successfully — the model was still failing after this route was added. So the
+> inference "these models are reachable via the REST endpoint" is supported by
+> Cloudflare's docs but **not** confirmed here. Do not treat the example above
+> as tested. Likely next things to eliminate: whether `cf-aig-token-<gw>` has
+> the permission this endpoint needs (see below), and whether the account needs
+> Cloudflare credits loaded for Unified Billing.
 
 **What the REST route cannot do:** because the model name lives in the body and
 agentbox never rewrites bodies, a client that sends bare model ids cannot reach
