@@ -222,17 +222,26 @@ fi
 # pi resolves a provider's endpoint as extension > models.json > built-in, and
 # honours no *_BASE_URL environment variable (docs/models.md, "Overriding
 # Built-in Providers"; docs/environment-variables.md lists none). So its
-# providers have to be redirected declaratively here, or pi talks to Anthropic,
-# OpenAI and Cloudflare directly — failing closed against the dummy keys, but
-# bypassing the proxy entirely.
+# providers have to be redirected declaratively here, or pi talks to Anthropic
+# and OpenAI directly — failing closed against the dummy keys, but bypassing
+# the proxy entirely.
+#
+# Deliberately NOT overridden: cloudflare-ai-gateway. Its models each carry
+# their own baseUrl from pi's remote catalog, already ending in the provider
+# segment, e.g.
+#   https://gateway.ai.cloudflare.com/v1/{ACCOUNT}/{GATEWAY}/anthropic
+# A provider-level override replaces that whole URL and loses the segment, so
+# pi requests <base>/v1/messages and Cloudflare reads "v1" as the provider name
+# and answers 400 Invalid provider. Those models reach the same upstreams as
+# the anthropic/openai providers above, which are proxied, so use those; the
+# gateway provider is left to fail closed on its dummy key.
 if id agent >/dev/null 2>&1; then
   install -d -o agent -g agent -m 0755 /home/agent/.pi /home/agent/.pi/agent
   cat > /home/agent/.pi/agent/models.json <<EOF
 {
   "providers": {
     "anthropic": { "baseUrl": "$GW/anthropic" },
-    "openai": { "baseUrl": "$GW/openai" },
-    "cloudflare-ai-gateway": { "baseUrl": "$GW" }
+    "openai": { "baseUrl": "$GW/openai" }
   }
 }
 EOF

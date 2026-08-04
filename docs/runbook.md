@@ -185,6 +185,13 @@ Provisioning fails the build if any agent installs without producing its
 binary — npm exiting 0 does not prove the command exists, as a package can
 install cleanly and ship a differently-named one.
 
+In pi, use the **`anthropic`** and **`openai`** providers
+(`pi --model anthropic/claude-opus-5`). Its `cloudflare-ai-gateway` provider is
+deliberately not proxied: those models carry a per-model `baseUrl` from pi's
+remote catalog that already includes the provider segment, so a provider-level
+override loses it and Cloudflare answers `400 Invalid provider`. They reach the
+same upstreams as the two proxied providers anyway.
+
 `pi` is routed by `~/.pi/agent/models.json`, written per container by
 `agentbox create`. pi honours no `*_BASE_URL` environment variable — it
 resolves a provider's endpoint as extension > models.json > built-in — so
