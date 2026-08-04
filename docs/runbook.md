@@ -176,7 +176,15 @@ DNS names are deliberately not trusted as proof of a local transport.
 Matching order is exact-host routes, then longest path prefix. For otherwise
 equivalent selectors, a route in the container's concrete scope wins over the
 universal `"*"` route. `path_map` entries match exact post-strip paths and do
-not cascade.
+not cascade. `request_json.string_prefixes` applies idempotent prefixes to
+selected top-level JSON string fields. `join_string_arrays` joins a selected
+string field from each object in a top-level array.
+`hoist_array_object_strings` removes matching objects from a top-level array
+and appends their string or text-block-array content to a top-level string.
+`remove_fields` idempotently removes selected top-level fields, and `drop_query`
+prevents the inbound query from reaching the upstream. JSON transforms accept
+only unencoded objects, buffer at most 64 MiB, and fail closed before resolving
+route material.
 
 Provider helpers are optional route generators:
 
@@ -216,9 +224,19 @@ containers intentionally share one source. GitHub operations are attributed to
 the App installation. Commands that require a human-user-only API endpoint may
 not work; validate the exact `gh` operations and App permissions used by agents.
 
-The Cloudflare profile creates only the provider-native AI Gateway route for
-each named scope. It intentionally does not preserve the old, unverified
-Cloudflare REST route.
+The Cloudflare profile creates a provider-native route plus a longer
+Anthropic-specific route for each named scope. OpenAI continues through the
+provider-native endpoint. The Anthropic route uses Cloudflare's unified
+`/ai/v1/messages` endpoint, injects the gateway token as host-side
+`Authorization`, supplies `cf-aig-gateway-id`, maps `/v1/messages` to
+`/messages`, drops Claude Code's unsupported `beta` query, joins Anthropic
+system text blocks into the string expected by the unified endpoint, folds
+Claude Code's system-role messages into that top-level string, removes its
+unsupported `context_management` extension, and prefixes the JSON `model` field
+with `anthropic/`. This keeps normal pi and Claude Code model names working
+while supporting models that are available through Unified Billing before the
+provider-native endpoint. The container receives only loopback URLs and dummy
+keys.
 
 ## Containers
 

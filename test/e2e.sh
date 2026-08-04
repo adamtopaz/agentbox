@@ -42,17 +42,27 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        payload = json.dumps({
+    def respond(self, body=None):
+        response = {
             "path": self.path.split("?", 1)[0],
             "query": self.path.split("?", 1)[1] if "?" in self.path else "",
             "headers": dict(self.headers.items()),
-        }).encode()
+        }
+        if body is not None:
+            response["body"] = json.loads(body)
+        payload = json.dumps(response).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def do_GET(self):
+        self.respond()
+
+    def do_POST(self):
+        length = int(self.headers.get("content-length", "0"))
+        self.respond(self.rfile.read(length))
 
     def log_message(self, *_):
         pass
@@ -138,6 +148,48 @@ assert "cf-aig-collect-log" not in h, h
 assert "container-fake" not in json.dumps(h), h
 PY
 
+cat > "$WORK/json-transform-route.json" <<EOF
+{
+  "name": "json-transform",
+  "scope": "test",
+  "match": {"path_prefix": "/transform"},
+  "upstream": "http://127.0.0.1:${PORT}",
+  "strip_prefix": true,
+  "drop_query": true,
+  "request_json": {
+    "join_string_arrays": [
+      {"field": "system", "element_field": "text", "separator": "\n\n"}
+    ],
+    "hoist_array_object_strings": [
+      {
+        "source_field": "messages", "match_field": "role", "match_value": "system",
+        "value_field": "content", "element_field": "text", "target_field": "system",
+        "separator": "\n\n"
+      }
+    ],
+    "string_prefixes": [
+      {"field": "model", "prefix": "anthropic/"}
+    ],
+    "remove_fields": ["context_management"]
+  }
+}
+EOF
+abx route put "$WORK/json-transform-route.json"
+RESPONSE=$(proxy -H 'content-type: application/json' \
+    --data '{"model":"claude-fable-5","system":[{"text":"first"},{"text":"second"}],"messages":[{"role":"user","content":[{"text":"hello"}]},{"role":"system","content":[{"text":"third"}]}],"context_management":{"edits":[]}}' \
+    'http://agentbox/transform/messages?beta=true')
+python3 - "$RESPONSE" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["path"] == "/messages", d
+assert d["query"] == "", d
+assert d["body"]["model"] == "anthropic/claude-fable-5", d
+assert d["body"]["system"] == "first\n\nsecond\n\nthird", d
+assert len(d["body"]["messages"]) == 1, d
+assert d["body"]["messages"][0]["role"] == "user", d
+assert "context_management" not in d["body"], d
+PY
+
 # Key rotation is live and does not restart or rewrite routes.
 printf '%s' real-two | abx key set token
 RESPONSE=$(proxy 'http://agentbox/echo/rotated')
@@ -211,7 +263,7 @@ control -X PATCH -H 'content-type: application/json' -d '{"blocked":false}' \
 [[ $(proxy -o /dev/null -w '%{http_code}' http://agentbox/echo/x) == 200 ]] \
     || fail "live unblock did not restore the route"
 
-abx status | grep -q '9 routes, 1 keys, 1 containers, 1 credential sources, 1 credential grants' \
+abx status | grep -q '10 routes, 1 keys, 1 containers, 1 credential sources, 1 credential grants' \
     || fail "health counts are wrong"
 for leak in QUERYSECRET container-fake real-one real-two; do
     if grep -Fq "$leak" "$WORK/daemon.log"; then

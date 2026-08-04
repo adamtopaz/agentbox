@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -86,6 +88,172 @@ func TestProxyStripsThenInjects(t *testing.T) {
 	server.Handler("dev").ServeHTTP(rec, req)
 	if rec.Code != 200 || rec.Body.String() != "ok" {
 		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestProxyTransformsTopLevelJSONStringPrefixes(t *testing.T) {
+	state := domain.NewState()
+	state.Containers = []domain.Container{{Name: "dev", Scope: "prod", CreatedAt: time.Now()}}
+	state.Routes = []domain.Route{{
+		Name: "unified", Scope: "prod", Match: domain.Match{PathPrefix: "/anthropic"},
+		Upstream: "https://upstream.invalid/ai/v1", StripPrefix: true, DropQuery: true,
+		PathMap: []domain.PathRewrite{{Path: "/v1/messages", To: "/messages"}},
+		RequestJSON: &domain.JSONTransform{
+			JoinStringArrays: []domain.JSONArrayStringJoin{{Field: "system", ElementField: "text", Separator: "\n\n"}},
+			HoistArrayObjectStrings: []domain.JSONArrayObjectStringHoist{{
+				SourceField: "messages", MatchField: "role", MatchValue: "system", ValueField: "content", ElementField: "text", TargetField: "system", Separator: "\n\n",
+			}},
+			StringPrefixes: []domain.JSONStringPrefix{{Field: "model", Prefix: "anthropic/"}},
+			RemoveFields:   []string{"context_management"},
+		},
+	}}
+	snapshot, err := engine.Compile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range []string{"claude-fable-5", "anthropic/claude-fable-5"} {
+		t.Run(model, func(t *testing.T) {
+			transport := roundTrip(func(r *http.Request) (*http.Response, error) {
+				if r.URL.String() != "https://upstream.invalid/ai/v1/messages" {
+					t.Errorf("URL: %s", r.URL)
+				}
+				data, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var payload map[string]any
+				if err := json.Unmarshal(data, &payload); err != nil {
+					t.Fatal(err)
+				}
+				if payload["model"] != "anthropic/claude-fable-5" || payload["system"] != "first\n\nsecond\n\nthird\n\nfourth" || payload["keep"] != "value" {
+					t.Errorf("payload=%v", payload)
+				}
+				if _, exists := payload["context_management"]; exists {
+					t.Errorf("context_management survived: %v", payload)
+				}
+				messages, ok := payload["messages"].([]any)
+				if !ok || len(messages) != 1 || messages[0].(map[string]any)["role"] != "user" {
+					t.Errorf("messages=%v", payload["messages"])
+				}
+				if r.ContentLength != int64(len(data)) || r.Header.Get("Content-Length") != fmt.Sprint(len(data)) {
+					t.Errorf("content length field=%d header=%q body=%d", r.ContentLength, r.Header.Get("Content-Length"), len(data))
+				}
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok")), Request: r}, nil
+			})
+			server := &Server{Snapshots: snapshots{snapshot}, Materials: resolver{}, Transport: transport, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			request := httptest.NewRequest(http.MethodPost, "http://agentbox/anthropic/v1/messages?beta=true", strings.NewReader(`{"model":"`+model+`","system":[{"type":"text","text":"first"},{"type":"text","text":"second"}],"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]},{"role":"system","content":[{"type":"text","text":"third"},{"type":"text","text":"fourth"}]}],"context_management":{"edits":[]},"keep":"value"}`))
+			request.Header.Set("Content-Type", "application/json; charset=utf-8")
+			recorder := httptest.NewRecorder()
+			server.Handler("dev").ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%q", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestJSONArrayObjectStringHoistSupportsStringsAndIsIdempotent(t *testing.T) {
+	transform := domain.JSONTransform{HoistArrayObjectStrings: []domain.JSONArrayObjectStringHoist{{
+		SourceField: "messages", MatchField: "role", MatchValue: "system", ValueField: "content", ElementField: "text", TargetField: "system", Separator: "\n\n",
+	}}}
+	request := httptest.NewRequest(http.MethodPost, "http://agentbox/", strings.NewReader(`{"messages":[{"role":"system","content":"rules"},{"role":"user","content":"hello"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	if got := transformJSONRequest(request, transform, 1024); got != nil {
+		t.Fatalf("first transform failed: %+v", got)
+	}
+	if got := transformJSONRequest(request, transform, 1024); got != nil {
+		t.Fatalf("second transform failed: %+v", got)
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["system"] != "rules" || len(payload["messages"].([]any)) != 1 {
+		t.Fatalf("payload=%v", payload)
+	}
+}
+
+func TestJSONArrayObjectStringHoistRejectsInvalidShapes(t *testing.T) {
+	transform := domain.JSONTransform{HoistArrayObjectStrings: []domain.JSONArrayObjectStringHoist{{
+		SourceField: "messages", MatchField: "role", MatchValue: "system", ValueField: "content", ElementField: "text", TargetField: "system", Separator: "\n\n",
+	}}}
+	for name, body := range map[string]string{
+		"missing source":          `{}`,
+		"source not array":        `{"messages":{}}`,
+		"source null":             `{"messages":null}`,
+		"element not object":      `{"messages":["bad"]}`,
+		"missing match":           `{"messages":[{"content":"bad"}]}`,
+		"match not string":        `{"messages":[{"role":1,"content":"bad"}]}`,
+		"missing value":           `{"messages":[{"role":"system"}]}`,
+		"invalid value":           `{"messages":[{"role":"system","content":1}]}`,
+		"invalid content element": `{"messages":[{"role":"system","content":[{"text":1}]}]}`,
+		"target not string":       `{"system":[],"messages":[{"role":"system","content":"rules"}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "http://agentbox/", strings.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			got := transformJSONRequest(request, transform, 1024)
+			if got == nil || got.status != http.StatusBadRequest {
+				t.Fatalf("error=%+v", got)
+			}
+		})
+	}
+}
+
+func TestJSONTransformRejectsUnsafeBodies(t *testing.T) {
+	transform := domain.JSONTransform{StringPrefixes: []domain.JSONStringPrefix{{Field: "model", Prefix: "anthropic/"}}}
+	tests := []struct {
+		name, body, contentType, contentEncoding string
+		limit                                    int64
+		status                                   int
+	}{
+		{name: "not JSON", body: `{}`, contentType: "text/plain", limit: 100, status: http.StatusUnsupportedMediaType},
+		{name: "encoded", body: `{}`, contentType: "application/json", contentEncoding: "gzip", limit: 100, status: http.StatusUnsupportedMediaType},
+		{name: "too large", body: `{"model":"x"}`, contentType: "application/json", limit: 5, status: http.StatusRequestEntityTooLarge},
+		{name: "malformed", body: `{`, contentType: "application/json", limit: 100, status: http.StatusBadRequest},
+		{name: "missing field", body: `{}`, contentType: "application/json", limit: 100, status: http.StatusBadRequest},
+		{name: "wrong field type", body: `{"model":1}`, contentType: "application/json", limit: 100, status: http.StatusBadRequest},
+		{name: "trailing JSON", body: `{"model":"x"} {}`, contentType: "application/json", limit: 100, status: http.StatusBadRequest},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "http://agentbox/", strings.NewReader(test.body))
+			request.Header.Set("Content-Type", test.contentType)
+			if test.contentEncoding != "" {
+				request.Header.Set("Content-Encoding", test.contentEncoding)
+			}
+			got := transformJSONRequest(request, transform, test.limit)
+			if got == nil || got.status != test.status {
+				t.Fatalf("error=%+v want status=%d", got, test.status)
+			}
+		})
+	}
+}
+
+func TestJSONArrayStringJoinRejectsInvalidShapesAndAllowsOptionalField(t *testing.T) {
+	transform := domain.JSONTransform{JoinStringArrays: []domain.JSONArrayStringJoin{{Field: "system", ElementField: "text", Separator: "\n\n"}}}
+	for name, body := range map[string]string{
+		"not array":             `{"system":"text"}`,
+		"null array":            `{"system":null}`,
+		"non-object element":    `{"system":["text"]}`,
+		"missing element field": `{"system":[{"type":"text"}]}`,
+		"wrong element type":    `{"system":[{"text":1}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "http://agentbox/", strings.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			got := transformJSONRequest(request, transform, 1024)
+			if got == nil || got.status != http.StatusBadRequest {
+				t.Fatalf("error=%+v", got)
+			}
+		})
+	}
+
+	optional := domain.JSONTransform{JoinStringArrays: []domain.JSONArrayStringJoin{{Field: "system", ElementField: "text", Optional: true}}}
+	request := httptest.NewRequest(http.MethodPost, "http://agentbox/", strings.NewReader(`{"model":"test"}`))
+	request.Header.Set("Content-Type", "application/json")
+	if got := transformJSONRequest(request, optional, 1024); got != nil {
+		t.Fatalf("optional field failed: %+v", got)
 	}
 }
 

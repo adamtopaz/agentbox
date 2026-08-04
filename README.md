@@ -126,6 +126,15 @@ agentbox container create --scope prod work
 agentbox container shell work
 ```
 
+OpenAI traffic uses Cloudflare's provider-native gateway endpoint. Anthropic
+traffic uses Cloudflare's unified Messages endpoint so newly released models
+available through Unified Billing do not depend on provider-native rollout
+timing. Agentbox prefixes the outgoing JSON `model` field with `anthropic/`
+on the host, folds any system-role message emitted by Claude Code into the
+top-level system prompt expected by the unified API, and removes Claude Code's
+unsupported `context_management` extension. Pi, Claude Code, and the container
+continue using their normal unprefixed model names and dummy API keys.
+
 Container creation registers the identity with the daemon, waits for its Unix
 listener, launches the Incus instance, attaches TCP `127.0.0.1:8787` and Unix
 `/run/agentbox.sock` proxy devices, then writes only non-secret client settings.
@@ -163,9 +172,26 @@ explicit; use `"*"` only when every registered container should reach it.
   "match": { "path_prefix": "/example" },
   "upstream": "https://api.example.com/v1",
   "strip_prefix": true,
+  "drop_query": true,
   "path_map": [
     { "path": "/messages", "to": "/chat/messages" }
   ],
+  "request_json": {
+    "join_string_arrays": [
+      { "field": "system", "element_field": "text", "separator": "\n\n", "optional": true }
+    ],
+    "hoist_array_object_strings": [
+      {
+        "source_field": "messages", "match_field": "role", "match_value": "system",
+        "value_field": "content", "element_field": "text", "target_field": "system",
+        "separator": "\n\n"
+      }
+    ],
+    "string_prefixes": [
+      { "field": "model", "prefix": "provider/" }
+    ],
+    "remove_fields": ["unsupported_extension"]
+  },
   "set_headers": [
     { "name": "Authorization", "value": "Bearer {secret:example-token}" }
   ]
@@ -182,6 +208,16 @@ Header values support durable `{secret:key-name}` references, renewable
 `{basic:username:key-name}` or `{basic:username:credential:name}`. Credential
 names are resolved against the grant for the request's container listener. A
 missing key, grant, or valid lease returns 503 before any upstream request.
+`request_json.string_prefixes` is a generic, idempotent rewrite for top-level
+JSON string fields. `join_string_arrays` converts an array of objects into one
+string by joining a selected string field in element order; an optional join
+skips an absent top-level field. `hoist_array_object_strings` removes matching
+objects from a top-level array and appends their string or text-block-array
+content to a top-level string. `drop_query` removes the inbound query from the
+upstream request. `remove_fields` idempotently removes selected top-level
+fields. Transformed requests must be unencoded JSON objects and are bounded at
+64 MiB; invalid or oversized bodies fail before material is resolved or an
+upstream request is made.
 Routes that inject a secret or credential must use HTTPS; literal loopback IP
 HTTP upstreams are permitted for host-local services. `localhost` is not
 accepted because resolving a name is weaker than verifying a loopback address.
