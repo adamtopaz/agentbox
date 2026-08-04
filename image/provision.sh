@@ -4,7 +4,6 @@
 #
 # Environment provided by the builder:
 #   AGENTBOX_ACCOUNT_ID  Cloudflare account ID (non-secret; may be empty)
-#   AGENTBOX_GATEWAY_ID  AI Gateway ID        (non-secret; may be empty)
 #   AGENTBOX_BUILD_DATE  build date stamp
 #
 # Everything written here is a dummy value or non-secret: the host-side proxy
@@ -136,8 +135,9 @@ install -o agent -g agent -m 0644 /dev/stdin /home/agent/.claude.json <<'EOF'
 }
 EOF
 
-echo "==> codex dir (config written per container by agentbox create)"
+echo "==> codex + pi dirs (configs written per container by agentbox create)"
 install -d -o agent -g agent /home/agent/.codex
+install -d -o agent -g agent /home/agent/.pi /home/agent/.pi/agent
 
 echo "==> gh wiring (http_unix_socket)"
 # gh has no base-URL override, but http_unix_socket makes it dial a unix

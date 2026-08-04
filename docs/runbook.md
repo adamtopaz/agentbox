@@ -185,11 +185,13 @@ Provisioning fails the build if any agent installs without producing its
 binary — npm exiting 0 does not prove the command exists, as a package can
 install cleanly and ship a differently-named one.
 
-`pi` is installed but **not yet routed through the proxy**. Its
-`cloudflare-ai-gateway` provider constructs Cloudflare URLs itself and would
-go direct; the only key inside the container is a dummy, so it fails rather
-than leaking, but it will not work until its provider baseUrl is overridden
-(see spec §10.3 for the leads). `claude` and `codex` are unaffected.
+`pi` is routed by `~/.pi/agent/models.json`, written per container by
+`agentbox create`. pi honours no `*_BASE_URL` environment variable — it
+resolves a provider's endpoint as extension > models.json > built-in — so
+without that file it talks to Anthropic, OpenAI and Cloudflare directly. That
+fails closed (the container holds only dummy keys) but bypasses the proxy, so
+if you see pi reporting 401 from a provider, check that file exists and names
+the container's gateway.
 
 Check what an image actually shipped:
 

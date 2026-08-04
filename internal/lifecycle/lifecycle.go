@@ -218,6 +218,27 @@ EOF
   chown agent:agent /home/agent/.codex/config.toml
   chmod 0644 /home/agent/.codex/config.toml
 fi
+
+# pi resolves a provider's endpoint as extension > models.json > built-in, and
+# honours no *_BASE_URL environment variable (docs/models.md, "Overriding
+# Built-in Providers"; docs/environment-variables.md lists none). So its
+# providers have to be redirected declaratively here, or pi talks to Anthropic,
+# OpenAI and Cloudflare directly — failing closed against the dummy keys, but
+# bypassing the proxy entirely.
+if id agent >/dev/null 2>&1; then
+  install -d -o agent -g agent -m 0755 /home/agent/.pi /home/agent/.pi/agent
+  cat > /home/agent/.pi/agent/models.json <<EOF
+{
+  "providers": {
+    "anthropic": { "baseUrl": "$GW/anthropic" },
+    "openai": { "baseUrl": "$GW/openai" },
+    "cloudflare-ai-gateway": { "baseUrl": "$GW" }
+  }
+}
+EOF
+  chown -R agent:agent /home/agent/.pi
+  chmod 0644 /home/agent/.pi/agent/models.json
+fi
 `
 	return m.Incus.RunInput(script, "exec", name, "--", "sh", "-s")
 }
