@@ -189,7 +189,17 @@ test -f /home/agent/.config/gh/config.yml
 test -f /home/agent/.claude.json
 test -f /etc/agentbox-image
 grep -F 'http_unix_socket: /run/agentbox.sock' /home/agent/.config/gh/config.yml
-grep -F 'insteadOf = https://github.com/' /etc/gitconfig
+if git config --system --get-regexp '^url\..*\.insteadof$'; then
+  echo 'system URL rewrites must not change canonical repository metadata' >&2
+  exit 1
+fi
+grep -F 'export GIT_EXEC_PATH=/usr/local/lib/agentbox/git-core' /etc/profile.d/agentbox.sh
+grep -F 'GIT_EXEC_PATH=/usr/local/lib/agentbox/git-core' /etc/environment
+grep -F 'github-git-transport=helper-v1' /etc/agentbox-image
+test -x /usr/local/lib/agentbox/git-core/git-remote-https
+test -x /usr/local/lib/agentbox/git-remote-http-original
+test "$(GIT_EXEC_PATH=/usr/local/lib/agentbox/git-core git --exec-path)" = \
+  /usr/local/lib/agentbox/git-core
 visudo -c
 `
 

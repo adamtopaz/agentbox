@@ -65,6 +65,7 @@ config:
           export DISABLE_AUTOUPDATER=1
           export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
           export GIT_TERMINAL_PROMPT=0
+          export GIT_EXEC_PATH=/usr/local/lib/agentbox/git-core
 
       - path: /etc/environment
         owner: root:root
@@ -76,14 +77,28 @@ config:
           DISABLE_AUTOUPDATER=1
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
           GIT_TERMINAL_PROMPT=0
+          GIT_EXEC_PATH=/usr/local/lib/agentbox/git-core
 
-      - path: /etc/gitconfig
+      - path: /usr/local/lib/agentbox/git-remote-https
         owner: root:root
-        permissions: "0644"
+        permissions: "0755"
         content: |
-          [url "http://127.0.0.1:8787/github-git/"]
-              insteadOf = https://github.com/
-              insteadOf = git@github.com:
+          #!/bin/sh
+          set -eu
+
+          original=/usr/local/lib/agentbox/git-remote-http-original
+          if [ "$#" -eq 2 ]; then
+              remote=$1
+              url=$2
+              case "$url" in
+                  https://github.com/*)
+                      path=${url#https://github.com/}
+                      exec "$original" "$remote" \
+                          "http://127.0.0.1:8787/github-git/$path"
+                      ;;
+              esac
+          fi
+          exec "$original" "$@"
 
       - path: /home/agent/.config/gh/config.yml
         owner: agent:agent
@@ -125,6 +140,7 @@ config:
           claude-code=2.1.220
           codex=0.145.0
           pi-coding-agent=0.82.1
+          github-git-transport=helper-v1
 
     runcmd:
       - |
@@ -132,6 +148,26 @@ config:
         sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
         locale-gen
         update-locale LANG=en_US.UTF-8
+
+        # Keep canonical GitHub URLs in repository metadata so GitHub CLI can
+        # resolve the current checkout. Only the HTTPS transport operation is
+        # redirected to Agentbox; the helper delegates every other URL to the
+        # distro-provided implementation unchanged.
+        GIT_ORIGINAL_EXEC_PATH=$(git --exec-path)
+        install -d -m 0755 /usr/local/lib/agentbox/git-core
+        cp --archive --symbolic-link \
+          "$GIT_ORIGINAL_EXEC_PATH"/. /usr/local/lib/agentbox/git-core/
+        rm -f /usr/local/lib/agentbox/git-core/git-remote-https
+        install -m 0755 \
+          /usr/local/lib/agentbox/git-remote-https \
+          /usr/local/lib/agentbox/git-core/git-remote-https
+        ln -sfn \
+          "$GIT_ORIGINAL_EXEC_PATH/git-remote-http" \
+          /usr/local/lib/agentbox/git-remote-http-original
+        test -x /usr/local/lib/agentbox/git-core/git-remote-https
+        test -x /usr/local/lib/agentbox/git-remote-http-original
+        test "$(GIT_EXEC_PATH=/usr/local/lib/agentbox/git-core git --exec-path)" = \
+          /usr/local/lib/agentbox/git-core
 
         # Debian 13 ships Node.js 20, but pi >=0.75 requires Node.js >=22.19.
         # Install an exact Node.js 24 LTS release from the upstream binary

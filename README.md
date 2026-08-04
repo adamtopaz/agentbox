@@ -104,7 +104,10 @@ one-hour installation token, caches that token only in daemon memory, and
 refreshes it before expiry. A grant binds the logical credential `github` to a
 source for exactly one container listener. The App private key, JWT, and
 installation token never enter the container. The image configures `git`
-through `/github-git/` and uses GitHub CLI's supported
+with canonical `https://github.com/...` remotes while a GitHub-only HTTPS
+transport helper routes clone, fetch, and push through `/github-git/`. This
+keeps checkout-aware `gh` commands working without exposing the proxy URL in
+repository metadata. GitHub CLI API calls use its supported
 [`http_unix_socket`](https://cli.github.com/manual/gh_config) setting for
 `/run/agentbox.sock`; `gh` and Git continue to see only dummy credentials.
 

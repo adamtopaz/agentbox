@@ -192,6 +192,14 @@ credentials are not attached to signed asset downloads. Unmapped hosts return
 interception, DNS override, or fake CA is involved. The container retains its
 dummy `GH_TOKEN`; Agentbox strips it before injecting the installation token.
 
+Git repositories retain canonical `https://github.com/OWNER/REPOSITORY.git`
+remote URLs. A GitHub-only `git-remote-https` transport helper changes only the
+live clone/fetch/push destination to the container's `/github-git/` route, then
+delegates the Git wire protocol to the distro's original HTTP helper. This lets
+`gh` infer the repository from the current checkout. Other HTTPS Git hosts are
+delegated unchanged, and SSH GitHub URLs are intentionally not translated.
+The helper contains no credential and never receives an installation token.
+
 Apply the routes once after configuring at least one source:
 
 ```sh

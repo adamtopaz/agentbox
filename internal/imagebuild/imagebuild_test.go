@@ -155,6 +155,9 @@ func TestIndependentVerificationExecutesPinnedAgentCLIs(t *testing.T) {
 		`claude --version | grep -F '2.1.220'`,
 		`codex --version | grep -F '0.145.0'`,
 		`pi --version | grep -F '0.82.1'`,
+		`system URL rewrites must not change canonical repository metadata`,
+		`test -x /usr/local/lib/agentbox/git-core/git-remote-https`,
+		`GIT_EXEC_PATH=/usr/local/lib/agentbox/git-core git --exec-path`,
 	} {
 		if !strings.Contains(verifyScript, required) {
 			t.Fatalf("verification script does not execute %q", required)
