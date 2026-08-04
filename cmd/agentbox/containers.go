@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 	"text/tabwriter"
 
@@ -31,12 +32,25 @@ func cmdContainer(ctx context.Context, client *control.Client, args []string) er
 		memory := fs.String("memory", incus.DefaultMemory, "maximum memory")
 		processes := fs.Uint("processes", incus.DefaultProcesses, "maximum processes")
 		disk := fs.String("disk", incus.DefaultDisk, "maximum root disk size")
+		noResourceLimits := fs.Bool("no-resource-limits", false, "omit per-instance resource limits")
 		incusBin := fs.String("incus-bin", "incus", "Incus CLI")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
 		if fs.NArg() != 1 || *scope == "" {
 			return errors.New("usage: agentbox container create --scope SCOPE [--configure cloudflare|none] [resource flags] <name>")
+		}
+		if *noResourceLimits {
+			var conflicting []string
+			fs.Visit(func(f *flag.Flag) {
+				switch f.Name {
+				case "cpus", "memory", "processes", "disk":
+					conflicting = append(conflicting, "--"+f.Name)
+				}
+			})
+			if len(conflicting) != 0 {
+				return fmt.Errorf("--no-resource-limits cannot be combined with %s", strings.Join(conflicting, ", "))
+			}
 		}
 		var script string
 		switch *configure {
@@ -55,6 +69,7 @@ func cmdContainer(ctx context.Context, client *control.Client, args []string) er
 		return manager.Create(ctx, incus.CreateOptions{
 			Name: fs.Arg(0), Scope: *scope, ConfigureScript: script,
 			CPUs: *cpus, Memory: *memory, Processes: *processes, Disk: *disk,
+			NoResourceLimits: *noResourceLimits,
 		})
 	case "list":
 		fs := flag.NewFlagSet("container list", flag.ContinueOnError)

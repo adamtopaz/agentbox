@@ -54,6 +54,7 @@ type CreateOptions struct {
 	Memory                       string
 	Processes                    uint
 	Disk                         string
+	NoResourceLimits             bool
 }
 
 func (m *Manager) Create(ctx context.Context, options CreateOptions) error {
@@ -101,15 +102,20 @@ func (m *Manager) Create(ctx context.Context, options CreateOptions) error {
 	if image == "" {
 		image = DefaultImage
 	}
-	if err := m.Incus.RunStreaming(
+	launchArgs := []string{
 		"launch", image, options.Name,
-		"-c", ManagedTag+"=true",
+		"-c", ManagedTag + "=true",
 		"-c", "boot.autostart=true",
-		"-c", "limits.cpu="+strconv.FormatUint(uint64(limits.CPUs), 10),
-		"-c", "limits.memory="+limits.Memory,
-		"-c", "limits.processes="+strconv.FormatUint(uint64(limits.Processes), 10),
-		"-d", "root,size="+limits.Disk,
-	); err != nil {
+	}
+	if !limits.NoResourceLimits {
+		launchArgs = append(launchArgs,
+			"-c", "limits.cpu="+strconv.FormatUint(uint64(limits.CPUs), 10),
+			"-c", "limits.memory="+limits.Memory,
+			"-c", "limits.processes="+strconv.FormatUint(uint64(limits.Processes), 10),
+			"-d", "root,size="+limits.Disk,
+		)
+	}
+	if err := m.Incus.RunStreaming(launchArgs...); err != nil {
 		return rollback(err)
 	}
 	for _, args := range m.deviceArgs(options.Name) {
@@ -127,6 +133,9 @@ func (m *Manager) Create(ctx context.Context, options CreateOptions) error {
 }
 
 func normalizeLimits(options CreateOptions) (CreateOptions, error) {
+	if options.NoResourceLimits {
+		return options, nil
+	}
 	if options.CPUs == 0 {
 		options.CPUs = DefaultCPUs
 	}

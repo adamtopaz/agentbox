@@ -144,6 +144,31 @@ func TestCreateAppliesDefaultResourceLimits(t *testing.T) {
 	}
 }
 
+func TestCreateCanOmitResourceLimits(t *testing.T) {
+	control := &controlFake{}
+	commands := &commanderFake{}
+	manager := &Manager{
+		Incus: commands, Control: control, SocketDir: "/run/test",
+		SocketReady: func(string) bool { return true },
+	}
+	if err := manager.Create(context.Background(), CreateOptions{
+		Name: "dev", Scope: "prod", NoResourceLimits: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(commands.calls) == 0 {
+		t.Fatal("Incus was not called")
+	}
+	launch := strings.Join(commands.calls[0], " ")
+	for _, unexpected := range []string{
+		"limits.cpu=", "limits.memory=", "limits.processes=", "root,size=",
+	} {
+		if strings.Contains(launch, unexpected) {
+			t.Fatalf("launch unexpectedly contains %q: %s", unexpected, launch)
+		}
+	}
+}
+
 func TestCreateRejectsInvalidResourceLimitsBeforeMutation(t *testing.T) {
 	control := &controlFake{}
 	commands := &commanderFake{}

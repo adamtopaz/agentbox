@@ -240,6 +240,17 @@ agentbox container create --scope prod --configure none \
   --cpus 8 --memory 16GiB --processes 4096 --disk 100GiB <name>
 ```
 
+To let the Incus profile and host determine available capacity without adding
+Agentbox per-instance limits, use the explicit opt-out:
+
+```sh
+agentbox container create --scope prod --configure none \
+  --no-resource-limits <name>
+```
+
+`--no-resource-limits` cannot be combined with `--cpus`, `--memory`,
+`--processes`, or `--disk`. Profile-level limits, if any, still apply.
+
 These limits are stored by Incus and do not apply retroactively to existing
 containers. Use `incus config set` and `incus config device override`, or
 recreate an old container, to bring it under the same limits.

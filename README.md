@@ -130,7 +130,10 @@ listener, launches the Incus instance, attaches TCP `127.0.0.1:8787` and Unix
 `/run/agentbox.sock` proxy devices, then writes only non-secret client settings.
 New containers default to 4 CPUs, 8 GiB of memory, 2,048 processes, and a
 50 GiB root disk. Override those safeguards with `--cpus`, `--memory`,
-`--processes`, and `--disk` when a workload needs different limits.
+`--processes`, and `--disk` when a workload needs different limits. To omit
+all Agentbox per-instance limits, use `--no-resource-limits`; limits inherited
+from the Incus profile still apply. The opt-out cannot be combined with the
+individual resource flags.
 
 Useful live operations:
 
