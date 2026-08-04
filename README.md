@@ -17,11 +17,14 @@ inference, GitHub for git).
   (`/etc/agentbox/routes.json`) and per-container state files. There is no
   daemon: every mutating command runs one reconcile cycle
   (render → `caddy validate` → atomic install → `caddy reload`).
-- Secrets live in `/etc/agentbox/secrets/` (root, 0600), loaded into
-  `caddy.service` via systemd `LoadCredential`, and referenced from the config
-  as `{file.*}` placeholders. The rendered Caddyfile contains secret *names*
-  only, and the CLI never reads secret values (one exception: `setup` writes
-  pre-encoded HTTP Basic companions as root). A route whose secret is not
+- Secrets are stored **encrypted at rest** by `systemd-creds` in
+  `/etc/agentbox/secrets/<name>.cred` (root, 0600) — `agentbox add-secret`
+  pipes the value straight into the encryptor, so no plaintext credential is
+  ever written to disk. systemd decrypts them into the service's private
+  `/run/credentials` tmpfs via `LoadCredentialEncrypted=`, and the config
+  references them as `{file.*}` placeholders. The rendered Caddyfile contains
+  secret *names* only (one exception to the CLI never handling values: `setup`
+  decrypts, in memory, to derive the pre-encoded HTTP Basic companion git needs). A route whose secret is not
   installed serves 503 rather than proxying without credentials.
 - Logs are metadata-only by construction — query strings stripped,
   request/response headers dropped, entries tagged with the container name —
@@ -51,9 +54,9 @@ Caddy's official apt repo if missing or too old.
 ```sh
 make bin
 sudo ./bin/agentbox setup          # prompts for Cloudflare account + gateway ID
-sudo install -m 600 /dev/stdin /etc/agentbox/secrets/cf-aig-token   # paste token, ^D
-sudo install -m 600 /dev/stdin /etc/agentbox/secrets/gh-pat         # paste PAT, ^D
-sudo agentbox setup                # picks up the new secrets (LoadCredential + companions)
+sudo agentbox add-secret cf-aig-token   # value read without echo
+sudo agentbox add-secret gh-pat
+sudo agentbox setup                # loads the new secrets into caddy
 agentbox build-image               # bake the agentbox-base container image
 ```
 

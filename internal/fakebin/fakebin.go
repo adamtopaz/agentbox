@@ -117,3 +117,45 @@ func (f *Fake) Reset() {
 		f.t.Fatalf("fakebin: %v", err)
 	}
 }
+
+// SystemdCreds writes a stand-in for systemd-creds that reversibly wraps a
+// value instead of encrypting it, so tests can exercise the credential flow
+// without root or a TPM. It binds the --name= into the wrapper exactly as the
+// real tool binds it into the ciphertext, so a credential cannot be decrypted
+// under the wrong name.
+func SystemdCreds(t *testing.T) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "systemd-creds")
+	// Sets its own PATH: callers null out PATH to keep LookPath deterministic.
+	// Format is a header line naming the credential, then the value, so the
+	// name binding can be checked exactly rather than by pattern.
+	script := `#!/bin/sh
+PATH=/usr/bin:/bin
+op=$1; shift
+name=""; args=""
+for a in "$@"; do
+  case "$a" in
+    --name=*) name=${a#--name=} ;;
+    --*) ;;
+    *) args="$args $a" ;;
+  esac
+done
+set -- $args
+case "$op" in
+  encrypt) { printf 'ENC(%s)\n' "$name"; cat; } > "$2" ;;
+  decrypt)
+    read -r hdr < "$1"
+    if [ "$hdr" != "ENC($name)" ]; then
+      echo "credential name mismatch: file has $hdr, asked for $name" >&2
+      exit 1
+    fi
+    tail -n +2 "$1"
+    ;;
+  *) echo "unknown op $op" >&2; exit 2 ;;
+esac
+`
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatalf("fakebin: %v", err)
+	}
+	return bin
+}

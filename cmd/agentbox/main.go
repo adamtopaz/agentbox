@@ -24,6 +24,9 @@ usage: agentbox <command> [flags] [args]
 
 host:
   setup                  one-time host setup (root); re-run after adding secrets
+  add-secret <name>      store a credential, encrypted at rest (root); the
+                         value is read without echo and never written to disk
+                         in plaintext. Run setup afterwards to load it.
   build-image            (re)build the agentbox-base container image
 
 containers:
@@ -53,6 +56,8 @@ func main() {
 	switch os.Args[1] {
 	case "setup":
 		code = cmdSetup(os.Args[2:])
+	case "add-secret":
+		code = cmdAddSecret(os.Args[2:])
 	case "setup-firewall": // hidden: used by agentbox-firewall.service
 		code = cmdSetupFirewall(os.Args[2:])
 	case "build-image":

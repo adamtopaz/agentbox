@@ -28,6 +28,7 @@ import (
 
 	"agentbox/internal/caddyctl"
 	"agentbox/internal/config"
+	"agentbox/internal/credstore"
 	"agentbox/internal/paths"
 	"agentbox/internal/reconcile"
 )
@@ -39,6 +40,7 @@ type Options struct {
 	AdminUser string // user added to the agentbox group; default $SUDO_USER
 	NoStart   bool
 	CaddyBin  string // default "caddy"
+	CredsBin  string // systemd-creds binary; default "systemd-creds"
 	In        io.Reader
 	Out       io.Writer
 }
@@ -68,6 +70,7 @@ func Run(o Options) error {
 		{"directories", r.ensureDirs},
 		{"gateway coordinates (agentbox.json)", r.ensureMeta},
 		{"routes.json", r.ensureRoutes},
+		{"encrypt any plaintext secrets", r.migratePlaintextSecrets},
 		{"{basic:...} companion secrets", r.ensureBasicCompanions},
 		{"secrets manifest", r.ensureSecretsManifest},
 		{"tmpfiles.d", r.ensureTmpfiles},
@@ -406,13 +409,16 @@ func (r *runner) ensureBasicCompanions() error {
 	if err != nil {
 		return err
 	}
+	store := r.credStore()
 	for name, usr := range cfg.BasicSecrets() {
-		src := filepath.Join(r.prefixed(paths.Secrets), name)
-		val, err := os.ReadFile(src)
-		if errors.Is(err, fs.ErrNotExist) {
-			r.warn("secret %q not installed yet (%s); re-run setup after: install -m 600 /dev/stdin %s", name, src, src)
+		if !store.Has(name) {
+			r.warn("secret %q not installed yet; add it with: sudo agentbox add-secret %s", name, name)
 			continue
 		}
+		// Caddy cannot base64-encode a file's contents, so the pre-encoded
+		// companion is derived here. This is the only place agentbox code
+		// handles a secret value, as root, in memory — never on disk.
+		val, err := store.Get(name)
 		if err != nil {
 			return err
 		}
@@ -420,21 +426,63 @@ func (r *runner) ensureBasicCompanions() error {
 		if token == "" {
 			r.warn("secret %q is empty; its routes will proxy without a usable credential", name)
 		}
-		if strings.TrimSpace(token) != token {
-			r.warn("secret %q has leading/trailing whitespace, which will be sent verbatim", name)
-		}
 		encoded := base64.StdEncoding.EncodeToString([]byte(usr + ":" + token))
-		dst := src + ".basic"
-		if cur, err := os.ReadFile(dst); err == nil && string(cur) == encoded {
-			r.logf("%s ok", dst)
+		companion := name + ".basic"
+		if cur, err := store.Get(companion); err == nil && string(cur) == encoded {
+			r.logf("%s ok", companion)
 			continue
 		}
-		if err := os.WriteFile(dst, []byte(encoded), 0o600); err != nil {
+		if err := store.Put(companion, []byte(encoded)); err != nil {
 			return err
 		}
-		r.change("wrote %s", dst)
+		r.change("wrote encrypted companion %s", store.Path(companion))
 	}
 	return nil
+}
+
+// migratePlaintextSecrets encrypts any secret left on disk in plaintext by an
+// older agentbox (or installed by hand) and removes the cleartext copy, so
+// enabling encryption does not silently leave the original readable.
+func (r *runner) migratePlaintextSecrets() error {
+	dir := r.prefixed(paths.Secrets)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	store := r.credStore()
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || strings.HasPrefix(name, ".") || strings.HasSuffix(name, credstore.Ext) {
+			continue
+		}
+		if !credstore.ValidName(name) {
+			r.warn("ignoring unexpected file in the secrets dir: %q", name)
+			continue
+		}
+		val, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			return err
+		}
+		// {file.*} strips exactly one trailing newline; be stricter here so a
+		// pasted-in blank line cannot produce a malformed header later.
+		trimmed := strings.TrimRight(string(val), " \t\r\n")
+		if trimmed == "" {
+			r.warn("plaintext secret %q is empty; leaving it alone", name)
+			continue
+		}
+		if err := store.Put(name, []byte(trimmed)); err != nil {
+			return err
+		}
+		if err := os.Remove(filepath.Join(dir, name)); err != nil {
+			return err
+		}
+		r.change("encrypted %s and removed the plaintext copy", name)
+	}
+	return nil
+}
+
+func (r *runner) credStore() credstore.Store {
+	return credstore.Store{Dir: r.prefixed(paths.Secrets), Bin: r.o.CredsBin}
 }
 
 // ensureSecretsManifest records which secret names are installed, so the
@@ -442,15 +490,9 @@ func (r *runner) ensureBasicCompanions() error {
 // still render routes with missing credentials as 503 instead of proxying
 // unauthenticated. Names only — never values.
 func (r *runner) ensureSecretsManifest() error {
-	entries, err := os.ReadDir(r.prefixed(paths.Secrets))
+	names, err := r.credStore().List()
 	if err != nil {
 		return err
-	}
-	var names []string
-	for _, e := range entries {
-		if !e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
-			names = append(names, e.Name())
-		}
 	}
 	sort.Strings(names)
 	content := "# Managed by agentbox setup — names of installed secrets, never values.\n"
@@ -477,7 +519,6 @@ func (r *runner) ensureTmpfiles() error {
 }
 
 func (r *runner) ensureCaddyDropin() error {
-	var creds []string
 	cfg, err := config.Load(r.prefixed(paths.Routes))
 	if err != nil {
 		return err
@@ -487,15 +528,18 @@ func (r *runner) ensureCaddyDropin() error {
 		need = append(need, name+".basic")
 	}
 	sort.Strings(need) // map iteration order must not churn the unit file
+
+	store := r.credStore()
+	var creds []string
 	for _, name := range need {
-		src := filepath.Join(r.prefixed(paths.Secrets), name)
-		if _, err := os.Stat(src); err != nil {
-			r.warn("secret %q referenced by routes.json is not installed (%s); Caddy will not receive it until you install it and re-run setup", name, src)
+		if !store.Has(name) {
+			r.warn("secret %q referenced by routes.json is not installed; its routes serve 503 until you run: sudo agentbox add-secret %s", name, name)
 			continue
 		}
-		// The unprefixed path goes into the unit; the stat above is what the
-		// prefix root is for.
-		creds = append(creds, fmt.Sprintf("LoadCredential=%s:%s", name, filepath.Join(paths.Secrets, name)))
+		// Unprefixed path: this line goes into a real unit file. The Has()
+		// check above is what the test prefix root applies to.
+		creds = append(creds, fmt.Sprintf("LoadCredentialEncrypted=%s:%s",
+			name, filepath.Join(paths.Secrets, name+credstore.Ext)))
 	}
 	dropin := renderCaddyDropin(r.caddyBinPath(), creds)
 	target := r.prefixed(paths.CaddyDropin)

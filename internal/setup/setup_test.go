@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"agentbox/internal/credstore"
+	"agentbox/internal/fakebin"
 )
 
 // run executes setup in prefix mode. PATH is emptied so LookPath("docker")
@@ -15,6 +18,9 @@ func run(t *testing.T, prefix string, opts Options) string {
 	t.Helper()
 	t.Setenv("PATH", "")
 	opts.Prefix = prefix
+	if opts.CredsBin == "" {
+		opts.CredsBin = fakebin.SystemdCreds(t)
+	}
 	var out bytes.Buffer
 	opts.Out = &out
 	if err := Run(opts); err != nil {
@@ -104,26 +110,30 @@ func TestIdempotentSecondRun(t *testing.T) {
 
 func TestSecretsWireUpCredentialsAndCompanions(t *testing.T) {
 	prefix := t.TempDir()
-	run(t, prefix, Options{AccountID: "acct123", GatewayID: "gw123"})
+	credsBin := fakebin.SystemdCreds(t)
+	run(t, prefix, Options{AccountID: "acct123", GatewayID: "gw123", CredsBin: credsBin})
 
 	secrets := filepath.Join(prefix, "etc/agentbox/secrets")
+	store := credstore.Store{Dir: secrets, Bin: credsBin}
 	// Dummy test material only — never real tokens in tests.
-	if err := os.WriteFile(filepath.Join(secrets, "cf-aig-token"), []byte("dummy-aig\n"), 0o600); err != nil {
+	if err := store.Put("cf-aig-token", []byte("dummy-aig")); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(secrets, "gh-pat"), []byte("dummy-pat\n"), 0o600); err != nil {
+	if err := store.Put("gh-pat", []byte("dummy-pat")); err != nil {
 		t.Fatal(err)
 	}
 
-	run(t, prefix, Options{})
+	run(t, prefix, Options{CredsBin: credsBin})
 
-	companion, err := os.ReadFile(filepath.Join(secrets, "gh-pat.basic"))
+	// The HTTP Basic companion is derived from the stored secret without the
+	// operator re-entering it, and is itself stored encrypted.
+	companion, err := store.Get("gh-pat.basic")
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := base64.StdEncoding.EncodeToString([]byte("x-access-token:dummy-pat"))
 	if string(companion) != want {
-		t.Fatalf("companion = %q, want %q (exactly one trailing newline trimmed)", companion, want)
+		t.Fatalf("companion = %q, want %q", companion, want)
 	}
 
 	dropin, err := os.ReadFile(filepath.Join(prefix, "etc/systemd/system/caddy.service.d/agentbox.conf"))
@@ -131,23 +141,24 @@ func TestSecretsWireUpCredentialsAndCompanions(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, line := range []string{
-		"LoadCredential=cf-aig-token:/etc/agentbox/secrets/cf-aig-token",
-		"LoadCredential=gh-pat:/etc/agentbox/secrets/gh-pat",
-		"LoadCredential=gh-pat.basic:/etc/agentbox/secrets/gh-pat.basic",
+		"LoadCredentialEncrypted=cf-aig-token:/etc/agentbox/secrets/cf-aig-token.cred",
+		"LoadCredentialEncrypted=gh-pat:/etc/agentbox/secrets/gh-pat.cred",
+		"LoadCredentialEncrypted=gh-pat.basic:/etc/agentbox/secrets/gh-pat.basic.cred",
 	} {
 		if !strings.Contains(string(dropin), line) {
 			t.Errorf("drop-in missing %q\n%s", line, dropin)
 		}
 	}
-	// The drop-in must reference secrets by path only — never contain values.
+	if strings.Contains(string(dropin), "LoadCredential=") {
+		t.Error("drop-in still uses unencrypted LoadCredential=")
+	}
 	for _, leak := range []string{"dummy-aig", "dummy-pat", want} {
 		if strings.Contains(string(dropin), leak) {
 			t.Errorf("drop-in leaks secret material %q", leak)
 		}
 	}
 
-	// The manifest lets the non-root CLI tell which routes have credentials,
-	// and must itself carry names only.
+	// Manifest carries names only, and names the ciphertext-backed secrets.
 	manifest, err := os.ReadFile(filepath.Join(prefix, "etc/agentbox/secrets.installed"))
 	if err != nil {
 		t.Fatal(err)
@@ -162,16 +173,54 @@ func TestSecretsWireUpCredentialsAndCompanions(t *testing.T) {
 			t.Errorf("manifest leaks secret material %q", leak)
 		}
 	}
-	if fi, _ := os.Stat(filepath.Join(prefix, "etc/agentbox/secrets.installed")); fi.Mode().Perm() != 0o644 {
-		t.Errorf("manifest mode = %v, want 0644 (the non-root CLI must read it)", fi.Mode().Perm())
+
+	// Nothing in the secrets dir may be a plaintext file.
+	entries, err := os.ReadDir(secrets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), credstore.Ext) {
+			t.Errorf("non-ciphertext file left in the secrets dir: %q", e.Name())
+		}
 	}
 
-	// Third run with everything in place must still be a no-op — map
-	// iteration order must not churn the generated files.
 	for range 3 {
-		if out := run(t, prefix, Options{}); !strings.Contains(out, "nothing to change") {
+		if out := run(t, prefix, Options{CredsBin: credsBin}); !strings.Contains(out, "nothing to change") {
 			t.Fatalf("re-run not idempotent with secrets installed:\n%s", out)
 		}
+	}
+}
+
+// TestPlaintextSecretsAreMigrated covers upgrading a host that installed
+// secrets the old way: enabling encryption must not leave the cleartext copy
+// sitting there readable.
+func TestPlaintextSecretsAreMigrated(t *testing.T) {
+	prefix := t.TempDir()
+	credsBin := fakebin.SystemdCreds(t)
+	run(t, prefix, Options{AccountID: "acct123", GatewayID: "gw123", CredsBin: credsBin})
+
+	secrets := filepath.Join(prefix, "etc/agentbox/secrets")
+	// A hand-installed plaintext secret, with the trailing newline a paste
+	// would leave behind.
+	if err := os.WriteFile(filepath.Join(secrets, "cf-aig-token"), []byte("dummy-aig\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out := run(t, prefix, Options{CredsBin: credsBin})
+	if !strings.Contains(out, "removed the plaintext copy") {
+		t.Errorf("migration not reported:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(secrets, "cf-aig-token")); !os.IsNotExist(err) {
+		t.Fatal("plaintext secret survived migration")
+	}
+	store := credstore.Store{Dir: secrets, Bin: credsBin}
+	got, err := store.Get("cf-aig-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "dummy-aig" {
+		t.Fatalf("migrated value = %q (trailing newline should be trimmed)", got)
 	}
 }
 

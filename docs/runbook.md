@@ -5,9 +5,14 @@ Operator procedures. Everything here is generic to any agentbox deployment.
 ## Add or rotate a secret
 
 ```sh
-sudo install -m 600 /dev/stdin /etc/agentbox/secrets/<name>   # paste value, ^D
-sudo agentbox setup        # regenerates LoadCredential drop-in + .basic companions
+sudo agentbox add-secret <name>   # value read without echo, encrypted at rest
+sudo agentbox setup               # loads it into caddy; derives .basic companions
 ```
+
+`add-secret` pipes the value directly into `systemd-creds`, so it never lands
+on disk in plaintext, never appears in argv or shell history, and is not
+echoed to your terminal. Piping works too (`... | sudo agentbox add-secret x`).
+Rotation is the same command again.
 
 `setup` is idempotent; re-running it is the standard way to pick up secret
 changes (systemd credentials are loaded at caddy start, so setup restarts
@@ -19,10 +24,30 @@ Until a referenced secret is both installed **and** loaded into Caddy, its
 routes serve `503 credential not installed` — deliberately, so a missing
 credential can never turn into an unauthenticated upstream call. Two files
 decide this: `/etc/agentbox/secrets.installed` (names only, written by setup)
-and the `LoadCredential=` lines in
+and the `LoadCredentialEncrypted=` lines in
 `/etc/systemd/system/caddy.service.d/agentbox.conf`. A secret must appear in
 both, which is why installing a secret requires re-running `setup` (it
 regenerates the drop-in and restarts caddy) and not just `proxy reload`.
+
+### What encryption at rest does and does not protect
+
+Ciphertext lives in `/etc/agentbox/secrets/<name>.cred`, encrypted by
+`systemd-creds`. On a host with a TPM the key is sealed to the hardware; with
+no TPM, systemd falls back to a host key at `/var/lib/systemd/credential.secret`.
+
+It protects the secrets when the **disk is read outside the running system** —
+a stolen or decommissioned drive, a backup, a copied snapshot. Note that with
+a host key rather than a TPM, key and ciphertext sit on the same disk, so that
+protection only holds if the two are separated (e.g. a backup covering `/etc`
+but not `/var/lib/systemd`). Full-disk encryption is the stronger answer there.
+
+It does **not** protect against root on the running host. Caddy needs the
+plaintext at request time and must start unattended, so the key is necessarily
+reachable by the machine. No scheme changes that. Membership in group
+`agentbox` is likewise root-equivalent with respect to these secrets.
+
+Because the ciphertext is bound to this host, a `.cred` file restored onto a
+different machine will not decrypt — re-add the secret there.
 
 ## Add a route
 
@@ -53,9 +78,9 @@ credential. Redirect targets that carry signed URLs (asset/CDN hosts) should
 be pass-through — no `inject` — so the token is not sent somewhere it was
 never scoped for.
 
-Then `agentbox proxy reload`. If the route references a new secret, install it
-and re-run `sudo agentbox setup` first (the LoadCredential drop-in must know
-the name). Validation fails closed: a broken routes.json never replaces the
+Then `agentbox proxy reload`. If the route references a new secret, add it with
+`sudo agentbox add-secret <name>` and re-run `sudo agentbox setup` first (the
+drop-in must know the name). Validation fails closed: a broken routes.json never replaces the
 live config.
 
 ## Revoke / contain a container
