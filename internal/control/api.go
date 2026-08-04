@@ -33,6 +33,12 @@ type Service interface {
 	Keys(context.Context) []domain.KeyInfo
 	SetKey(context.Context, string, []byte) error
 	DeleteKey(context.Context, string) error
+	CredentialSources(context.Context) []domain.CredentialSource
+	PutCredentialSource(context.Context, domain.CredentialSource) error
+	DeleteCredentialSource(context.Context, string) error
+	CredentialGrants(context.Context) []domain.CredentialGrant
+	PutCredentialGrant(context.Context, domain.CredentialGrant) error
+	DeleteCredentialGrant(context.Context, string, string) error
 	Containers(context.Context) []domain.Container
 	AddContainer(context.Context, domain.Container) (domain.Container, error)
 	SetContainerBlocked(context.Context, string, bool) error
@@ -58,6 +64,16 @@ func (a API) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/keys", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, a.Service.Keys(r.Context())) })
 	mux.HandleFunc("PUT /v1/keys/{name}", a.putKey)
 	mux.HandleFunc("DELETE /v1/keys/{name}", a.deleteKey)
+	mux.HandleFunc("GET /v1/credential-sources", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, a.Service.CredentialSources(r.Context()))
+	})
+	mux.HandleFunc("PUT /v1/credential-sources/{name}", a.putCredentialSource)
+	mux.HandleFunc("DELETE /v1/credential-sources/{name}", a.deleteCredentialSource)
+	mux.HandleFunc("GET /v1/credential-grants", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, a.Service.CredentialGrants(r.Context()))
+	})
+	mux.HandleFunc("PUT /v1/credential-grants/{container}/{credential}", a.putCredentialGrant)
+	mux.HandleFunc("DELETE /v1/credential-grants/{container}/{credential}", a.deleteCredentialGrant)
 	mux.HandleFunc("GET /v1/containers", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, a.Service.Containers(r.Context()))
 	})
@@ -120,6 +136,54 @@ func (a API) putKey(w http.ResponseWriter, r *http.Request) {
 
 func (a API) deleteKey(w http.ResponseWriter, r *http.Request) {
 	if err := a.Service.DeleteKey(r.Context(), r.PathValue("name")); err != nil {
+		writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a API) putCredentialSource(w http.ResponseWriter, r *http.Request) {
+	var source domain.CredentialSource
+	if !decodeJSON(w, r, &source) {
+		return
+	}
+	if source.Name != r.PathValue("name") {
+		writeErrorStatus(w, http.StatusBadRequest, "credential source name must match URL")
+		return
+	}
+	if err := a.Service.PutCredentialSource(r.Context(), source); err != nil {
+		writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a API) deleteCredentialSource(w http.ResponseWriter, r *http.Request) {
+	if err := a.Service.DeleteCredentialSource(r.Context(), r.PathValue("name")); err != nil {
+		writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a API) putCredentialGrant(w http.ResponseWriter, r *http.Request) {
+	var grant domain.CredentialGrant
+	if !decodeJSON(w, r, &grant) {
+		return
+	}
+	if grant.Container != r.PathValue("container") || grant.Credential != r.PathValue("credential") {
+		writeErrorStatus(w, http.StatusBadRequest, "credential grant container and credential must match URL")
+		return
+	}
+	if err := a.Service.PutCredentialGrant(r.Context(), grant); err != nil {
+		writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a API) deleteCredentialGrant(w http.ResponseWriter, r *http.Request) {
+	if err := a.Service.DeleteCredentialGrant(r.Context(), r.PathValue("container"), r.PathValue("credential")); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -351,6 +415,28 @@ func clear(value []byte) {
 }
 func (c *Client) DeleteKey(ctx context.Context, name string) error {
 	return c.json(ctx, http.MethodDelete, "/v1/keys/"+name, nil, nil)
+}
+func (c *Client) CredentialSources(ctx context.Context) ([]domain.CredentialSource, error) {
+	var out []domain.CredentialSource
+	err := c.json(ctx, http.MethodGet, "/v1/credential-sources", nil, &out)
+	return out, err
+}
+func (c *Client) PutCredentialSource(ctx context.Context, source domain.CredentialSource) error {
+	return c.json(ctx, http.MethodPut, "/v1/credential-sources/"+source.Name, source, nil)
+}
+func (c *Client) DeleteCredentialSource(ctx context.Context, name string) error {
+	return c.json(ctx, http.MethodDelete, "/v1/credential-sources/"+name, nil, nil)
+}
+func (c *Client) CredentialGrants(ctx context.Context) ([]domain.CredentialGrant, error) {
+	var out []domain.CredentialGrant
+	err := c.json(ctx, http.MethodGet, "/v1/credential-grants", nil, &out)
+	return out, err
+}
+func (c *Client) PutCredentialGrant(ctx context.Context, grant domain.CredentialGrant) error {
+	return c.json(ctx, http.MethodPut, "/v1/credential-grants/"+grant.Container+"/"+grant.Credential, grant, nil)
+}
+func (c *Client) DeleteCredentialGrant(ctx context.Context, container, name string) error {
+	return c.json(ctx, http.MethodDelete, "/v1/credential-grants/"+container+"/"+name, nil, nil)
 }
 func (c *Client) Containers(ctx context.Context) ([]domain.Container, error) {
 	var out []domain.Container

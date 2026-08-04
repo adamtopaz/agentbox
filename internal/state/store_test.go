@@ -15,6 +15,8 @@ func TestStoreRoundTripAndStrictInput(t *testing.T) {
 	state := domain.NewState()
 	state.Containers = []domain.Container{{Name: "dev", Scope: "prod", CreatedAt: time.Now()}}
 	state.Routes = []domain.Route{{Name: "api", Scope: "prod", Match: domain.Match{PathPrefix: "/api"}, Upstream: "https://example.com"}}
+	state.CredentialSources = []domain.CredentialSource{{Name: "source", Provider: "provider", Parameters: map[string]string{"public": "value"}, Secrets: map[string]string{"root": "root-key"}}}
+	state.CredentialGrants = []domain.CredentialGrant{{Container: "dev", Credential: "api", Source: "source"}}
 	if err := store.Save(state); err != nil {
 		t.Fatal(err)
 	}
@@ -22,7 +24,7 @@ func TestStoreRoundTripAndStrictInput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded.Routes) != 1 || len(loaded.Containers) != 1 {
+	if len(loaded.Routes) != 1 || len(loaded.Containers) != 1 || len(loaded.CredentialSources) != 1 || len(loaded.CredentialGrants) != 1 {
 		t.Fatalf("unexpected state: %+v", loaded)
 	}
 	info, err := os.Stat(path)
@@ -38,5 +40,20 @@ func TestStoreRoundTripAndStrictInput(t *testing.T) {
 	}
 	if _, err := store.Load(); err == nil {
 		t.Fatal("unknown state field was accepted")
+	}
+}
+
+func TestStoreLoadsStateWithoutCredentialFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	data := `{"version":1,"routes":[],"containers":[]}`
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := (Store{Path: path}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.CredentialSources == nil || loaded.CredentialGrants == nil {
+		t.Fatalf("credential collections were not normalized: %+v", loaded)
 	}
 }

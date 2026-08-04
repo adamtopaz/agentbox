@@ -2,13 +2,21 @@ package domain
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"testing"
 	"time"
 )
 
 type mapResolver map[string][]byte
 
-func (m mapResolver) Resolve(name string) ([]byte, bool) { v, ok := m[name]; return v, ok }
+func (m mapResolver) Resolve(_ context.Context, _ string, ref MaterialReference) ([]byte, error) {
+	v, ok := m[ref.Name]
+	if !ok {
+		return nil, fmt.Errorf("missing %s %q", ref.Kind, ref.Name)
+	}
+	return append([]byte(nil), v...), nil
+}
 
 func validRoute() Route {
 	return Route{Name: "example", Scope: "prod", Match: Match{PathPrefix: "/api"}, Upstream: "https://example.com/base",
@@ -49,7 +57,7 @@ func TestTemplate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := tpl.Render(mapResolver{"github-pat": []byte("pat"), "suffix": []byte("ok")})
+	got, err := tpl.Render(context.Background(), "dev", mapResolver{"github-pat": []byte("pat"), "suffix": []byte("ok")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,8 +68,51 @@ func TestTemplate(t *testing.T) {
 	if !bytes.Equal([]byte(tpl.Keys()[0]), []byte("github-pat")) {
 		t.Fatalf("keys: %v", tpl.Keys())
 	}
-	if _, err := tpl.Render(mapResolver{}); err == nil {
+	if _, err := tpl.Render(context.Background(), "dev", mapResolver{}); err == nil {
 		t.Fatal("missing secret accepted")
+	}
+}
+
+func TestCredentialTemplate(t *testing.T) {
+	tpl, err := ParseTemplate("Bearer {credential:github} / Basic {basic:x-access-token:credential:github}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := tpl.Render(context.Background(), "dev", mapResolver{"github": []byte("ghs_token")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "Bearer ghs_token / Basic eC1hY2Nlc3MtdG9rZW46Z2hzX3Rva2Vu" {
+		t.Fatalf("rendered=%q", got)
+	}
+	if len(tpl.Keys()) != 0 || len(tpl.Credentials()) != 1 || tpl.Credentials()[0] != "github" {
+		t.Fatalf("keys=%v credentials=%v", tpl.Keys(), tpl.Credentials())
+	}
+	for _, invalid := range []string{"{credential:Bad}", "{basic:x:credential:Bad}", "{basic:x:other:name}"} {
+		if _, err := ParseTemplate(invalid); err == nil {
+			t.Fatalf("accepted %q", invalid)
+		}
+	}
+}
+
+func TestCredentialStateReferences(t *testing.T) {
+	state := NewState()
+	state.Containers = []Container{{Name: "dev", Scope: "prod", CreatedAt: time.Now()}}
+	state.CredentialSources = []CredentialSource{{Name: "github-prod", Provider: "github-app", Parameters: map[string]string{"installation-id": "1"}, Secrets: map[string]string{"private-key": "app.pem"}}}
+	state.CredentialGrants = []CredentialGrant{{Container: "dev", Credential: "github", Source: "github-prod"}}
+	if err := ValidateState(state); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*State){
+		func(s *State) { s.CredentialGrants[0].Container = "missing" },
+		func(s *State) { s.CredentialGrants[0].Source = "missing" },
+		func(s *State) { s.CredentialGrants = append(s.CredentialGrants, s.CredentialGrants[0]) },
+	} {
+		candidate := CloneState(state)
+		mutate(&candidate)
+		if ValidateState(candidate) == nil {
+			t.Fatal("accepted invalid credential references")
+		}
 	}
 }
 
@@ -70,8 +121,14 @@ func TestCloneStateIsDeep(t *testing.T) {
 	s.Routes = []Route{validRoute()}
 	clone := CloneState(s)
 	clone.Routes[0].SetHeaders[0].Value = "changed"
+	clone.CredentialSources = []CredentialSource{{Name: "source", Provider: "provider", Parameters: map[string]string{"a": "b"}, Secrets: map[string]string{}}}
+	original := CloneState(clone)
+	clone.CredentialSources[0].Parameters["a"] = "changed"
 	if s.Routes[0].SetHeaders[0].Value == "changed" {
 		t.Fatal("nested route data was shared")
+	}
+	if original.CredentialSources[0].Parameters["a"] == "changed" {
+		t.Fatal("credential source maps were shared")
 	}
 }
 

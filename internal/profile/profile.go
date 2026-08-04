@@ -29,11 +29,11 @@ func ReplaceOwned(existing, generated []domain.Route, owns func(domain.Route) bo
 }
 
 func GitHubRoutes() []domain.Route {
-	bearer := []domain.HeaderValue{{Name: "Authorization", Value: "Bearer {secret:github-pat}"}}
+	bearer := []domain.HeaderValue{{Name: "Authorization", Value: "Bearer {credential:github}"}}
 	return []domain.Route{
 		{Name: "github-api", Scope: "*", Match: domain.Match{PathPrefix: "/github-api"}, Upstream: "https://api.github.com", StripPrefix: true, SetHeaders: bearer},
 		{Name: "github-git", Scope: "*", Match: domain.Match{PathPrefix: "/github-git"}, Upstream: "https://github.com", StripPrefix: true,
-			SetHeaders: []domain.HeaderValue{{Name: "Authorization", Value: "Basic {basic:x-access-token:github-pat}"}}},
+			SetHeaders: []domain.HeaderValue{{Name: "Authorization", Value: "Basic {basic:x-access-token:credential:github}"}}},
 		{Name: "github-host-api", Scope: "*", Match: domain.Match{Host: "api.github.com"}, Upstream: "https://api.github.com", SetHeaders: bearer},
 		{Name: "github-host-uploads", Scope: "*", Match: domain.Match{Host: "uploads.github.com"}, Upstream: "https://uploads.github.com", SetHeaders: bearer},
 		{Name: "github-host-objects", Scope: "*", Match: domain.Match{Host: "objects.githubusercontent.com"}, Upstream: "https://objects.githubusercontent.com"},

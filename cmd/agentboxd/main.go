@@ -75,8 +75,9 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("open state: %w", err)
 	}
+	defer service.Close()
 
-	dataPlane := &proxy.Server{Snapshots: service, Secrets: service, Log: log}
+	dataPlane := &proxy.Server{Snapshots: service, Materials: service, Log: log}
 	listeners := &proxy.ListenerManager{Dir: *containerSockets, Proxy: dataPlane, Log: log}
 	if err := service.AttachListeners(listeners); err != nil {
 		return fmt.Errorf("start container listeners: %w", err)
@@ -92,7 +93,8 @@ func run() error {
 	}
 	health := service.Health(context.Background())
 	log.Info("agentboxd ready", "version", version, "control_socket", *controlSocket,
-		"routes", health.Routes, "keys", health.Keys, "containers", health.Containers)
+		"routes", health.Routes, "keys", health.Keys, "containers", health.Containers,
+		"credential_sources", health.CredentialSources, "credential_grants", health.CredentialGrants)
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

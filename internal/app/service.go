@@ -11,8 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"agentbox/internal/credential"
 	"agentbox/internal/domain"
 	"agentbox/internal/engine"
+	"agentbox/internal/githubapp"
 	"agentbox/internal/secret"
 	"agentbox/internal/state"
 )
@@ -27,8 +29,9 @@ type ListenerReconciler interface {
 }
 
 type Service struct {
-	stateStore state.Store
-	keys       *secret.Store
+	stateStore  state.Store
+	keys        *secret.Store
+	credentials *credential.Broker
 
 	mu        sync.Mutex
 	state     domain.State
@@ -37,13 +40,21 @@ type Service struct {
 }
 
 type Health struct {
-	Status     string `json:"status"`
-	Routes     int    `json:"routes"`
-	Keys       int    `json:"keys"`
-	Containers int    `json:"containers"`
+	Status            string `json:"status"`
+	Routes            int    `json:"routes"`
+	Keys              int    `json:"keys"`
+	Containers        int    `json:"containers"`
+	CredentialSources int    `json:"credential_sources"`
+	CredentialGrants  int    `json:"credential_grants"`
 }
 
 func Open(stateStore state.Store, keys *secret.Store) (*Service, error) {
+	return OpenWithProviders(stateStore, keys, []credential.Provider{githubapp.MustDefault()}, credential.Options{})
+}
+
+// OpenWithProviders is the composition seam used by tests and future provider
+// adapters. Production Open registers only explicitly supported providers.
+func OpenWithProviders(stateStore state.Store, keys *secret.Store, providers []credential.Provider, options credential.Options) (*Service, error) {
 	current, err := stateStore.Load()
 	if err != nil {
 		return nil, err
@@ -52,7 +63,14 @@ func Open(stateStore state.Store, keys *secret.Store) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Service{stateStore: stateStore, keys: keys, state: current}
+	broker, err := credential.NewBroker(keys, providers, options)
+	if err != nil {
+		return nil, err
+	}
+	if err := broker.Configure(current); err != nil {
+		return nil, err
+	}
+	s := &Service{stateStore: stateStore, keys: keys, credentials: broker, state: current}
 	s.snapshot.Store(snapshot)
 	return s, nil
 }
@@ -73,13 +91,34 @@ func (s *Service) AttachListeners(listeners ListenerReconciler) error {
 	return nil
 }
 
-func (s *Service) Snapshot() *engine.Snapshot         { return s.snapshot.Load() }
-func (s *Service) Resolve(name string) ([]byte, bool) { return s.keys.Resolve(name) }
+func (s *Service) Snapshot() *engine.Snapshot { return s.snapshot.Load() }
+
+func (s *Service) Close() { s.credentials.Close() }
+
+func (s *Service) Resolve(ctx context.Context, principal string, ref domain.MaterialReference) ([]byte, error) {
+	switch ref.Kind {
+	case domain.MaterialSecret:
+		value, ok := s.keys.Resolve(ref.Name)
+		if !ok {
+			return nil, fmt.Errorf("secret %q is not installed", ref.Name)
+		}
+		return value, nil
+	case domain.MaterialCredential:
+		lease, err := s.credentials.Acquire(ctx, principal, ref.Name)
+		if err != nil {
+			return nil, err
+		}
+		return lease.Value, nil
+	default:
+		return nil, fmt.Errorf("unknown material kind %q", ref.Kind)
+	}
+}
 
 func (s *Service) Health(context.Context) Health {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return Health{Status: "ok", Routes: len(s.state.Routes), Keys: len(s.keys.List()), Containers: len(s.state.Containers)}
+	return Health{Status: "ok", Routes: len(s.state.Routes), Keys: len(s.keys.List()), Containers: len(s.state.Containers),
+		CredentialSources: len(s.state.CredentialSources), CredentialGrants: len(s.state.CredentialGrants)}
 }
 
 func (s *Service) Routes(context.Context) []domain.Route {
@@ -119,7 +158,11 @@ func (s *Service) DeleteRoute(_ context.Context, name string) error {
 
 func (s *Service) Keys(context.Context) []domain.KeyInfo { return s.keys.List() }
 func (s *Service) SetKey(_ context.Context, name string, value []byte) error {
-	return s.keys.Set(name, value)
+	if err := s.keys.Set(name, value); err != nil {
+		return err
+	}
+	s.credentials.InvalidateSecret(name)
+	return nil
 }
 
 func (s *Service) DeleteKey(_ context.Context, name string) error {
@@ -136,10 +179,84 @@ func (s *Service) DeleteKey(_ context.Context, name string) error {
 			}
 		}
 	}
+	for _, source := range s.state.CredentialSources {
+		for role, ref := range source.Secrets {
+			if ref == name {
+				return fmt.Errorf("%w: key %q is referenced by credential source %q as %q", ErrConflict, name, source.Name, role)
+			}
+		}
+	}
 	if !s.keys.Has(name) {
 		return fmt.Errorf("%w: key %q", ErrNotFound, name)
 	}
 	return s.keys.Delete(name)
+}
+
+func (s *Service) CredentialSources(context.Context) []domain.CredentialSource {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return domain.CloneState(s.state).CredentialSources
+}
+
+func (s *Service) PutCredentialSource(_ context.Context, source domain.CredentialSource) error {
+	return s.change(func(next *domain.State) error {
+		for i := range next.CredentialSources {
+			if next.CredentialSources[i].Name == source.Name {
+				next.CredentialSources[i] = source
+				return nil
+			}
+		}
+		next.CredentialSources = append(next.CredentialSources, source)
+		return nil
+	})
+}
+
+func (s *Service) DeleteCredentialSource(_ context.Context, name string) error {
+	return s.change(func(next *domain.State) error {
+		for _, grant := range next.CredentialGrants {
+			if grant.Source == name {
+				return fmt.Errorf("%w: credential source %q is referenced by grant %q for container %q", ErrConflict, name, grant.Credential, grant.Container)
+			}
+		}
+		for i, source := range next.CredentialSources {
+			if source.Name == name {
+				next.CredentialSources = append(next.CredentialSources[:i], next.CredentialSources[i+1:]...)
+				return nil
+			}
+		}
+		return fmt.Errorf("%w: credential source %q", ErrNotFound, name)
+	})
+}
+
+func (s *Service) CredentialGrants(context.Context) []domain.CredentialGrant {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return domain.CloneState(s.state).CredentialGrants
+}
+
+func (s *Service) PutCredentialGrant(_ context.Context, grant domain.CredentialGrant) error {
+	return s.change(func(next *domain.State) error {
+		for i := range next.CredentialGrants {
+			if next.CredentialGrants[i].Container == grant.Container && next.CredentialGrants[i].Credential == grant.Credential {
+				next.CredentialGrants[i] = grant
+				return nil
+			}
+		}
+		next.CredentialGrants = append(next.CredentialGrants, grant)
+		return nil
+	})
+}
+
+func (s *Service) DeleteCredentialGrant(_ context.Context, container, name string) error {
+	return s.change(func(next *domain.State) error {
+		for i, grant := range next.CredentialGrants {
+			if grant.Container == container && grant.Credential == name {
+				next.CredentialGrants = append(next.CredentialGrants[:i], next.CredentialGrants[i+1:]...)
+				return nil
+			}
+		}
+		return fmt.Errorf("%w: credential %q for container %q", ErrNotFound, name, container)
+	})
 }
 
 func (s *Service) Containers(context.Context) []domain.Container {
@@ -181,6 +298,13 @@ func (s *Service) DeleteContainer(_ context.Context, name string) error {
 		for i, container := range next.Containers {
 			if container.Name == name {
 				next.Containers = append(next.Containers[:i], next.Containers[i+1:]...)
+				grants := next.CredentialGrants[:0]
+				for _, grant := range next.CredentialGrants {
+					if grant.Container != name {
+						grants = append(grants, grant)
+					}
+				}
+				next.CredentialGrants = grants
 				return nil
 			}
 		}
@@ -201,13 +325,23 @@ func (s *Service) change(mutator func(*domain.State) error) error {
 	if err != nil {
 		return err
 	}
+	if err := s.credentials.Validate(next); err != nil {
+		return err
+	}
 	if s.listeners != nil {
 		if err := s.listeners.Reconcile(next.Containers); err != nil {
 			rollbackErr := s.listeners.Reconcile(previous.Containers)
 			return fmt.Errorf("reconcile listeners: %w (rollback listeners: %v)", err, rollbackErr)
 		}
 	}
+	if err := s.credentials.Configure(next); err != nil {
+		if s.listeners != nil {
+			_ = s.listeners.Reconcile(previous.Containers)
+		}
+		return fmt.Errorf("configure credentials: %w", err)
+	}
 	if err := s.stateStore.Save(next); err != nil {
+		_ = s.credentials.Configure(previous)
 		if s.listeners != nil {
 			rollbackErr := s.listeners.Reconcile(previous.Containers)
 			return fmt.Errorf("persist state: %w (rollback listeners: %v)", err, rollbackErr)

@@ -170,6 +170,25 @@ abx route put "$WORK/missing-route.json"
 [[ $(proxy -o /dev/null -w '%{http_code}' http://agentbox/missing/x) == 503 ]] \
     || fail "missing key did not return 503"
 
+# Renewable credentials are configured and granted independently. A missing
+# GitHub App private key fails before any network request and never forwards
+# the container's dummy Authorization header.
+abx credential source github-app github-test \
+    --client-id Iv1.test \
+    --installation-id 123 \
+    --private-key github-app-private-key \
+    --repository-ids 42 \
+    --permissions contents=write,pull_requests=write
+abx credential grant set dev github github-test
+abx profile apply github >/dev/null
+[[ $(proxy -o /dev/null -w '%{http_code}' -H 'Host: api.github.com' \
+    -H 'Authorization: Bearer agentbox-dummy' http://agentbox/repos/example/repo) == 503 ]] \
+    || fail "unavailable renewable credential did not fail closed"
+abx credential source list | grep -q 'github-test.*github-app' \
+    || fail "credential source is not listed"
+abx credential grant list | grep -q 'dev.*github.*github-test' \
+    || fail "credential grant is not listed"
+
 abx container block dev >/dev/null
 [[ $(proxy -o /dev/null -w '%{http_code}' http://agentbox/echo/x) == 403 ]] \
     || fail "live block did not return 403"
@@ -178,7 +197,8 @@ control -X PATCH -H 'content-type: application/json' -d '{"blocked":false}' \
 [[ $(proxy -o /dev/null -w '%{http_code}' http://agentbox/echo/x) == 200 ]] \
     || fail "live unblock did not restore the route"
 
-abx status | grep -q '3 routes, 1 keys, 1 containers' || fail "health counts are wrong"
+abx status | grep -q '9 routes, 1 keys, 1 containers, 1 credential sources, 1 credential grants' \
+    || fail "health counts are wrong"
 for leak in QUERYSECRET container-fake real-one real-two; do
     if grep -Fq "$leak" "$WORK/daemon.log"; then
         fail "daemon log leaked $leak"

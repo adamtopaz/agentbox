@@ -27,7 +27,8 @@ func cmdStatus(ctx context.Context, client *control.Client, args []string) error
 	if err != nil {
 		return err
 	}
-	fmt.Printf("agentboxd: %s (%d routes, %d keys, %d containers)\n", health.Status, health.Routes, health.Keys, health.Containers)
+	fmt.Printf("agentboxd: %s (%d routes, %d keys, %d containers, %d credential sources, %d credential grants)\n",
+		health.Status, health.Routes, health.Keys, health.Containers, health.CredentialSources, health.CredentialGrants)
 	return nil
 }
 
@@ -53,18 +54,26 @@ func cmdRoute(ctx context.Context, client *control.Client, args []string) error 
 			return printJSON(routes)
 		}
 		w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "NAME\tSCOPE\tMATCH\tUPSTREAM\tKEYS")
+		fmt.Fprintln(w, "NAME\tSCOPE\tMATCH\tUPSTREAM\tMATERIAL")
 		for _, route := range routes {
 			match := route.Match.PathPrefix
 			if route.Match.Host != "" {
 				match = "host:" + route.Match.Host
 			}
 			keys, _ := domain.ReferencedKeys([]domain.Route{route})
-			keyList := strings.Join(keys, ",")
-			if keyList == "" {
-				keyList = "-"
+			credentials, _ := domain.ReferencedCredentials([]domain.Route{route})
+			var material []string
+			for _, key := range keys {
+				material = append(material, "secret:"+key)
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", route.Name, route.Scope, match, route.Upstream, keyList)
+			for _, credential := range credentials {
+				material = append(material, "credential:"+credential)
+			}
+			materialList := strings.Join(material, ",")
+			if materialList == "" {
+				materialList = "-"
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", route.Name, route.Scope, match, route.Upstream, materialList)
 		}
 		return w.Flush()
 	case "put":

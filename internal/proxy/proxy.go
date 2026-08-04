@@ -25,7 +25,7 @@ type SnapshotSource interface{ Snapshot() *engine.Snapshot }
 
 type Server struct {
 	Snapshots SnapshotSource
-	Secrets   domain.Resolver
+	Materials domain.Resolver
 	Transport http.RoundTripper
 	Log       *slog.Logger
 }
@@ -77,7 +77,7 @@ func (s *Server) Handler(containerName string) http.Handler {
 
 		headers := make(http.Header, len(route.Headers))
 		for _, h := range route.Headers {
-			value, err := h.Template.Render(s.Secrets)
+			value, err := h.Template.Render(r.Context(), containerName, s.Materials)
 			if err != nil {
 				s.logger().Warn("route credential unavailable", "container", containerName, "route", route.Name, "err", err)
 				status = http.StatusServiceUnavailable

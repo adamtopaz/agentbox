@@ -32,6 +32,13 @@ generic control plane:
   key list
   key set <name>                read value hidden or from stdin
   key delete <name>
+  credential source list
+  credential source put <source.json>
+  credential source github-app <name> [flags]
+  credential source delete <name>
+  credential grant list
+  credential grant set <container> <credential> <source>
+  credential grant delete <container> <credential>
 
 optional profiles:
   profile apply github
@@ -87,6 +94,8 @@ func run() error {
 		return cmdRoute(ctx, client, args[1:])
 	case "key":
 		return cmdKey(ctx, client, args[1:])
+	case "credential":
+		return cmdCredential(ctx, client, args[1:])
 	case "profile":
 		return cmdProfile(ctx, client, args[1:])
 	case "container":

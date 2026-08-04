@@ -3,8 +3,8 @@
 Agentbox runs coding agents in Incus containers without putting real API keys
 in those containers. A small Go daemon owns both the reverse proxy and its live
 configuration. Containers receive dummy credentials; `agentboxd` removes
-credential-bearing request headers and injects the appropriate host-side key
-only after a route has matched.
+credential-bearing request headers and injects an appropriate host-side static
+secret or renewable credential only after a route has matched.
 
 There is no Caddy dependency and no generated proxy configuration. Routes,
 keys, and container registrations change while the daemon is running.
@@ -14,8 +14,9 @@ keys, and container registrations change while the daemon is running.
 ```text
 operator
   agentbox CLI ── HTTP/Unix socket ──> typed application service
-                                           ├── state.json (routes/containers)
+                                           ├── state.json (routes/containers/sources/grants)
                                            ├── AES-256-GCM key envelopes
+                                           ├── expiring credential broker
                                            └── immutable runtime snapshots
 
 container ── Incus proxy device ──> per-container Unix socket
@@ -23,9 +24,9 @@ container ── Incus proxy device ──> per-container Unix socket
 ```
 
 HTTP is only the current adapter for the control socket. Validation,
-persistence, route/key operations, and commits live in a transport-independent
-application service. Provider profiles are ordinary compositions of the same
-generic route model.
+persistence, route/key/credential operations, and commits live in a
+transport-independent application service. Provider profiles are ordinary
+compositions of the same generic route model.
 
 The per-container socket is its identity. A container has no bearer token with
 which to claim another identity, and its listener sees only routes in its
@@ -70,18 +71,42 @@ Rebuilding the same alias uses `incus publish --reuse`.
 
 ## Configure and use
 
-GitHub is an optional profile built from ordinary routes:
+GitHub is an optional profile built from ordinary routes and a renewable
+credential. Give the GitHub App only the repository permissions agents need,
+install it on the intended repositories, and download one App private key.
+The Client ID, installation ID, repository selection, and permission subset
+are non-secret configuration; only the PEM is stored as an encrypted key.
 
 ```sh
-agentbox key set github-pat
+agentbox key set github-app-private-key < /path/to/app.private-key.pem
+
+agentbox credential source github-app github-main \
+  --client-id Iv1.example \
+  --installation-id 12345678 \
+  --private-key github-app-private-key \
+  --repository-ids 111111,222222 \
+  --permissions contents=write,pull_requests=write,issues=write
+
 agentbox profile apply github
+
+agentbox container create --scope prod --configure none work
+agentbox credential grant set work github github-main
+agentbox container shell work
 ```
 
-The value is read without terminal echo (or from stdin), sent over the
-permission-protected control socket, encrypted, and made available immediately.
-The image configures `git` through `/github-git/` and uses GitHub CLI's
-supported [`http_unix_socket`](https://cli.github.com/manual/gh_config) setting
-for `/run/agentbox.sock`.
+Use `--repositories repo-a,repo-b` instead of numeric IDs if preferred; names
+are relative to the installation account. Omit both selectors to use every
+repository selected in the installation. Omit `--permissions` to inherit all
+App permissions, though an explicit least-privilege subset is preferable.
+
+On the first request, the host signs a short-lived App JWT, exchanges it for a
+one-hour installation token, caches that token only in daemon memory, and
+refreshes it before expiry. A grant binds the logical credential `github` to a
+source for exactly one container listener. The App private key, JWT, and
+installation token never enter the container. The image configures `git`
+through `/github-git/` and uses GitHub CLI's supported
+[`http_unix_socket`](https://cli.github.com/manual/gh_config) setting for
+`/run/agentbox.sock`; `gh` and Git continue to see only dummy credentials.
 
 Cloudflare AI Gateway is also an optional profile. Each gateway is both a route
 scope and a separately named key:
@@ -106,6 +131,8 @@ Useful live operations:
 agentbox status
 agentbox route list
 agentbox key list
+agentbox credential source list
+agentbox credential grant list
 agentbox container list
 agentbox container block work
 agentbox container block --hard work
@@ -139,9 +166,12 @@ agentbox key set example-token
 agentbox route put route.json
 ```
 
-Header values support `{secret:key-name}` and
-`{basic:username:key-name}`. A missing referenced key returns 503 before any
-upstream request. Incoming authorization, cookies, forwarding headers,
+Header values support durable `{secret:key-name}` references, renewable
+`{credential:name}` references, and Basic forms such as
+`{basic:username:key-name}` or `{basic:username:credential:name}`. Credential
+names are resolved against the grant for the request's container listener. A
+missing key, grant, or valid lease returns 503 before any upstream request.
+Incoming authorization, cookies, forwarding headers,
 Cloudflare Access headers, and the complete `cf-aig-*` family are removed;
 configured headers are applied afterward. Queries are forwarded but never
 logged. Ambiguous escaped paths, dot segments, repeated separators, backslashes,
@@ -153,6 +183,8 @@ The daemon runs as `agentboxd`, with no capabilities and a hardened systemd
 unit. `systemd-creds` protects one 32-byte master key at startup. Dynamic keys
 are independently sealed with AES-256-GCM using random nonces and key-name-bound
 additional data under `/var/lib/agentbox/secrets`; rotation needs no restart.
+Renewable leases exist only in daemon memory, are never returned by the control
+API, and are cleared on source/key changes and shutdown.
 
 Membership in group `agentbox` is a trusted secret-management role. A member
 cannot list plaintext through the API, but can set a route that sends a stored

@@ -53,7 +53,8 @@ type PathRewrite struct {
 }
 
 // HeaderValue sets a request header after agent-supplied credentials have
-// been stripped. Value supports {secret:name} and {basic:user:name} templates.
+// been stripped. Templates may reference durable secrets or credentials
+// resolved for the container on whose listener the request arrived.
 type HeaderValue struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
@@ -66,10 +67,31 @@ type Container struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// CredentialSource is provider-neutral configuration for an object capable
+// of issuing request credentials. Parameters are public configuration;
+// Secrets maps provider-defined roles to encrypted key-store entries.
+type CredentialSource struct {
+	Name       string            `json:"name"`
+	Provider   string            `json:"provider"`
+	Parameters map[string]string `json:"parameters"`
+	Secrets    map[string]string `json:"secrets"`
+}
+
+// CredentialGrant binds a logical route credential to one container. The
+// per-container proxy listener is the principal: request data can never select
+// a different grant.
+type CredentialGrant struct {
+	Container  string `json:"container"`
+	Credential string `json:"credential"`
+	Source     string `json:"source"`
+}
+
 type State struct {
-	Version    int         `json:"version"`
-	Routes     []Route     `json:"routes"`
-	Containers []Container `json:"containers"`
+	Version           int                `json:"version"`
+	Routes            []Route            `json:"routes"`
+	Containers        []Container        `json:"containers"`
+	CredentialSources []CredentialSource `json:"credential_sources"`
+	CredentialGrants  []CredentialGrant  `json:"credential_grants"`
 }
 
 type KeyInfo struct {
@@ -78,7 +100,8 @@ type KeyInfo struct {
 }
 
 func NewState() State {
-	return State{Version: StateVersion, Routes: []Route{}, Containers: []Container{}}
+	return State{Version: StateVersion, Routes: []Route{}, Containers: []Container{},
+		CredentialSources: []CredentialSource{}, CredentialGrants: []CredentialGrant{}}
 }
 
 func ValidName(s string) bool    { return nameRE.MatchString(s) }
@@ -115,6 +138,80 @@ func ValidateState(s State) error {
 			return fmt.Errorf("duplicate container name %q", c.Name)
 		}
 		containers[c.Name] = true
+	}
+	sources := map[string]bool{}
+	for i, source := range s.CredentialSources {
+		if err := ValidateCredentialSource(source); err != nil {
+			return fmt.Errorf("credential source %d: %w", i, err)
+		}
+		if sources[source.Name] {
+			return fmt.Errorf("duplicate credential source name %q", source.Name)
+		}
+		sources[source.Name] = true
+	}
+	grants := map[string]bool{}
+	for i, grant := range s.CredentialGrants {
+		if err := ValidateCredentialGrant(grant); err != nil {
+			return fmt.Errorf("credential grant %d: %w", i, err)
+		}
+		if !containers[grant.Container] {
+			return fmt.Errorf("credential grant %d: unknown container %q", i, grant.Container)
+		}
+		if !sources[grant.Source] {
+			return fmt.Errorf("credential grant %d: unknown source %q", i, grant.Source)
+		}
+		key := grant.Container + "\x00" + grant.Credential
+		if grants[key] {
+			return fmt.Errorf("duplicate credential %q for container %q", grant.Credential, grant.Container)
+		}
+		grants[key] = true
+	}
+	return nil
+}
+
+func ValidateCredentialSource(source CredentialSource) error {
+	if !ValidName(source.Name) {
+		return fmt.Errorf("invalid name %q (want a lowercase slug, max 63 characters)", source.Name)
+	}
+	if !ValidName(source.Provider) {
+		return fmt.Errorf("invalid provider %q", source.Provider)
+	}
+	for name, value := range source.Parameters {
+		if !ValidKeyName(name) {
+			return fmt.Errorf("invalid parameter name %q", name)
+		}
+		if value == "" {
+			return fmt.Errorf("parameter %q must not be empty", name)
+		}
+		if len(value) > 64<<10 {
+			return fmt.Errorf("parameter %q exceeds 65536 bytes", name)
+		}
+		for _, ch := range []byte(value) {
+			if ch < 0x20 || ch > 0x7e {
+				return fmt.Errorf("parameter %q contains a non-printable or non-ASCII byte", name)
+			}
+		}
+	}
+	for role, key := range source.Secrets {
+		if !ValidKeyName(role) {
+			return fmt.Errorf("invalid secret role %q", role)
+		}
+		if !ValidKeyName(key) {
+			return fmt.Errorf("invalid key name %q for secret role %q", key, role)
+		}
+	}
+	return nil
+}
+
+func ValidateCredentialGrant(grant CredentialGrant) error {
+	if !ValidName(grant.Container) {
+		return fmt.Errorf("invalid container %q", grant.Container)
+	}
+	if !ValidName(grant.Credential) {
+		return fmt.Errorf("invalid credential %q", grant.Credential)
+	}
+	if !ValidName(grant.Source) {
+		return fmt.Errorf("invalid source %q", grant.Source)
 	}
 	return nil
 }
@@ -243,6 +340,13 @@ func NormalizeState(s State) State {
 	}
 	sort.Slice(s.Routes, func(i, j int) bool { return s.Routes[i].Name < s.Routes[j].Name })
 	sort.Slice(s.Containers, func(i, j int) bool { return s.Containers[i].Name < s.Containers[j].Name })
+	sort.Slice(s.CredentialSources, func(i, j int) bool { return s.CredentialSources[i].Name < s.CredentialSources[j].Name })
+	sort.Slice(s.CredentialGrants, func(i, j int) bool {
+		if s.CredentialGrants[i].Container != s.CredentialGrants[j].Container {
+			return s.CredentialGrants[i].Container < s.CredentialGrants[j].Container
+		}
+		return s.CredentialGrants[i].Credential < s.CredentialGrants[j].Credential
+	})
 	return s
 }
 
@@ -256,6 +360,36 @@ func CloneState(s State) State {
 		out.Routes[i] = r
 		out.Routes[i].PathMap = append([]PathRewrite(nil), r.PathMap...)
 		out.Routes[i].SetHeaders = append([]HeaderValue(nil), r.SetHeaders...)
+	}
+	out.CredentialSources = make([]CredentialSource, len(s.CredentialSources))
+	for i, source := range s.CredentialSources {
+		out.CredentialSources[i] = source
+		out.CredentialSources[i].Parameters = cloneMap(source.Parameters)
+		out.CredentialSources[i].Secrets = cloneMap(source.Secrets)
+	}
+	out.CredentialGrants = append([]CredentialGrant(nil), s.CredentialGrants...)
+	if out.Routes == nil {
+		out.Routes = []Route{}
+	}
+	if out.Containers == nil {
+		out.Containers = []Container{}
+	}
+	if out.CredentialSources == nil {
+		out.CredentialSources = []CredentialSource{}
+	}
+	if out.CredentialGrants == nil {
+		out.CredentialGrants = []CredentialGrant{}
+	}
+	return out
+}
+
+func cloneMap(source map[string]string) map[string]string {
+	if source == nil {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(source))
+	for key, value := range source {
+		out[key] = value
 	}
 	return out
 }
@@ -279,6 +413,28 @@ func ReferencedKeys(routes []Route) ([]string, error) {
 				return nil, err
 			}
 			for _, name := range t.Keys() {
+				if !seen[name] {
+					seen[name] = true
+					out = append(out, name)
+				}
+			}
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// ReferencedCredentials returns logical credential names used by routes.
+func ReferencedCredentials(routes []Route) ([]string, error) {
+	seen := map[string]bool{}
+	var out []string
+	for _, r := range routes {
+		for _, h := range r.SetHeaders {
+			t, err := ParseTemplate(h.Value)
+			if err != nil {
+				return nil, err
+			}
+			for _, name := range t.Credentials() {
 				if !seen[name] {
 					seen[name] = true
 					out = append(out, name)

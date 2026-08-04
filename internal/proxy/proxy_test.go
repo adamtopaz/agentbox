@@ -22,7 +22,13 @@ func (s snapshots) Snapshot() *engine.Snapshot { return s.s }
 
 type resolver map[string][]byte
 
-func (r resolver) Resolve(name string) ([]byte, bool) { value, ok := r[name]; return value, ok }
+func (r resolver) Resolve(_ context.Context, _ string, ref domain.MaterialReference) ([]byte, error) {
+	value, ok := r[ref.Name]
+	if !ok {
+		return nil, errors.New("missing material")
+	}
+	return append([]byte(nil), value...), nil
+}
 
 type roundTrip func(*http.Request) (*http.Response, error)
 
@@ -55,7 +61,7 @@ func TestProxyStripsThenInjects(t *testing.T) {
 		}
 		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok")), Request: r}, nil
 	})
-	server := &Server{Snapshots: snapshots{snapshot}, Secrets: resolver{"token": []byte("real")}, Transport: transport, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	server := &Server{Snapshots: snapshots{snapshot}, Materials: resolver{"token": []byte("real")}, Transport: transport, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	req := httptest.NewRequest(http.MethodPost, "http://agentbox/api/messages?q=kept", nil)
 	req.Header.Set("Authorization", "Bearer fake")
 	req.Header.Set("Cookie", "secret")
@@ -69,13 +75,55 @@ func TestProxyStripsThenInjects(t *testing.T) {
 	}
 }
 
+type credentialResolver struct {
+	principal string
+	ref       domain.MaterialReference
+}
+
+func (r *credentialResolver) Resolve(_ context.Context, principal string, ref domain.MaterialReference) ([]byte, error) {
+	r.principal, r.ref = principal, ref
+	return []byte("ghs_installation"), nil
+}
+
+func TestProxyResolvesCredentialForListenerPrincipal(t *testing.T) {
+	state := domain.NewState()
+	state.Containers = []domain.Container{{Name: "dev", Scope: "prod", CreatedAt: time.Now()}}
+	state.Routes = []domain.Route{{
+		Name: "github", Scope: "*", Match: domain.Match{Host: "api.github.com"}, Upstream: "https://api.github.com",
+		SetHeaders: []domain.HeaderValue{{Name: "Authorization", Value: "Bearer {credential:github}"}},
+	}}
+	snapshot, err := engine.Compile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := &credentialResolver{}
+	server := &Server{
+		Snapshots: snapshots{snapshot}, Materials: resolver,
+		Transport: roundTrip(func(request *http.Request) (*http.Response, error) {
+			if got := request.Header.Get("Authorization"); got != "Bearer ghs_installation" {
+				t.Errorf("Authorization=%q", got)
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok")), Request: request}, nil
+		}),
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	request := httptest.NewRequest(http.MethodGet, "http://agentbox/repos/o/r", nil)
+	request.Host = "api.github.com"
+	request.Header.Set("Authorization", "Bearer agentbox-dummy")
+	recorder := httptest.NewRecorder()
+	server.Handler("dev").ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || resolver.principal != "dev" || resolver.ref.Kind != domain.MaterialCredential || resolver.ref.Name != "github" {
+		t.Fatalf("status=%d principal=%q ref=%+v", recorder.Code, resolver.principal, resolver.ref)
+	}
+}
+
 func TestProxyFailsClosed(t *testing.T) {
 	state := domain.NewState()
 	state.Containers = []domain.Container{{Name: "dev", Scope: "prod", CreatedAt: time.Now()}}
 	state.Routes = []domain.Route{{Name: "api", Scope: "prod", Match: domain.Match{PathPrefix: "/api"}, Upstream: "https://upstream.invalid", SetHeaders: []domain.HeaderValue{{Name: "Authorization", Value: "{secret:missing}"}}}}
 	snapshot, _ := engine.Compile(state)
 	called := false
-	server := &Server{Snapshots: snapshots{snapshot}, Secrets: resolver{}, Transport: roundTrip(func(*http.Request) (*http.Response, error) { called = true; return nil, context.Canceled }), Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	server := &Server{Snapshots: snapshots{snapshot}, Materials: resolver{}, Transport: roundTrip(func(*http.Request) (*http.Response, error) { called = true; return nil, context.Canceled }), Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	for _, path := range []string{"/api/x", "/api/%2e%2e/x"} {
 		rec := httptest.NewRecorder()
 		server.Handler("dev").ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://agentbox"+path, nil))
@@ -101,7 +149,7 @@ func TestTransportErrorDetailsAreNotLogged(t *testing.T) {
 	}
 	var logs bytes.Buffer
 	server := &Server{
-		Snapshots: snapshots{snapshot}, Secrets: resolver{},
+		Snapshots: snapshots{snapshot}, Materials: resolver{},
 		Transport: roundTrip(func(*http.Request) (*http.Response, error) {
 			return nil, errors.New("transport included URL ?token=QUERYSECRET")
 		}),

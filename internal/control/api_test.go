@@ -26,6 +26,7 @@ func TestUnixSocketRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(service.Close)
 
 	socket := filepath.Join(dir, "control.sock")
 	server := &Server{
@@ -57,12 +58,24 @@ func TestUnixSocketRoundTrip(t *testing.T) {
 	if created.CreatedAt.IsZero() {
 		t.Fatal("server did not return its canonical creation timestamp")
 	}
+	source := domain.CredentialSource{
+		Name: "github-test", Provider: "github-app",
+		Parameters: map[string]string{"client-id": "Iv1.example", "installation-id": "123"},
+		Secrets:    map[string]string{"private-key": "api-token"},
+	}
+	if err := client.PutCredentialSource(ctx, source); err != nil {
+		t.Fatal(err)
+	}
+	grant := domain.CredentialGrant{Container: "work", Credential: "github", Source: "github-test"}
+	if err := client.PutCredentialGrant(ctx, grant); err != nil {
+		t.Fatal(err)
+	}
 
 	health, err := client.Health(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if health.Routes != 1 || health.Keys != 1 || health.Containers != 1 {
+	if health.Routes != 1 || health.Keys != 1 || health.Containers != 1 || health.CredentialSources != 1 || health.CredentialGrants != 1 {
 		t.Fatalf("unexpected health: %+v", health)
 	}
 	routes, err := client.Routes(ctx)
@@ -71,6 +84,14 @@ func TestUnixSocketRoundTrip(t *testing.T) {
 	}
 	if len(routes) != 1 || routes[0].Name != "api" {
 		t.Fatalf("unexpected routes: %+v", routes)
+	}
+	sources, err := client.CredentialSources(ctx)
+	if err != nil || len(sources) != 1 || sources[0].Name != "github-test" {
+		t.Fatalf("sources=%+v err=%v", sources, err)
+	}
+	grants, err := client.CredentialGrants(ctx)
+	if err != nil || len(grants) != 1 || grants[0] != grant {
+		t.Fatalf("grants=%+v err=%v", grants, err)
 	}
 }
 

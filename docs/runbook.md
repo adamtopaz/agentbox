@@ -41,15 +41,99 @@ agentbox key list
 agentbox key delete <name>
 ```
 
-Deletion is refused while any route references the key. Remove or replace
-those routes first. Missing keys are permitted in route definitions so an
-operator can stage configuration, but requests to such a route fail closed
-with 503 before dialing upstream.
+Deletion is refused while any route or credential source references the key.
+Remove or replace those references first. Missing keys are permitted in route
+and credential-source definitions so an operator can stage configuration, but
+requests fail closed with 503 before dialing upstream.
 
 Each envelope is AES-256-GCM ciphertext with a fresh nonce. The key name is
 authenticated as additional data, so renaming an envelope cannot retarget its
 contents. An invalid envelope, wrong master key, or authentication failure
 prevents daemon startup instead of silently dropping keys.
+
+## Renewable credentials
+
+A credential source describes how to issue request material without exposing
+provider details to routes. A credential grant binds one logical name to a
+source for one container:
+
+```text
+route template {credential:github}
+             ↓
+container work + logical name github
+             ↓
+grant to source github-main
+             ↓
+github-app provider → expiring lease
+```
+
+List the live, non-secret configuration:
+
+```sh
+agentbox credential source list
+agentbox credential source list --json
+agentbox credential grant list
+agentbox credential grant list --json
+```
+
+Generic JSON sources can be submitted with `credential source put`. The
+GitHub-specific CLI adapter constructs the same generic source after validating
+its flags:
+
+```sh
+agentbox key set github-app-private-key < /path/to/app.private-key.pem
+
+agentbox credential source github-app github-main \
+  --client-id Iv1.example \
+  --installation-id 12345678 \
+  --private-key github-app-private-key \
+  --repository-ids 111111,222222 \
+  --permissions contents=write,pull_requests=write,issues=write
+
+agentbox credential grant set work github github-main
+```
+
+The Client ID is shown on the GitHub App settings page. The installation ID is
+the numeric component of the installation's Configure URL (and is also
+available from GitHub's App installation API). It is not the App ID.
+
+`--repositories repo-a,repo-b` is an alternative to numeric IDs; repository
+names are relative to the installation account. The two selectors are mutually
+exclusive and GitHub permits at most 500. Omitting both gives the token access
+to every repository selected in that installation. Omitting permissions gives
+the token all permissions granted to the installation. Neither option can
+expand beyond the App installation's repository selection or permissions.
+
+One source represents one GitHub installation and one requested repository/
+permission subset. Create additional sources for narrower container grants or
+for installations under other accounts. One token cannot span installations.
+
+Sources and grants update while the daemon is running:
+
+```sh
+agentbox credential grant set <container> <logical-name> <source>
+agentbox credential grant delete <container> <logical-name>
+agentbox credential source delete <source>
+```
+
+Source deletion is refused while a grant references it. Container deletion
+removes its grants. Updating a source or rotating one of its encrypted keys
+invalidates the cached lease immediately.
+
+The broker obtains at most one lease concurrently for a source, caches it only
+in daemon memory, and refreshes five minutes before expiry. During that refresh,
+concurrent requests may continue using the still-valid old lease. A temporary
+refresh failure also falls back to the old lease until its exact expiry; after
+that the proxy returns 503. Failed issuance is retried no more than once every
+15 seconds to avoid an upstream outage or invalid configuration creating a
+token-mint storm. Leases are never persisted, returned by the control API, or
+logged.
+
+The `github-app` provider uses the App Client ID as the JWT issuer, signs RS256
+with the encrypted PEM, and calls only GitHub's fixed installation-token
+endpoint with a direct, time-limited HTTP client. Redirects are rejected and
+upstream error bodies are never included in errors or logs. Token strings are
+opaque; no prefix or fixed-length assumption is made.
 
 ## Routes
 
@@ -100,11 +184,24 @@ Applying a profile replaces the routes it owns (`github-*` or `cloudflare-*`)
 and preserves all others. Avoid those prefixes for operator-owned routes.
 
 The GitHub profile has path routes for Git HTTPS/API and exact-host routes for
-GitHub CLI. `api.github.com` and `uploads.github.com` receive the PAT;
+GitHub CLI. `api.github.com` and `uploads.github.com` receive the container's
+granted `github` credential;
 `objects.githubusercontent.com` and `codeload.github.com` are pass-through so
 credentials are not attached to signed asset downloads. Unmapped hosts return
 404. GitHub CLI uses its supported `http_unix_socket` setting; no TLS
-interception, DNS override, or fake CA is involved.
+interception, DNS override, or fake CA is involved. The container retains its
+dummy `GH_TOKEN`; Agentbox strips it before injecting the installation token.
+
+Apply the routes once after configuring at least one source:
+
+```sh
+agentbox profile apply github
+```
+
+Every container that should use GitHub needs its own grant, even when several
+containers intentionally share one source. GitHub operations are attributed to
+the App installation. Commands that require a human-user-only API endpoint may
+not work; validate the exact `gh` operations and App permissions used by agents.
 
 The Cloudflare profile creates only the provider-native AI Gateway route for
 each named scope. It intentionally does not preserve the old, unverified
@@ -155,17 +252,21 @@ The current wire adapter is HTTP/1.1 over `/run/agentbox/control.sock`:
 | `PUT`, `DELETE` | `/v1/routes/{name}` | upsert or delete one route |
 | `GET` | `/v1/keys` | list key metadata |
 | `PUT`, `DELETE` | `/v1/keys/{name}` | set raw value or delete key |
+| `GET` | `/v1/credential-sources` | list non-secret source configuration |
+| `PUT`, `DELETE` | `/v1/credential-sources/{name}` | upsert or delete a source |
+| `GET` | `/v1/credential-grants` | list container credential grants |
+| `PUT`, `DELETE` | `/v1/credential-grants/{container}/{credential}` | upsert or delete a grant |
 | `GET`, `POST` | `/v1/containers` | list or register identities |
 | `PATCH`, `DELETE` | `/v1/containers/{name}` | block/unblock or unregister |
 
 The protocol is not the domain boundary. Handlers call a typed application
 service that contains all mutation and validation semantics; another local
-transport can be added without duplicating route or key logic.
+transport can be added without duplicating route, key, or credential logic.
 
 There is no bearer authentication on this local API. Authorization is the
 kernel-enforced owner/group/mode on the Unix socket. Linux peer credentials are
 recorded in control logs for attribution. Members of `agentbox` are trusted
-because arbitrary route management can redirect injected keys.
+because arbitrary route management can redirect injected keys and credentials.
 
 ## Master key and recovery
 

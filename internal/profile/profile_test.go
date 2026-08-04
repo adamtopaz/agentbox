@@ -20,6 +20,14 @@ func TestProfilesAreOrdinaryValidRoutes(t *testing.T) {
 	if len(routes) != 8 {
 		t.Fatalf("got %d routes", len(routes))
 	}
+	credentials, err := domain.ReferencedCredentials(GitHubRoutes())
+	if err != nil || len(credentials) != 1 || credentials[0] != "github" {
+		t.Fatalf("GitHub credentials=%v err=%v", credentials, err)
+	}
+	keys, err := domain.ReferencedKeys(GitHubRoutes())
+	if err != nil || len(keys) != 0 {
+		t.Fatalf("GitHub static keys=%v err=%v", keys, err)
+	}
 }
 
 func TestReplaceOwnedPreservesOperatorRoutes(t *testing.T) {

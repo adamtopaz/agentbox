@@ -1,15 +1,35 @@
 package domain
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"strings"
 )
 
-type Resolver interface{ Resolve(string) ([]byte, bool) }
+type MaterialKind string
+
+const (
+	MaterialSecret     MaterialKind = "secret"
+	MaterialCredential MaterialKind = "credential"
+)
+
+type MaterialReference struct {
+	Kind MaterialKind
+	Name string
+}
+
+// Resolver obtains sensitive material for a request principal. Implementors
+// may resolve durable secrets immediately or acquire renewable credentials.
+type Resolver interface {
+	Resolve(context.Context, string, MaterialReference) ([]byte, error)
+}
 
 type Template struct{ parts []templatePart }
-type templatePart struct{ literal, secret, basicUser string }
+type templatePart struct {
+	literal, basicUser string
+	reference          MaterialReference
+}
 
 func ParseTemplate(value string) (Template, error) {
 	if value == "" {
@@ -46,13 +66,24 @@ func ParseTemplate(value string) (Template, error) {
 			if !ValidKeyName(name) {
 				return Template{}, fmt.Errorf("invalid secret reference %q", name)
 			}
-			parts = append(parts, templatePart{secret: name})
+			parts = append(parts, templatePart{reference: MaterialReference{Kind: MaterialSecret, Name: name}})
+		case strings.HasPrefix(token, "credential:"):
+			name := strings.TrimPrefix(token, "credential:")
+			if !ValidName(name) {
+				return Template{}, fmt.Errorf("invalid credential reference %q", name)
+			}
+			parts = append(parts, templatePart{reference: MaterialReference{Kind: MaterialCredential, Name: name}})
 		case strings.HasPrefix(token, "basic:"):
 			fields := strings.Split(token, ":")
-			if len(fields) != 3 || !basicUserRE.MatchString(fields[1]) || !ValidKeyName(fields[2]) {
-				return Template{}, fmt.Errorf("invalid basic template %q (want {basic:user:key})", token)
+			if len(fields) == 3 && basicUserRE.MatchString(fields[1]) && ValidKeyName(fields[2]) {
+				parts = append(parts, templatePart{basicUser: fields[1], reference: MaterialReference{Kind: MaterialSecret, Name: fields[2]}})
+				break
 			}
-			parts = append(parts, templatePart{basicUser: fields[1], secret: fields[2]})
+			if len(fields) == 4 && basicUserRE.MatchString(fields[1]) && fields[2] == string(MaterialCredential) && ValidName(fields[3]) {
+				parts = append(parts, templatePart{basicUser: fields[1], reference: MaterialReference{Kind: MaterialCredential, Name: fields[3]}})
+				break
+			}
+			return Template{}, fmt.Errorf("invalid basic template %q (want {basic:user:key} or {basic:user:credential:name})", token)
 		default:
 			return Template{}, fmt.Errorf("unknown template %q", token)
 		}
@@ -64,24 +95,36 @@ func (t Template) Keys() []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, p := range t.parts {
-		if p.secret != "" && !seen[p.secret] {
-			seen[p.secret] = true
-			out = append(out, p.secret)
+		if p.reference.Kind == MaterialSecret && !seen[p.reference.Name] {
+			seen[p.reference.Name] = true
+			out = append(out, p.reference.Name)
 		}
 	}
 	return out
 }
 
-func (t Template) Render(r Resolver) (string, error) {
+func (t Template) Credentials() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range t.parts {
+		if p.reference.Kind == MaterialCredential && !seen[p.reference.Name] {
+			seen[p.reference.Name] = true
+			out = append(out, p.reference.Name)
+		}
+	}
+	return out
+}
+
+func (t Template) Render(ctx context.Context, principal string, r Resolver) (string, error) {
 	var b strings.Builder
 	for _, p := range t.parts {
-		if p.secret == "" {
+		if p.reference.Kind == "" {
 			b.WriteString(p.literal)
 			continue
 		}
-		value, ok := r.Resolve(p.secret)
-		if !ok {
-			return "", fmt.Errorf("secret %q is not installed", p.secret)
+		value, err := r.Resolve(ctx, principal, p.reference)
+		if err != nil {
+			return "", err
 		}
 		if p.basicUser != "" {
 			raw := make([]byte, len(p.basicUser)+1+len(value))
@@ -93,6 +136,7 @@ func (t Template) Render(r Resolver) (string, error) {
 		} else {
 			b.Write(value)
 		}
+		clearBytes(value)
 	}
 	out := b.String()
 	for _, ch := range []byte(out) {
