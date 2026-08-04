@@ -51,13 +51,14 @@ on first launch.
 ## Install
 
 ```sh
-make bin
-sudo ./bin/agentbox setup
+make setup
 # Log out and back in after setup activates group membership, then:
 agentbox image build
 ```
 
-`setup` installs `agentbox` and `agentboxd`, creates the unprivileged
+`make setup` builds both binaries as the current user, then runs the privileged
+`agentbox setup` installation step through `sudo`. The installer installs
+`agentbox` and `agentboxd`, creates the unprivileged
 `agentboxd` account, generates one encrypted systemd credential for the master
 key, and installs the only systemd unit in the project. It also adds
 `$SUDO_USER` to `agentbox` and `incus-admin` when those groups exist. Log out
