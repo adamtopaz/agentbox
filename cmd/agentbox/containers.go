@@ -27,12 +27,16 @@ func cmdContainer(ctx context.Context, client *control.Client, args []string) er
 		scope := fs.String("scope", "", "route scope")
 		configure := fs.String("configure", "cloudflare", "container configuration profile: cloudflare or none")
 		image := fs.String("image", incus.DefaultImage, "Incus image alias")
+		cpus := fs.Uint("cpus", incus.DefaultCPUs, "maximum CPUs")
+		memory := fs.String("memory", incus.DefaultMemory, "maximum memory")
+		processes := fs.Uint("processes", incus.DefaultProcesses, "maximum processes")
+		disk := fs.String("disk", incus.DefaultDisk, "maximum root disk size")
 		incusBin := fs.String("incus-bin", "incus", "Incus CLI")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
 		if fs.NArg() != 1 || *scope == "" {
-			return errors.New("usage: agentbox container create --scope SCOPE [--configure cloudflare|none] <name>")
+			return errors.New("usage: agentbox container create --scope SCOPE [--configure cloudflare|none] [resource flags] <name>")
 		}
 		var script string
 		switch *configure {
@@ -48,7 +52,10 @@ func cmdContainer(ctx context.Context, client *control.Client, args []string) er
 		}
 		manager := containerManager(client, *incusBin)
 		manager.Image = *image
-		return manager.Create(ctx, incus.CreateOptions{Name: fs.Arg(0), Scope: *scope, ConfigureScript: script})
+		return manager.Create(ctx, incus.CreateOptions{
+			Name: fs.Arg(0), Scope: *scope, ConfigureScript: script,
+			CPUs: *cpus, Memory: *memory, Processes: *processes, Disk: *disk,
+		})
 	case "list":
 		fs := flag.NewFlagSet("container list", flag.ContinueOnError)
 		incusBin := fs.String("incus-bin", "incus", "Incus CLI")

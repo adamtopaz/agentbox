@@ -236,13 +236,16 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=agentboxd
 Group=agentbox
 UMask=0007
 ExecStart=` + paths.InstalledDaemon + `
 Restart=on-failure
 RestartSec=2s
+TimeoutStartSec=30s
+TimeoutStopSec=15s
 RuntimeDirectory=agentbox
 RuntimeDirectoryMode=0750
 StateDirectory=agentbox
@@ -265,8 +268,14 @@ MemoryDenyWriteExecute=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 RestrictNamespaces=yes
+ProtectProc=invisible
+ProcSubset=pid
+RemoveIPC=yes
+SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LimitCORE=0
+LimitNOFILE=8192
+TasksMax=512
 CapabilityBoundingSet=
 AmbientCapabilities=
 

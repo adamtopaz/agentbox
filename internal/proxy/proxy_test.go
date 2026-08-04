@@ -3,9 +3,11 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -33,6 +35,18 @@ func (r resolver) Resolve(_ context.Context, _ string, ref domain.MaterialRefere
 type roundTrip func(*http.Request) (*http.Response, error)
 
 func (f roundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestDefaultTransportHasProductionBounds(t *testing.T) {
+	if defaultTransport.TLSClientConfig == nil || defaultTransport.TLSClientConfig.MinVersion < tls.VersionTLS12 {
+		t.Fatal("default transport permits TLS older than 1.2")
+	}
+	if defaultTransport.ResponseHeaderTimeout <= 0 || defaultTransport.MaxResponseHeaderBytes <= 0 || defaultTransport.MaxConnsPerHost <= 0 {
+		t.Fatalf("default transport is unbounded: %+v", defaultTransport)
+	}
+	if defaultMaxConnections <= 0 {
+		t.Fatal("per-container connection limit is disabled")
+	}
+}
 
 func TestProxyStripsThenInjects(t *testing.T) {
 	state := domain.NewState()
@@ -162,5 +176,103 @@ func TestTransportErrorDetailsAreNotLogged(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), "QUERYSECRET") {
 		t.Fatalf("transport detail leaked into log: %s", logs.String())
+	}
+}
+
+type queuedListener struct {
+	connections chan net.Conn
+	closed      chan struct{}
+}
+
+func (l *queuedListener) Accept() (net.Conn, error) {
+	select {
+	case connection := <-l.connections:
+		return connection, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+func (l *queuedListener) Close() error   { close(l.closed); return nil }
+func (l *queuedListener) Addr() net.Addr { return testAddr("queue") }
+
+type testAddr string
+
+func (a testAddr) Network() string { return string(a) }
+func (a testAddr) String() string  { return string(a) }
+
+func TestLimitListenerReleasesSlotsAndUnblocksOnClose(t *testing.T) {
+	base := &queuedListener{connections: make(chan net.Conn, 2), closed: make(chan struct{})}
+	limited := newLimitListener(base, 1)
+	serverOne, clientOne := net.Pipe()
+	defer clientOne.Close()
+	base.connections <- serverOne
+	first, err := limited.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	serverTwo, clientTwo := net.Pipe()
+	defer clientTwo.Close()
+	base.connections <- serverTwo
+	accepted := make(chan net.Conn, 1)
+	errs := make(chan error, 1)
+	go func() {
+		connection, err := limited.Accept()
+		if err != nil {
+			errs <- err
+			return
+		}
+		accepted <- connection
+	}()
+	select {
+	case <-accepted:
+		t.Fatal("second connection bypassed the limit")
+	case err := <-errs:
+		t.Fatalf("second accept failed early: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case second := <-accepted:
+		if err := second.Close(); err != nil {
+			t.Fatal(err)
+		}
+	case err := <-errs:
+		t.Fatalf("second accept failed: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("released slot did not unblock accept")
+	}
+
+	serverThree, clientThree := net.Pipe()
+	defer clientThree.Close()
+	base.connections <- serverThree
+	third, err := limited.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverFour, clientFour := net.Pipe()
+	defer serverFour.Close()
+	defer clientFour.Close()
+	base.connections <- serverFour
+	thirdErr := make(chan error, 1)
+	go func() {
+		_, err := limited.Accept()
+		thirdErr <- err
+	}()
+	if err := limited.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-thirdErr:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("blocked accept error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("listener close did not unblock accept")
+	}
+	if err := third.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

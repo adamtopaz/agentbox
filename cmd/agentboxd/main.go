@@ -16,6 +16,7 @@ import (
 	"agentbox/internal/control"
 	"agentbox/internal/paths"
 	"agentbox/internal/proxy"
+	"agentbox/internal/sdnotify"
 	"agentbox/internal/secret"
 	"agentbox/internal/state"
 )
@@ -92,6 +93,13 @@ func run() error {
 		return fmt.Errorf("start control server: %w", err)
 	}
 	health := service.Health(context.Background())
+	if err := sdnotify.Ready(); err != nil {
+		shutdown, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = controlServer.Close(shutdown)
+		_ = listeners.Close(shutdown)
+		return fmt.Errorf("notify systemd that agentboxd is ready: %w", err)
+	}
 	log.Info("agentboxd ready", "version", version, "control_socket", *controlSocket,
 		"routes", health.Routes, "keys", health.Keys, "containers", health.Containers,
 		"credential_sources", health.CredentialSources, "credential_grants", health.CredentialGrants)
@@ -99,6 +107,7 @@ func run() error {
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	<-sigCtx.Done()
+	_ = sdnotify.Stopping()
 	log.Info("agentboxd stopping")
 	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

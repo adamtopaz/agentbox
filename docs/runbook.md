@@ -168,6 +168,11 @@ ambiguous matches are rejected before state changes. A commit validates and
 compiles a new immutable snapshot, atomically persists state, publishes the
 snapshot, and reconciles listeners. A listener failure rolls state back.
 
+A route that renders `{secret:...}` or `{credential:...}` material must use an
+HTTPS upstream. Plain HTTP is accepted for material only when the upstream host
+is a literal loopback IP such as `127.0.0.1` or `::1`; `localhost` and other
+DNS names are deliberately not trusted as proof of a local transport.
+
 Matching order is exact-host routes, then longest path prefix. For otherwise
 equivalent selectors, a route in the container's concrete scope wins over the
 universal `"*"` route. `path_map` entries match exact post-strip paths and do
@@ -226,7 +231,18 @@ agentbox container destroy <name>
 
 Use `--configure none` for a generic container with no Cloudflare client
 settings, and `--image <alias>` to select another image. The scope determines
-route visibility and is persisted independently of Incus.
+route visibility and is persisted independently of Incus. New instances have
+safe resource defaults: 4 CPUs, 8 GiB memory, 2,048 processes, and a 50 GiB
+root disk. Adjust them at creation time when needed:
+
+```sh
+agentbox container create --scope prod --configure none \
+  --cpus 8 --memory 16GiB --processes 4096 --disk 100GiB <name>
+```
+
+These limits are stored by Incus and do not apply retroactively to existing
+containers. Use `incus config set` and `incus config device override`, or
+recreate an old container, to bring it under the same limits.
 
 `container list` deliberately exposes drift: a missing Incus instance, missing
 daemon socket, or tagged but unregistered Incus instance is shown instead of
@@ -275,6 +291,14 @@ There is no bearer authentication on this local API. Authorization is the
 kernel-enforced owner/group/mode on the Unix socket. Linux peer credentials are
 recorded in control logs for attribution. Members of `agentbox` are trusted
 because arbitrary route management can redirect injected keys and credentials.
+
+The systemd unit uses `Type=notify`, so setup/restart is not considered
+successful until state, encrypted keys, the control listener, and all persisted
+container listeners have loaded. The unit bounds file descriptors and OS tasks;
+the data plane separately caps each container listener at 128 simultaneous
+connections. Dial, TLS handshake, response-header time, and response-header
+size are bounded, while response bodies remain streamable without a global
+request timeout.
 
 ## Master key and recovery
 

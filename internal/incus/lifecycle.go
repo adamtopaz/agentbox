@@ -7,7 +7,9 @@ import (
 	"io"
 	"net"
 	"os"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,13 +17,19 @@ import (
 )
 
 const (
-	DefaultImage  = "agentbox-base"
-	TCPDevice     = "agentbox-proxy"
-	UnixDevice    = "agentbox-socket"
-	ContainerTCP  = "tcp:127.0.0.1:8787"
-	ContainerUnix = "/run/agentbox.sock"
-	ManagedTag    = "user.agentbox"
+	DefaultImage     = "agentbox-base"
+	TCPDevice        = "agentbox-proxy"
+	UnixDevice       = "agentbox-socket"
+	ContainerTCP     = "tcp:127.0.0.1:8787"
+	ContainerUnix    = "/run/agentbox.sock"
+	ManagedTag       = "user.agentbox"
+	DefaultCPUs      = 4
+	DefaultMemory    = "8GiB"
+	DefaultProcesses = 2048
+	DefaultDisk      = "50GiB"
 )
+
+var sizeRE = regexp.MustCompile(`^[1-9][0-9]*(?:KiB|MiB|GiB|TiB)$`)
 
 type Control interface {
 	Containers(context.Context) ([]domain.Container, error)
@@ -40,11 +48,21 @@ type Manager struct {
 	Out         io.Writer
 }
 
-type CreateOptions struct{ Name, Scope, ConfigureScript string }
+type CreateOptions struct {
+	Name, Scope, ConfigureScript string
+	CPUs                         uint
+	Memory                       string
+	Processes                    uint
+	Disk                         string
+}
 
 func (m *Manager) Create(ctx context.Context, options CreateOptions) error {
 	container := domain.Container{Name: options.Name, Scope: options.Scope, CreatedAt: time.Now().UTC()}
 	if err := domain.ValidateContainer(container); err != nil {
+		return err
+	}
+	limits, err := normalizeLimits(options)
+	if err != nil {
 		return err
 	}
 	managed, exists, err := m.instanceManaged(options.Name)
@@ -83,7 +101,15 @@ func (m *Manager) Create(ctx context.Context, options CreateOptions) error {
 	if image == "" {
 		image = DefaultImage
 	}
-	if err := m.Incus.RunStreaming("launch", image, options.Name, "-c", ManagedTag+"=true", "-c", "boot.autostart=true"); err != nil {
+	if err := m.Incus.RunStreaming(
+		"launch", image, options.Name,
+		"-c", ManagedTag+"=true",
+		"-c", "boot.autostart=true",
+		"-c", "limits.cpu="+strconv.FormatUint(uint64(limits.CPUs), 10),
+		"-c", "limits.memory="+limits.Memory,
+		"-c", "limits.processes="+strconv.FormatUint(uint64(limits.Processes), 10),
+		"-d", "root,size="+limits.Disk,
+	); err != nil {
 		return rollback(err)
 	}
 	for _, args := range m.deviceArgs(options.Name) {
@@ -98,6 +124,34 @@ func (m *Manager) Create(ctx context.Context, options CreateOptions) error {
 	}
 	fmt.Fprintf(m.out(), "container %q ready in scope %q; enter it with: agentbox container shell %s\n", options.Name, options.Scope, options.Name)
 	return nil
+}
+
+func normalizeLimits(options CreateOptions) (CreateOptions, error) {
+	if options.CPUs == 0 {
+		options.CPUs = DefaultCPUs
+	}
+	if options.Memory == "" {
+		options.Memory = DefaultMemory
+	}
+	if options.Processes == 0 {
+		options.Processes = DefaultProcesses
+	}
+	if options.Disk == "" {
+		options.Disk = DefaultDisk
+	}
+	if options.CPUs > 1024 {
+		return CreateOptions{}, fmt.Errorf("CPU limit %d exceeds 1024", options.CPUs)
+	}
+	if options.Processes > 1_000_000 {
+		return CreateOptions{}, fmt.Errorf("process limit %d exceeds 1000000", options.Processes)
+	}
+	if !sizeRE.MatchString(options.Memory) {
+		return CreateOptions{}, fmt.Errorf("invalid memory limit %q (want a positive KiB, MiB, GiB, or TiB value)", options.Memory)
+	}
+	if !sizeRE.MatchString(options.Disk) {
+		return CreateOptions{}, fmt.Errorf("invalid disk limit %q (want a positive KiB, MiB, GiB, or TiB value)", options.Disk)
+	}
+	return options, nil
 }
 
 func (m *Manager) Destroy(ctx context.Context, name string) error {

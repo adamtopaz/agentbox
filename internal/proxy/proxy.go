@@ -6,6 +6,7 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -22,6 +23,8 @@ import (
 )
 
 type SnapshotSource interface{ Snapshot() *engine.Snapshot }
+
+const defaultMaxConnections = 128
 
 type Server struct {
 	Snapshots SnapshotSource
@@ -137,13 +140,18 @@ func (s *Server) transport() http.RoundTripper {
 }
 
 var defaultTransport = &http.Transport{
-	Proxy:                 nil,
-	DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-	ForceAttemptHTTP2:     true,
-	MaxIdleConns:          100,
-	IdleConnTimeout:       90 * time.Second,
-	TLSHandshakeTimeout:   10 * time.Second,
-	ExpectContinueTimeout: time.Second,
+	Proxy:                  nil,
+	DialContext:            (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+	ForceAttemptHTTP2:      true,
+	TLSClientConfig:        &tls.Config{MinVersion: tls.VersionTLS12},
+	MaxIdleConns:           100,
+	MaxIdleConnsPerHost:    32,
+	MaxConnsPerHost:        256,
+	IdleConnTimeout:        90 * time.Second,
+	TLSHandshakeTimeout:    10 * time.Second,
+	ResponseHeaderTimeout:  30 * time.Second,
+	ExpectContinueTimeout:  time.Second,
+	MaxResponseHeaderBytes: 1 << 20,
 }
 
 func sanitizeRequestHeaders(h http.Header) {
@@ -228,11 +236,12 @@ func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // ListenerManager reconciles the set of per-container Unix HTTP servers.
 type ListenerManager struct {
-	Dir    string
-	Proxy  *Server
-	Log    *slog.Logger
-	mu     sync.Mutex
-	active map[string]*listener
+	Dir            string
+	Proxy          *Server
+	Log            *slog.Logger
+	MaxConnections int
+	mu             sync.Mutex
+	active         map[string]*listener
 }
 
 type listener struct {
@@ -293,6 +302,17 @@ func (m *ListenerManager) start(name string) error {
 		ln.Close()
 		return err
 	}
+	maxConnections := m.MaxConnections
+	if maxConnections == 0 {
+		maxConnections = defaultMaxConnections
+	}
+	if maxConnections < 0 {
+		ln.Close()
+		return errors.New("max connections must not be negative")
+	}
+	if maxConnections > 0 {
+		ln = newLimitListener(ln, maxConnections)
+	}
 	srv := &http.Server{
 		Handler:           m.Proxy.Handler(name),
 		ReadHeaderTimeout: 10 * time.Second,
@@ -328,4 +348,46 @@ func (m *ListenerManager) logger() *slog.Logger {
 		return m.Log
 	}
 	return slog.Default()
+}
+
+type limitListener struct {
+	net.Listener
+	slots chan struct{}
+	done  chan struct{}
+	once  sync.Once
+}
+
+func newLimitListener(listener net.Listener, max int) net.Listener {
+	return &limitListener{Listener: listener, slots: make(chan struct{}, max), done: make(chan struct{})}
+}
+
+func (l *limitListener) Accept() (net.Conn, error) {
+	select {
+	case l.slots <- struct{}{}:
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+	connection, err := l.Listener.Accept()
+	if err != nil {
+		<-l.slots
+		return nil, err
+	}
+	return &limitConn{Conn: connection, release: func() { <-l.slots }}, nil
+}
+
+func (l *limitListener) Close() error {
+	l.once.Do(func() { close(l.done) })
+	return l.Listener.Close()
+}
+
+type limitConn struct {
+	net.Conn
+	release func()
+	once    sync.Once
+}
+
+func (c *limitConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
 }

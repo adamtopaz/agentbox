@@ -43,7 +43,12 @@ func TestPrefixInstallLayout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"User=agentboxd", "RuntimeDirectoryMode=0750", "LoadCredentialEncrypted=master-key:", "LimitCORE=0", "CapabilityBoundingSet="} {
+	for _, want := range []string{
+		"Type=notify", "NotifyAccess=main", "User=agentboxd", "RuntimeDirectoryMode=0750",
+		"LoadCredentialEncrypted=master-key:", "ProtectProc=invisible", "ProcSubset=pid",
+		"SystemCallArchitectures=native", "LimitCORE=0", "LimitNOFILE=8192", "TasksMax=512",
+		"CapabilityBoundingSet=",
+	} {
 		if !strings.Contains(string(unit), want) {
 			t.Fatalf("unit missing %q", want)
 		}

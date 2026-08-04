@@ -140,3 +140,27 @@ func TestHostRouteAllowsSingleLabelNames(t *testing.T) {
 		t.Fatalf("single-label host rejected: %v", err)
 	}
 }
+
+func TestMaterialRequiresEncryptedOrLoopbackTransport(t *testing.T) {
+	for _, upstream := range []string{"http://example.com", "http://localhost:8080"} {
+		route := validRoute()
+		route.Upstream = upstream
+		if err := ValidateRoute(route); err == nil {
+			t.Fatalf("material-bearing route accepted plaintext upstream %q", upstream)
+		}
+	}
+	for _, upstream := range []string{"https://example.com", "http://127.0.0.1:8080", "http://[::1]:8080"} {
+		route := validRoute()
+		route.Upstream = upstream
+		if err := ValidateRoute(route); err != nil {
+			t.Fatalf("safe upstream %q rejected: %v", upstream, err)
+		}
+	}
+
+	route := validRoute()
+	route.Upstream = "http://example.com"
+	route.SetHeaders = []HeaderValue{{Name: "X-Mode", Value: "non-secret"}}
+	if err := ValidateRoute(route); err != nil {
+		t.Fatalf("plaintext route without material rejected: %v", err)
+	}
+}

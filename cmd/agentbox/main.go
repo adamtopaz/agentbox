@@ -45,7 +45,7 @@ optional profiles:
   profile apply cloudflare --account-id ID --gateways prod,test
 
 containers:
-  container create --scope SCOPE [--configure cloudflare|none] <name>
+  container create --scope SCOPE [--configure cloudflare|none] [resource flags] <name>
   container list
   container shell <name>
   container destroy <name>

@@ -121,6 +121,41 @@ func TestCreateRegistersBeforeLaunchAndRollsBack(t *testing.T) {
 	}
 }
 
+func TestCreateAppliesDefaultResourceLimits(t *testing.T) {
+	control := &controlFake{}
+	commands := &commanderFake{}
+	manager := &Manager{
+		Incus: commands, Control: control, SocketDir: "/run/test",
+		SocketReady: func(string) bool { return true },
+	}
+	if err := manager.Create(context.Background(), CreateOptions{Name: "dev", Scope: "prod"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(commands.calls) == 0 {
+		t.Fatal("Incus was not called")
+	}
+	launch := strings.Join(commands.calls[0], " ")
+	for _, expected := range []string{
+		"limits.cpu=4", "limits.memory=8GiB", "limits.processes=2048", "root,size=50GiB",
+	} {
+		if !strings.Contains(launch, expected) {
+			t.Fatalf("launch missing %q: %s", expected, launch)
+		}
+	}
+}
+
+func TestCreateRejectsInvalidResourceLimitsBeforeMutation(t *testing.T) {
+	control := &controlFake{}
+	commands := &commanderFake{}
+	manager := &Manager{Incus: commands, Control: control}
+	if err := manager.Create(context.Background(), CreateOptions{Name: "dev", Scope: "prod", Memory: "everything"}); err == nil {
+		t.Fatal("invalid memory limit accepted")
+	}
+	if len(commands.calls) != 0 || len(control.containers) != 0 {
+		t.Fatalf("invalid limits mutated state: calls=%v containers=%v", commands.calls, control.containers)
+	}
+}
+
 func TestCreateRollsBackInstanceCreatedBeforeLaunchError(t *testing.T) {
 	control := &controlFake{}
 	commands := &commanderFake{failLaunch: true, createThenFail: true}

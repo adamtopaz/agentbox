@@ -92,6 +92,20 @@ proxy() {
 }
 
 printf '%s' real-one | abx key set token
+cat > "$WORK/plaintext-secret-route.json" <<'EOF'
+{
+  "name": "plaintext-secret",
+  "scope": "test",
+  "match": {"path_prefix": "/plaintext"},
+  "upstream": "http://example.invalid",
+  "set_headers": [
+    {"name": "Authorization", "value": "Bearer {secret:token}"}
+  ]
+}
+EOF
+if abx route put "$WORK/plaintext-secret-route.json" >/dev/null 2>&1; then
+    fail "secret-bearing remote plaintext route was accepted"
+fi
 cat > "$WORK/path-route.json" <<EOF
 {
   "name": "echo",

@@ -36,7 +36,8 @@ concrete scope plus routes in the universal `"*"` scope.
 
 - Linux host with systemd and [`systemd-creds`](https://systemd.io/CREDENTIALS/)
 - [Incus](https://linuxcontainers.org/incus/), initialized for the operator
-- Go 1.24 or newer to build
+- Go 1.26.5 or newer to build (the patch-level floor prevents binaries from
+  embedding a standard library with known, already-fixed security defects)
 
 The image builder uses Incus's Debian 13 cloud image and a declarative
 cloud-init instance configuration. Claude Code, Codex, pi, and their Node.js
@@ -127,6 +128,9 @@ agentbox container shell work
 Container creation registers the identity with the daemon, waits for its Unix
 listener, launches the Incus instance, attaches TCP `127.0.0.1:8787` and Unix
 `/run/agentbox.sock` proxy devices, then writes only non-secret client settings.
+New containers default to 4 CPUs, 8 GiB of memory, 2,048 processes, and a
+50 GiB root disk. Override those safeguards with `--cpus`, `--memory`,
+`--processes`, and `--disk` when a workload needs different limits.
 
 Useful live operations:
 
@@ -174,6 +178,9 @@ Header values support durable `{secret:key-name}` references, renewable
 `{basic:username:key-name}` or `{basic:username:credential:name}`. Credential
 names are resolved against the grant for the request's container listener. A
 missing key, grant, or valid lease returns 503 before any upstream request.
+Routes that inject a secret or credential must use HTTPS; literal loopback IP
+HTTP upstreams are permitted for host-local services. `localhost` is not
+accepted because resolving a name is weaker than verifying a loopback address.
 Incoming authorization, cookies, forwarding headers,
 Cloudflare Access headers, and the complete `cf-aig-*` family are removed;
 configured headers are applied afterward. Queries are forwarded but never
@@ -183,9 +190,14 @@ and semicolons are rejected.
 ## Security boundaries
 
 The daemon runs as `agentboxd`, with no capabilities and a hardened systemd
-unit. `systemd-creds` protects one 32-byte master key at startup. Dynamic keys
-are independently sealed with AES-256-GCM using random nonces and key-name-bound
-additional data under `/var/lib/agentbox/secrets`; rotation needs no restart.
+unit. Startup completes only after the control and data listeners are ready;
+the unit also bounds file descriptors and OS tasks. Each container listener
+accepts at most 128 simultaneous connections, and upstream connection, TLS,
+and response-header work is bounded without imposing a timeout on streamed
+response bodies. `systemd-creds` protects one 32-byte master key at startup.
+Dynamic keys are independently sealed with AES-256-GCM using random nonces and
+key-name-bound additional data under `/var/lib/agentbox/secrets`; rotation
+needs no restart.
 Renewable leases exist only in daemon memory, are never returned by the control
 API, and are cleared on source/key changes and shutdown.
 

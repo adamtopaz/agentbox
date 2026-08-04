@@ -284,6 +284,7 @@ func ValidateRoute(r Route) error {
 	}
 
 	headerNames := map[string]bool{}
+	hasMaterial := false
 	forbiddenHeaders := map[string]bool{
 		"connection": true, "proxy-connection": true, "keep-alive": true,
 		"te": true, "trailer": true, "transfer-encoding": true, "upgrade": true,
@@ -301,8 +302,18 @@ func ValidateRoute(r Route) error {
 			return fmt.Errorf("header %q is set more than once", h.Name)
 		}
 		headerNames[canonical] = true
-		if _, err := ParseTemplate(h.Value); err != nil {
+		template, err := ParseTemplate(h.Value)
+		if err != nil {
 			return fmt.Errorf("header %q: %w", h.Name, err)
+		}
+		if len(template.Keys()) != 0 || len(template.Credentials()) != 0 {
+			hasMaterial = true
+		}
+	}
+	if u.Scheme == "http" && hasMaterial {
+		ip := net.ParseIP(u.Hostname())
+		if ip == nil || !ip.IsLoopback() {
+			return errors.New("routes that inject secrets or credentials require HTTPS or a literal loopback HTTP upstream")
 		}
 	}
 	return nil
