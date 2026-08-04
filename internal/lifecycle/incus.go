@@ -45,6 +45,18 @@ func (i Incus) RunStreaming(args ...string) error {
 	return nil
 }
 
+// RunInput executes incus with the given string on the command's stdin.
+func (i Incus) RunInput(stdin string, args ...string) error {
+	cmd := exec.Command(i.bin(), args...)
+	cmd.Stdin = strings.NewReader(stdin)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("incus %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
 // Output executes incus and returns stdout.
 func (i Incus) Output(args ...string) ([]byte, error) {
 	cmd := exec.Command(i.bin(), args...)

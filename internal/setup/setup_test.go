@@ -3,11 +3,13 @@ package setup
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"agentbox/internal/config"
 	"agentbox/internal/credstore"
 	"agentbox/internal/fakebin"
 	"agentbox/internal/reconcile"
@@ -32,11 +34,11 @@ func run(t *testing.T, prefix string, opts Options) string {
 
 func TestFreshRunCreatesEverything(t *testing.T) {
 	prefix := t.TempDir()
-	out := run(t, prefix, Options{AccountID: "acct123", GatewayID: "gw123"})
+	out := run(t, prefix, Options{AccountID: "acct123", Gateways: []string{"prod"}})
 
 	checks := map[string]string{
 		"etc/agentbox/agentbox.json":                       `"account_id": "acct123"`,
-		"etc/agentbox/routes.json":                         `"prefix": "/cloudflare"`,
+		"etc/agentbox/routes.json":                         `"prefix": "/cloudflare/prod"`,
 		"etc/tmpfiles.d/agentbox.conf":                     "d /run/agentbox/containers 2775 caddy agentbox",
 		"etc/systemd/system/caddy.service.d/agentbox.conf": "--config /var/lib/agentbox/Caddyfile",
 		"usr/local/bin/agentbox":                           "",
@@ -101,7 +103,7 @@ func TestFreshRunCreatesEverything(t *testing.T) {
 
 func TestIdempotentSecondRun(t *testing.T) {
 	prefix := t.TempDir()
-	run(t, prefix, Options{AccountID: "acct123", GatewayID: "gw123"})
+	run(t, prefix, Options{AccountID: "acct123", Gateways: []string{"prod"}})
 	// Second run: no flags — must reuse agentbox.json instead of prompting.
 	out := run(t, prefix, Options{})
 	if !strings.Contains(out, "nothing to change") {
@@ -112,12 +114,12 @@ func TestIdempotentSecondRun(t *testing.T) {
 func TestSecretsWireUpCredentialsAndCompanions(t *testing.T) {
 	prefix := t.TempDir()
 	credsBin := fakebin.SystemdCreds(t)
-	run(t, prefix, Options{AccountID: "acct123", GatewayID: "gw123", CredsBin: credsBin})
+	run(t, prefix, Options{AccountID: "acct123", Gateways: []string{"prod"}, CredsBin: credsBin})
 
 	secrets := filepath.Join(prefix, "etc/agentbox/secrets")
 	store := credstore.Store{Dir: secrets, Bin: credsBin}
 	// Dummy test material only — never real tokens in tests.
-	if err := store.Put("cf-aig-token", []byte("dummy-aig")); err != nil {
+	if err := store.Put("cf-aig-token-prod", []byte("dummy-aig")); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Put("gh-pat", []byte("dummy-pat")); err != nil {
@@ -142,7 +144,7 @@ func TestSecretsWireUpCredentialsAndCompanions(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, line := range []string{
-		"LoadCredentialEncrypted=cf-aig-token:/etc/agentbox/secrets/cf-aig-token.cred",
+		"LoadCredentialEncrypted=cf-aig-token-prod:/etc/agentbox/secrets/cf-aig-token-prod.cred",
 		"LoadCredentialEncrypted=gh-pat:/etc/agentbox/secrets/gh-pat.cred",
 		"LoadCredentialEncrypted=gh-pat.basic:/etc/agentbox/secrets/gh-pat.basic.cred",
 	} {
@@ -164,7 +166,7 @@ func TestSecretsWireUpCredentialsAndCompanions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"cf-aig-token", "gh-pat", "gh-pat.basic"} {
+	for _, name := range []string{"cf-aig-token-prod", "gh-pat", "gh-pat.basic"} {
 		if !strings.Contains(string(manifest), name+"\n") {
 			t.Errorf("manifest missing %q\n%s", name, manifest)
 		}
@@ -184,7 +186,7 @@ func TestSecretsWireUpCredentialsAndCompanions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"cf-aig-token", "gh-pat", "gh-pat.basic"} {
+	for _, name := range []string{"cf-aig-token-prod", "gh-pat", "gh-pat.basic"} {
 		if !seen[name] {
 			t.Errorf("reconcile cannot see credential %q in the drop-in setup wrote", name)
 		}
@@ -214,12 +216,12 @@ func TestSecretsWireUpCredentialsAndCompanions(t *testing.T) {
 func TestPlaintextSecretsAreMigrated(t *testing.T) {
 	prefix := t.TempDir()
 	credsBin := fakebin.SystemdCreds(t)
-	run(t, prefix, Options{AccountID: "acct123", GatewayID: "gw123", CredsBin: credsBin})
+	run(t, prefix, Options{AccountID: "acct123", Gateways: []string{"prod"}, CredsBin: credsBin})
 
 	secrets := filepath.Join(prefix, "etc/agentbox/secrets")
 	// A hand-installed plaintext secret, with the trailing newline a paste
 	// would leave behind.
-	if err := os.WriteFile(filepath.Join(secrets, "cf-aig-token"), []byte("dummy-aig\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(secrets, "cf-aig-token-prod"), []byte("dummy-aig\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -227,11 +229,11 @@ func TestPlaintextSecretsAreMigrated(t *testing.T) {
 	if !strings.Contains(out, "removed the plaintext copy") {
 		t.Errorf("migration not reported:\n%s", out)
 	}
-	if _, err := os.Stat(filepath.Join(secrets, "cf-aig-token")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(secrets, "cf-aig-token-prod")); !os.IsNotExist(err) {
 		t.Fatal("plaintext secret survived migration")
 	}
 	store := credstore.Store{Dir: secrets, Bin: credsBin}
-	got, err := store.Get("cf-aig-token")
+	got, err := store.Get("cf-aig-token-prod")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,25 +242,112 @@ func TestPlaintextSecretsAreMigrated(t *testing.T) {
 	}
 }
 
-func TestNeverClobbersEditedRoutes(t *testing.T) {
+// TestReconcilesGatewayRoutesKeepingOperatorEdits: the generated gateway
+// routes must track agentbox.json, because they are what enforces which
+// gateway a container may reach. Refusing to touch the file (the old
+// behaviour) left that boundary describing a set of gateways the operator no
+// longer had — silently open in one direction, silently dead in the other.
+func TestReconcilesGatewayRoutesKeepingOperatorEdits(t *testing.T) {
 	prefix := t.TempDir()
-	run(t, prefix, Options{AccountID: "acct123", GatewayID: "gw123"})
-
+	run(t, prefix, Options{AccountID: "acct123", Gateways: []string{"prod"}})
 	routesPath := filepath.Join(prefix, "etc/agentbox/routes.json")
-	edited := `{"routes":[{"name":"custom","prefix":"/custom","upstream":"https://example.com"}]}` + "\n"
-	if err := os.WriteFile(routesPath, []byte(edited), 0o644); err != nil {
+
+	// An operator-added route, alongside the generated ones.
+	cfg, err := config.Load(routesPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Routes = append(cfg.Routes, config.Route{
+		Name: "mine", Prefix: "/mine", Gateway: config.AnyGateway,
+		Upstream: "https://example.com",
+	})
+	data, _ := json.MarshalIndent(cfg, "", "  ")
+	if err := os.WriteFile(routesPath, append(data, '\n'), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
+	// Add one gateway and remove the original.
+	metaPath := filepath.Join(prefix, "etc/agentbox/agentbox.json")
+	if err := os.WriteFile(metaPath,
+		[]byte(`{"account_id":"acct123","gateways":["experiments"]}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, prefix, Options{})
+
+	got, err := config.Load(routesPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]config.Route{}
+	for _, r := range got.Routes {
+		byName[r.Name] = r
+	}
+	if _, ok := byName["cloudflare-experiments"]; !ok {
+		t.Error("route for the newly configured gateway was not added")
+	}
+	if _, ok := byName["cloudflare-prod"]; ok {
+		t.Error("route for a removed gateway was left behind — that container could still reach it")
+	}
+	if r, ok := byName["mine"]; !ok || r.Upstream != "https://example.com" {
+		t.Error("operator-added route was not preserved")
+	}
+	// No route may omit the gateway field: that is what makes the boundary
+	// established by construction rather than by remembering.
+	for _, r := range got.Routes {
+		if r.Gateway == "" {
+			t.Errorf("route %q has no gateway", r.Name)
+		}
+	}
+}
+
+// TestLegacyRoutesAreRefusedLoudly: the pre-pinning format had no gateway
+// field. Loading it must fail with migration guidance rather than being
+// treated as a table of universal routes.
+func TestLegacyRoutesAreRefusedLoudly(t *testing.T) {
+	prefix := t.TempDir()
+	run(t, prefix, Options{AccountID: "acct123", Gateways: []string{"prod"}})
+	routesPath := filepath.Join(prefix, "etc/agentbox/routes.json")
+	legacy := `{"routes":[{"name":"cloudflare","prefix":"/cloudflare",` +
+		`"upstream":"https://gateway.ai.cloudflare.com/v1/acct123",` +
+		`"inject":[{"header":"cf-aig-authorization","value":"Bearer {secret:cf-aig-token}"}]}]}` + "\n"
+	if err := os.WriteFile(routesPath, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", "")
+	var out bytes.Buffer
+	err := Run(Options{Prefix: prefix, Out: &out, CredsBin: fakebin.SystemdCreds(t)})
+	if err == nil {
+		t.Fatal("a routes.json in the pre-pinning format must not be accepted")
+	}
+	if !strings.Contains(err.Error(), "gateway") {
+		t.Fatalf("error should explain the missing gateway field: %v", err)
+	}
+}
+
+// TestLegacyMetaIsMigrated: an agentbox.json from before multi-gateway keeps
+// its account id and becomes a one-gateway list.
+func TestLegacyMetaIsMigrated(t *testing.T) {
+	prefix := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(prefix, "etc/agentbox"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(prefix, "etc/agentbox/agentbox.json"),
+		[]byte(`{"account_id":"acct123","gateway_id":"ff"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	out := run(t, prefix, Options{})
-	got, _ := os.ReadFile(routesPath)
-	if string(got) != edited {
-		t.Fatal("operator-edited routes.json was clobbered")
+	if !strings.Contains(out, "migrated") {
+		t.Errorf("migration not reported:\n%s", out)
 	}
-	if _, err := os.Stat(routesPath + ".new"); err != nil {
-		t.Fatal("routes.json.new not written")
+	m, err := config.LoadMeta(filepath.Join(prefix, "etc/agentbox/agentbox.json"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(out, "routes.json.new") {
-		t.Error("operator not told about routes.json.new")
+	if m.AccountID != "acct123" {
+		t.Errorf("account id lost in migration: %+v", m)
+	}
+	if len(m.Gateways) != 1 || m.Gateways[0] != "ff" {
+		t.Errorf("gateways = %v, want [ff]", m.Gateways)
 	}
 }

@@ -90,11 +90,12 @@ func TestNameIsBoundToTheCredentialID(t *testing.T) {
 	if !slices.Contains(encrypt, "--name=gh-pat") {
 		t.Errorf("encrypt argv must bind the bare credential ID, got %v", encrypt)
 	}
-	// Sealing to the default PCR 7 would make every credential undecryptable
-	// after an unrelated firmware or Secure Boot change, with no plaintext
-	// copy left to recover from.
-	if !slices.Contains(encrypt, "--tpm2-pcrs=") {
-		t.Errorf("encrypt must pin an empty PCR set, got %v", encrypt)
+	// The key choice must be explicit. systemd's default binds to the TPM and
+	// the host key together where a TPM exists, so losing either destroys
+	// every credential — fatal to caddy's activation, with no plaintext copy
+	// to recover from.
+	if !slices.Contains(encrypt, "--with-key=host") {
+		t.Errorf("encrypt must choose its key explicitly, got %v", encrypt)
 	}
 }
 

@@ -50,13 +50,13 @@ func cmdProxyStatus(args []string) int {
 		return fail(err)
 	}
 	w := tabwriter.NewWriter(os.Stdout, 2, 8, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tINCUS\tBLOCKED\tSOCKET\tCREATED")
+	fmt.Fprintln(w, "NAME\tGATEWAY\tINCUS\tBLOCKED\tSOCKET\tCREATED")
 	for _, r := range rows {
 		created := ""
 		if !r.Created.IsZero() {
 			created = r.Created.Local().Format(time.RFC3339)
 		}
-		fmt.Fprintf(w, "%s\t%s\t%v\t%s\t%s\n", r.Name, r.Incus, r.Blocked, presence(r.Socket), created)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%v\t%s\t%s\n", r.Name, orDash(r.Gateway), r.Incus, r.Blocked, presence(r.Socket), created)
 	}
 	w.Flush()
 	fmt.Println("\nproxy traffic logs: journalctl -u caddy")

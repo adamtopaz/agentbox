@@ -2,31 +2,75 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 )
 
 // Meta holds the non-secret Cloudflare AI Gateway coordinates
 // (/etc/agentbox/agentbox.json).
 //
-// GatewayID is the *default* gateway: routing does not depend on it, since
-// `/cloudflare/<gateway>/...` names the gateway in the path. It is what the
-// image wires agents to out of the box, so an agent that is never told
-// otherwise bills to this one.
+// Gateways is the set of AI Gateways this host may use. There is deliberately
+// no default: every gateway is named explicitly, each gets its own route, and
+// each carries its own credential (`cf-aig-token-<gateway>`). Cloudflare
+// cannot scope a token to one gateway — any token with AI Gateway Run reaches
+// them all — so separate tokens buy revocation and attribution granularity
+// rather than capability isolation. The isolation that *is* enforceable
+// happens here: a container is created against one gateway and its Caddy site
+// carries only that gateway's route.
 type Meta struct {
-	AccountID string `json:"account_id"`
-	GatewayID string `json:"gateway_id"`
+	AccountID string   `json:"account_id"`
+	Gateways  []string `json:"gateways"`
 }
 
-var idRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+// AnyGateway marks a route usable by every container, whatever gateway it was
+// created against (the GitHub routes, for instance).
+const AnyGateway = "*"
+
+// GatewaySecret is the credential name for a gateway's Cloudflare token.
+func GatewaySecret(gateway string) string { return "cf-aig-token-" + gateway }
+
+// ValidGatewayName reports whether a gateway name is usable. It has to survive
+// being a path segment, a route name, and part of a secret name.
+func ValidGatewayName(s string) bool { return gatewayRE.MatchString(s) }
+
+// HasGateway reports whether the named gateway is configured.
+func (m Meta) HasGateway(name string) bool {
+	return slices.Contains(m.Gateways, name)
+}
+
+var (
+	idRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+	// Gateway names become path segments, route names and secret-name
+	// suffixes, so they are held to the strictest of those: the route-name
+	// slug rule.
+	// Capped at 50 so GatewaySecret(name) stays inside credstore's 64-byte
+	// credential-name limit; otherwise a gateway would validate here and then
+	// be impossible to store a token for.
+	gatewayRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,49}$`)
+)
 
 func (m Meta) Validate() error {
 	if !idRE.MatchString(m.AccountID) {
 		return fmt.Errorf("invalid account_id %q", m.AccountID)
 	}
-	if !idRE.MatchString(m.GatewayID) {
-		return fmt.Errorf("invalid gateway_id %q", m.GatewayID)
+	if len(m.Gateways) == 0 {
+		return errors.New("no gateways configured; list at least one in \"gateways\"")
+	}
+	seen := map[string]bool{}
+	for _, g := range m.Gateways {
+		if g == AnyGateway {
+			return fmt.Errorf("%q is not a gateway name; it is the marker for a universal route", AnyGateway)
+		}
+		if !ValidGatewayName(g) {
+			return fmt.Errorf("invalid gateway name %q (lowercase letters, digits and dashes)", g)
+		}
+		if seen[g] {
+			return fmt.Errorf("duplicate gateway %q", g)
+		}
+		seen[g] = true
 	}
 	return nil
 }
@@ -54,41 +98,53 @@ func GatewayBase(accountID string) string {
 }
 
 // GatewayPrefix is the container-visible prefix for Cloudflare AI Gateway
-// traffic. `/cloudflare/<gateway>/...` maps straight onto
-// `https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/...`, so any
-// number of gateways are reachable through one route with no config change —
-// the gateway name is just the next path segment.
+// traffic. Each configured gateway gets its own route beneath it:
+// `/cloudflare/<gateway>/...` maps onto
+// `https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/...`, carries that
+// gateway's own credential, and is rendered only into the sites of containers
+// created against it.
 const GatewayPrefix = "/cloudflare"
 
 // DefaultRoutes is the day-one route table (spec §4), parameterized by the
 // gateway coordinates.
 func DefaultRoutes(m Meta) []Route {
-	aig := []Header{{Header: "cf-aig-authorization", Value: "Bearer {secret:cf-aig-token}"}}
 	ghToken := []Header{{Header: "Authorization", Value: "Bearer {secret:gh-pat}"}}
-	return []Route{
-		// Path-prefix routes: agents point their base URL at 127.0.0.1:8787.
-		//
-		// One route covers every gateway on the account. The prefix is
-		// stripped and the account base prepended, so
-		//   /cloudflare/<gw>/anthropic/v1/messages
-		//   /cloudflare/<gw>/openai/chat/completions
-		// reach the provider-native endpoints of whichever gateway is named.
-		//
-		// /anthropic and /openai are deliberately left unused, reserved for
-		// talking to those APIs directly rather than through Cloudflare.
-		{Name: "cloudflare", Prefix: GatewayPrefix, Upstream: GatewayBase(m.AccountID), Inject: aig},
-		{Name: "github-api", Prefix: "/github-api", Upstream: "https://api.github.com", Inject: ghToken},
-		{Name: "github-git", Prefix: "/github-git", Upstream: "https://github.com",
+	var routes []Route
+
+	// One route per configured gateway, each injecting that gateway's own
+	// credential. The prefix is stripped and the account base prepended, so
+	//   /cloudflare/<gw>/anthropic/v1/messages
+	//   /cloudflare/<gw>/openai/chat/completions
+	// reach the provider-native endpoints of that gateway.
+	//
+	// /anthropic and /openai are deliberately left unused, reserved for
+	// talking to those APIs directly rather than through Cloudflare.
+	for _, g := range m.Gateways {
+		routes = append(routes, Route{
+			Name:     "cloudflare-" + g,
+			Prefix:   GatewayPrefix + "/" + g,
+			Gateway:  g,
+			Upstream: GatewayBase(m.AccountID) + "/" + g,
+			Inject: []Header{{
+				Header: "cf-aig-authorization",
+				Value:  "Bearer {secret:" + GatewaySecret(g) + "}",
+			}},
+		})
+	}
+
+	return append(routes, []Route{
+		{Name: "github-api", Gateway: AnyGateway, Prefix: "/github-api", Upstream: "https://api.github.com", Inject: ghToken},
+		{Name: "github-git", Gateway: AnyGateway, Prefix: "/github-git", Upstream: "https://github.com",
 			Inject: []Header{{Header: "Authorization", Value: "{basic:x-access-token:gh-pat}"}}},
 
 		// Host routes for the `gh` CLI, which has no base-URL override but
 		// does have http_unix_socket: it dials our socket in plain HTTP while
 		// still addressing the real hostnames.
-		{Name: "gh-api", Host: "api.github.com", Upstream: "https://api.github.com", Inject: ghToken},
-		{Name: "gh-uploads", Host: "uploads.github.com", Upstream: "https://uploads.github.com", Inject: ghToken},
+		{Name: "gh-api", Gateway: AnyGateway, Host: "api.github.com", Upstream: "https://api.github.com", Inject: ghToken},
+		{Name: "gh-uploads", Gateway: AnyGateway, Host: "uploads.github.com", Upstream: "https://uploads.github.com", Inject: ghToken},
 		// Asset downloads redirect here with a signed URL; they need no
 		// credential, and must not be sent one.
-		{Name: "gh-objects", Host: "objects.githubusercontent.com", Upstream: "https://objects.githubusercontent.com"},
-		{Name: "gh-codeload", Host: "codeload.github.com", Upstream: "https://codeload.github.com"},
-	}
+		{Name: "gh-objects", Gateway: AnyGateway, Host: "objects.githubusercontent.com", Upstream: "https://objects.githubusercontent.com"},
+		{Name: "gh-codeload", Gateway: AnyGateway, Host: "codeload.github.com", Upstream: "https://codeload.github.com"},
+	}...)
 }

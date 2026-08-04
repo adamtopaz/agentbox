@@ -19,13 +19,13 @@ var update = flag.Bool("update", false, "rewrite golden files")
 
 func testRoutes() []config.Route {
 	return []config.Route{
-		{Name: "anthropic", Prefix: "/anthropic",
+		{Name: "anthropic", Prefix: "/anthropic", Gateway: "prod",
 			Upstream: "https://gateway.ai.cloudflare.com/v1/ACCT/GW/anthropic",
 			Inject:   []config.Header{{Header: "cf-aig-authorization", Value: "Bearer {secret:cf-aig-token}"}}},
-		{Name: "github-git", Prefix: "/github-git", Upstream: "https://github.com",
+		{Name: "github-git", Prefix: "/github-git", Gateway: config.AnyGateway, Upstream: "https://github.com",
 			Inject: []config.Header{{Header: "Authorization", Value: "{basic:x-access-token:gh-pat}"}}},
-		{Name: "passthrough", Prefix: "/echo", Upstream: "http://127.0.0.1:9999"},
-		{Name: "gh-api", Host: "api.github.com", Upstream: "https://api.github.com",
+		{Name: "passthrough", Prefix: "/echo", Gateway: config.AnyGateway, Upstream: "http://127.0.0.1:9999"},
+		{Name: "gh-api", Host: "api.github.com", Gateway: config.AnyGateway, Upstream: "https://api.github.com",
 			Inject: []config.Header{{Header: "Authorization", Value: "Bearer {secret:gh-pat}"}}},
 	}
 }
@@ -75,14 +75,14 @@ func TestGolden(t *testing.T) {
 		"empty.caddyfile": baseOptions(),
 		"one.caddyfile": func() Options {
 			o := baseOptions()
-			o.Containers = []state.Container{{Name: "dev"}}
+			o.Containers = []state.Container{{Name: "dev", Gateway: "prod"}}
 			return o
 		}(),
 		"multi-blocked.caddyfile": func() Options {
 			o := baseOptions()
 			o.Containers = []state.Container{
-				{Name: "beta", Blocked: true},
-				{Name: "alpha"},
+				{Name: "beta", Gateway: "prod", Blocked: true},
+				{Name: "alpha", Gateway: "prod"},
 			}
 			return o
 		}(),
@@ -92,9 +92,70 @@ func TestGolden(t *testing.T) {
 	}
 }
 
+// TestGatewayPinning is the isolation property in config form: a container
+// sees its own gateway's route and credential, and the other gateway's route
+// is absent from its snippet entirely — not present-but-denied.
+func TestGatewayPinning(t *testing.T) {
+	o := baseOptions()
+	o.Routes = []config.Route{
+		{Name: "cf-mine", Prefix: "/cloudflare/mine", Gateway: "mine",
+			Upstream: "https://gateway.ai.cloudflare.com/v1/ACCT/mine",
+			Inject:   []config.Header{{Header: "cf-aig-authorization", Value: "Bearer {secret:cf-aig-token-mine}"}}},
+		{Name: "cf-other", Prefix: "/cloudflare/other", Gateway: "other",
+			Upstream: "https://gateway.ai.cloudflare.com/v1/ACCT/other",
+			Inject:   []config.Header{{Header: "cf-aig-authorization", Value: "Bearer {secret:cf-aig-token-other}"}}},
+		{Name: "github-api", Prefix: "/github-api", Gateway: config.AnyGateway,
+			Upstream: "https://api.github.com",
+			Inject:   []config.Header{{Header: "Authorization", Value: "Bearer {secret:gh-pat}"}}},
+	}
+	o.Containers = []state.Container{{Name: "alpha", Gateway: "mine"}, {Name: "beta", Gateway: "other"}}
+	got := render(t, o)
+	checkGolden(t, "two-gateways.caddyfile", got)
+
+	mine := snippet(t, got, "agentbox_routes_gw_mine")
+	other := snippet(t, got, "agentbox_routes_gw_other")
+	for _, c := range []struct{ name, block, own, foreign string }{
+		{"mine", mine, "mine", "other"},
+		{"other", other, "other", "mine"},
+	} {
+		if !strings.Contains(c.block, "handle_path /cloudflare/"+c.own+"/*") {
+			t.Errorf("%s snippet lacks its own gateway route", c.name)
+		}
+		if strings.Contains(c.block, "/cloudflare/"+c.foreign) {
+			t.Errorf("%s snippet contains the other gateway's route", c.name)
+		}
+		if strings.Contains(c.block, "cf-aig-token-"+c.foreign) {
+			t.Errorf("%s snippet references the other gateway's credential", c.name)
+		}
+		// Universal routes appear in both.
+		if !strings.Contains(c.block, "handle_path /github-api/*") {
+			t.Errorf("%s snippet lost the universal github route", c.name)
+		}
+	}
+	// Each site imports only its own set.
+	if !strings.Contains(got, "import agentbox_routes_gw_mine") ||
+		!strings.Contains(got, "import agentbox_routes_gw_other") {
+		t.Error("sites do not import per-gateway snippets")
+	}
+}
+
+// snippet returns the text of one rendered snippet definition.
+func snippet(t *testing.T, rendered, name string) string {
+	t.Helper()
+	start := strings.Index(rendered, "("+name+") {")
+	if start == -1 {
+		t.Fatalf("no snippet %q", name)
+	}
+	end := strings.Index(rendered[start:], "\n}\n")
+	if end == -1 {
+		t.Fatalf("unterminated snippet %q", name)
+	}
+	return rendered[start : start+end]
+}
+
 func TestDeterministicUnderShuffle(t *testing.T) {
 	o := baseOptions()
-	o.Containers = []state.Container{{Name: "a"}, {Name: "b", Blocked: true}, {Name: "c"}}
+	o.Containers = []state.Container{{Name: "a", Gateway: "prod"}, {Name: "b", Gateway: "prod", Blocked: true}, {Name: "c", Gateway: "prod"}}
 	want := render(t, o)
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	for range 5 {
@@ -118,13 +179,13 @@ func TestDeterministicUnderShuffle(t *testing.T) {
 // (cf-aig-collect-log, cf-aig-custom-cost) that a container must not be able
 // to set even on a route that injects cf-aig-authorization.
 func TestStripsPrecedeInjection(t *testing.T) {
-	cfg := config.Config{Routes: config.DefaultRoutes(config.Meta{AccountID: "ACCT", GatewayID: "GW"})}
+	cfg := config.Config{Routes: config.DefaultRoutes(config.Meta{AccountID: "ACCT", Gateways: []string{"prod"}})}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
 	o := baseOptions()
 	o.Routes = cfg.Routes
-	o.Containers = []state.Container{{Name: "dev"}}
+	o.Containers = []state.Container{{Name: "dev", Gateway: "prod"}}
 	got := render(t, o)
 
 	for _, r := range cfg.Routes {
@@ -152,7 +213,7 @@ func TestStripsPrecedeInjection(t *testing.T) {
 			}
 		}
 	}
-	if !strings.Contains(got, `header_up cf-aig-authorization "Bearer {file./run/credentials/caddy.service/cf-aig-token}"`) {
+	if !strings.Contains(got, `header_up cf-aig-authorization "Bearer {file./run/credentials/caddy.service/cf-aig-token-prod}"`) {
 		t.Error("gateway credential injection missing")
 	}
 	// Caddy adds these itself while proxying, so they stay as header_up.
@@ -168,7 +229,7 @@ func TestStripsPrecedeInjection(t *testing.T) {
 // happens to match the same path must not get there first.
 func TestHostRoutesComeFirst(t *testing.T) {
 	o := baseOptions()
-	o.Containers = []state.Container{{Name: "dev"}}
+	o.Containers = []state.Container{{Name: "dev", Gateway: "prod"}}
 	got := render(t, o)
 
 	firstHost := strings.Index(got, "@host_gh_api host api.github.com")
@@ -222,7 +283,7 @@ func hostBlock(t *testing.T, rendered, matcher string) string {
 
 func TestMissingSecretRendersUnavailable(t *testing.T) {
 	o := baseOptions()
-	o.Containers = []state.Container{{Name: "dev"}}
+	o.Containers = []state.Container{{Name: "dev", Gateway: "prod"}}
 	o.InstalledSecrets = map[string]bool{"cf-aig-token": true} // gh-pat.basic absent
 	got := render(t, o)
 
@@ -241,7 +302,7 @@ func TestMissingSecretRendersUnavailable(t *testing.T) {
 
 func TestSecurityPresence(t *testing.T) {
 	o := baseOptions()
-	o.Containers = []state.Container{{Name: "dev"}, {Name: "bad", Blocked: true}}
+	o.Containers = []state.Container{{Name: "dev", Gateway: "prod"}, {Name: "bad", Gateway: "prod", Blocked: true}}
 	got := render(t, o)
 
 	// Every route strips every credential-bearing header it does not inject,
@@ -306,7 +367,7 @@ func TestNoSecretValues(t *testing.T) {
 	}
 	o := baseOptions()
 	o.CredentialsDir = dir
-	o.Containers = []state.Container{{Name: "dev"}}
+	o.Containers = []state.Container{{Name: "dev", Gateway: "prod"}}
 	got := render(t, o)
 	if strings.Contains(got, planted) {
 		t.Fatal("secret value leaked into rendered config")
@@ -328,24 +389,24 @@ func TestRenderRejects(t *testing.T) {
 		func() Options { o := baseOptions(); o.GracePeriod = "10s\nadmin off"; return o }(),
 		func() Options {
 			o := baseOptions()
-			o.Containers = []state.Container{{Name: "Bad Name"}}
+			o.Containers = []state.Container{{Name: "Bad Name", Gateway: "prod"}}
 			return o
 		}(),
 		func() Options { // socket path over the sun_path limit
 			o := baseOptions()
 			o.SocketDir = "/run/" + strings.Repeat("d", 120)
-			o.Containers = []state.Container{{Name: "dev"}}
+			o.Containers = []state.Container{{Name: "dev", Gateway: "prod"}}
 			return o
 		}(),
 		func() Options {
 			o := baseOptions()
-			o.Routes = []config.Route{{Name: "a", Prefix: "/a", Upstream: "https://x.com",
+			o.Routes = []config.Route{{Name: "a", Prefix: "/a", Gateway: config.AnyGateway, Upstream: "https://x.com",
 				Inject: []config.Header{{Header: "X", Value: `inject"ion`}}}}
 			return o
 		}(),
 		func() Options {
 			o := baseOptions()
-			o.Routes = []config.Route{{Name: "a", Prefix: "/a", Upstream: "https://x.com/p a t h"}}
+			o.Routes = []config.Route{{Name: "a", Prefix: "/a", Gateway: config.AnyGateway, Upstream: "https://x.com/p a t h"}}
 			return o
 		}(),
 	}
@@ -380,7 +441,7 @@ func TestCaddyValidate(t *testing.T) {
 	// Unix socket paths must exist-able but validate doesn't bind; still use
 	// a temp dir to stay hermetic.
 	o.SocketDir = filepath.Join(t.TempDir(), "sockets")
-	o.Containers = []state.Container{{Name: "dev"}, {Name: "bad", Blocked: true}}
+	o.Containers = []state.Container{{Name: "dev", Gateway: "prod"}, {Name: "bad", Gateway: "prod", Blocked: true}}
 	got := render(t, o)
 	path := filepath.Join(t.TempDir(), "Caddyfile")
 	if err := os.WriteFile(path, []byte(got), 0o644); err != nil {

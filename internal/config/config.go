@@ -42,6 +42,12 @@ type Route struct {
 	Host     string   `json:"host,omitempty"`
 	Upstream string   `json:"upstream"`
 	Inject   []Header `json:"inject,omitempty"`
+	// Gateway restricts this route to containers created against that AI
+	// Gateway. It is REQUIRED: "*" declares a route universal. Making it
+	// mandatory rather than defaulting an empty value to universal is
+	// deliberate — a route that forgets it would otherwise silently dissolve
+	// the per-container gateway boundary instead of being rejected by it.
+	Gateway string `json:"gateway"`
 }
 
 // IsHostRoute reports whether the route matches on Host rather than a path
@@ -61,8 +67,9 @@ type Config struct {
 }
 
 var (
-	nameRE   = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
-	prefixRE = regexp.MustCompile(`^/[a-z0-9][a-z0-9-]*$`)
+	nameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+	// One or more slug segments: /github-api, /cloudflare/prod.
+	prefixRE = regexp.MustCompile(`^(/[a-z0-9][a-z0-9-]*)+$`)
 	secretRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 	hostRE   = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
 	userRE   = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
@@ -122,7 +129,7 @@ func (c *Config) Validate() error {
 			}
 		case r.Prefix != "":
 			if !prefixRE.MatchString(r.Prefix) {
-				return fmt.Errorf("route %q: invalid prefix %q (want a single path segment like /anthropic)", r.Name, r.Prefix)
+				return fmt.Errorf("route %q: invalid prefix %q (want slug path segments like /github-api or /cloudflare/prod)", r.Name, r.Prefix)
 			}
 		default:
 			return fmt.Errorf("route %q: needs either a prefix or a host", r.Name)
@@ -131,6 +138,16 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("duplicate route selector %q", r.Selector())
 		}
 		selectors[r.Selector()] = true
+
+		switch {
+		case r.Gateway == "":
+			return fmt.Errorf("route %q: %q is required (%q for a route every container may use, "+
+				"or a gateway name to restrict it). A route without it would be reachable from every "+
+				"container regardless of the gateway it was created against", r.Name, "gateway", AnyGateway)
+		case r.Gateway == AnyGateway:
+		case !ValidGatewayName(r.Gateway):
+			return fmt.Errorf("route %q: invalid gateway %q", r.Name, r.Gateway)
+		}
 
 		u, err := url.Parse(r.Upstream)
 		if err != nil || !u.IsAbs() || (u.Scheme != "http" && u.Scheme != "https") ||
@@ -160,6 +177,24 @@ func (c *Config) Validate() error {
 					return fmt.Errorf("secret %q used in {basic:...} templates with two different users (%q and %q)", p.BasicSecret, prev, p.BasicUser)
 				}
 				basicUsers[p.BasicSecret] = p.BasicUser
+			}
+		}
+	}
+	// A prefix that contains another shadows it: inside the rendered route
+	// block, written order is execution order and the shorter prefix sorts
+	// first, so /cloudflare would swallow every /cloudflare/<gw> route — and
+	// serve them with its own credential.
+	for i, a := range c.Routes {
+		if a.IsHostRoute() {
+			continue
+		}
+		for j, b := range c.Routes {
+			if i == j || b.IsHostRoute() {
+				continue
+			}
+			if strings.HasPrefix(b.Prefix, a.Prefix+"/") {
+				return fmt.Errorf("route %q (%s) shadows route %q (%s); a prefix must not contain another",
+					a.Name, a.Prefix, b.Name, b.Prefix)
 			}
 		}
 	}

@@ -2,7 +2,7 @@
 // so no plaintext credential is ever written to disk. Ciphertext lives in
 // /etc/agentbox/secrets/<name>.cred and is handed to Caddy by systemd's
 // LoadCredentialEncrypted=, which decrypts it into the service's private
-// /run/credentials tmpfs at start.
+// /run/credentials ramfs at start (unswappable, per man systemd-creds).
 //
 // What this does and does not buy is worth being precise about. Caddy needs
 // plaintext at request time and must start unattended, so the decryption key
@@ -10,8 +10,9 @@
 // recover the secrets, under any scheme. The protection is against the disk
 // being read *outside* the running system — a stolen or decommissioned drive,
 // a backup, a copied snapshot. On a host with a TPM that is a strong
-// boundary; with only a host key (/var/lib/systemd/credential.secret) it is
-// weaker, since key and ciphertext sit on the same disk. See docs/runbook.md.
+// boundary; agentbox uses the host key
+// (/var/lib/systemd/credential.secret), which is weaker — key and ciphertext
+// sit on the same disk — but predictable. See docs/runbook.md.
 package credstore
 
 import (
@@ -84,24 +85,24 @@ func (s Store) Put(name string, value []byte) error {
 	tmp.Close()
 	defer os.Remove(tmpName) // no-op once renamed
 
-	// No --with-key: systemd's default binds to the TPM when one is present
-	// and falls back to the host key otherwise, so this upgrades itself on
-	// hardware that has a TPM without any change here.
+	// --with-key=host, explicitly. The default (auto) binds to the TPM *and*
+	// the host key when a TPM is present — man systemd-creds: "both need to
+	// be available to decrypt the credential again" — so losing either one
+	// destroys every credential, and decryption failure is fatal to unit
+	// activation. Since no plaintext copy is kept, that would mean re-issuing
+	// every token. The host key alone is predictable, survives firmware and
+	// Secure Boot changes, and still makes the ciphertext useless off this
+	// host, which is the property this is for. A TPM-backed deployment can
+	// opt into stronger binding deliberately; it should not arrive by
+	// accident with the brittleness attached.
 	//
-	// --tpm2-pcrs= (empty) is not optional. systemd-creds otherwise defaults
-	// to sealing against PCR 7, which measures Secure Boot state: a dbx
-	// update from fwupd, a firmware Secure Boot toggle, or key re-enrolment
-	// would change it and make every credential permanently undecryptable.
-	// Decryption failure is fatal to unit activation, so caddy would simply
-	// stop starting, and since no plaintext copy is kept the only recovery
-	// would be re-issuing every token. Binding to no PCRs still keeps the
-	// ciphertext useless off this host, which is the property we want.
-	// --tpm2-public-key= (empty) too: systemd auto-discovers
-	// tpm2-pcr-public-key.pem from /etc, /run or /usr/lib and would then bind
-	// to signed PCR 11, quietly reintroducing the brittleness --tpm2-pcrs=
-	// exists to avoid.
+	// (An earlier revision passed --tpm2-pcrs= and --tpm2-public-key= to tame
+	// the auto path. The first is real; the second is a no-op — an empty
+	// value parses to "unset", which is exactly what triggers the
+	// tpm2-pcr-public-key.pem auto-discovery it was meant to suppress. Both
+	// are moot with an explicit key choice.)
 	cmd := exec.Command(s.bin(), "encrypt",
-		"--name="+name, "--tpm2-pcrs=", "--tpm2-public-key=", "-", tmpName)
+		"--name="+name, "--with-key=host", "-", tmpName)
 	cmd.Stdin = bytes.NewReader(value)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

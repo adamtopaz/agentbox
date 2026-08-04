@@ -30,7 +30,10 @@ host:
   build-image            (re)build the agentbox-base container image
 
 containers:
-  create <name>          new wired container (proxy at 127.0.0.1:8787 inside)
+  create --gateway <gw> <name>
+                         new wired container (proxy at 127.0.0.1:8787 inside).
+                         --gateway is required and pins the container: its
+                         site carries only that gateway's route
   shell <name>           login shell as user 'agent' inside the container
   list                   containers with incus/socket/blocked status
   destroy <name>         delete container + its proxy config

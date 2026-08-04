@@ -90,7 +90,7 @@ func TestCreateHappyPath(t *testing.T) {
 	e := newEnv(t)
 	e.incus.Respond("list --format json", 0, "[]")
 
-	if err := e.m.Create("dev"); err != nil {
+	if err := e.m.Create("dev", "prod"); err != nil {
 		t.Fatal(err)
 	}
 	if _, found, _ := e.m.States.Get("dev"); !found {
@@ -140,18 +140,18 @@ func TestCreateHappyPath(t *testing.T) {
 
 func TestCreateRejectsBadAndExistingNames(t *testing.T) {
 	e := newEnv(t)
-	if err := e.m.Create("Bad Name"); err == nil {
+	if err := e.m.Create("Bad Name", "prod"); err == nil {
 		t.Fatal("bad name accepted")
 	}
-	if err := e.m.Create(state.ReservedName); err == nil {
+	if err := e.m.Create(state.ReservedName, "prod"); err == nil {
 		t.Fatal("reserved name accepted")
 	}
 
 	e.incus.Respond("list --format json", 0, "[]")
-	if err := e.m.Create("dev"); err != nil {
+	if err := e.m.Create("dev", "prod"); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.m.Create("dev"); err == nil || !strings.Contains(err.Error(), "already exists") {
+	if err := e.m.Create("dev", "prod"); err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("duplicate create: %v", err)
 	}
 }
@@ -159,7 +159,7 @@ func TestCreateRejectsBadAndExistingNames(t *testing.T) {
 func TestCreateRefusesForeignInstance(t *testing.T) {
 	e := newEnv(t)
 	e.incus.Respond("list --format json", 0, `[{"name":"dev","status":"Running","config":{}}]`)
-	err := e.m.Create("dev")
+	err := e.m.Create("dev", "prod")
 	if err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("expected foreign-instance refusal, got %v", err)
 	}
@@ -173,7 +173,7 @@ func TestCreateRollsBackOnDeviceAddFailure(t *testing.T) {
 	e.incus.Respond("list --format json", 0, "[]")
 	e.incus.RespondStderr("config device add", 1, "", "Error: proxy devices unavailable\n")
 
-	err := e.m.Create("dev")
+	err := e.m.Create("dev", "prod")
 	if err == nil || !strings.Contains(err.Error(), "proxy devices unavailable") {
 		t.Fatalf("expected device-add failure, got %v", err)
 	}
@@ -198,7 +198,7 @@ func TestCreateFailsWhenSocketNeverAppears(t *testing.T) {
 	e := newEnv(t)
 	e.incus.Respond("list --format json", 0, "[]")
 	e.m.Reconcile = func() error { return nil } // caddy "down": no socket appears
-	err := e.m.Create("dev")
+	err := e.m.Create("dev", "prod")
 	if err == nil || !strings.Contains(err.Error(), "caddy") {
 		t.Fatalf("expected socket-wait failure, got %v", err)
 	}

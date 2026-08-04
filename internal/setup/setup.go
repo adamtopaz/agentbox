@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,7 +38,7 @@ import (
 type Options struct {
 	Prefix    string // test root; "" = the real host
 	AccountID string
-	GatewayID string
+	Gateways  []string
 	AdminUser string // user added to the agentbox group; default $SUDO_USER
 	NoStart   bool
 	CaddyBin  string // default "caddy"
@@ -329,24 +330,40 @@ func (r *runner) ensureMeta() error {
 	metaPath := r.prefixed(paths.Meta)
 	existing, err := config.LoadMeta(metaPath)
 	haveExisting := err == nil
+	if !haveExisting {
+		// A file in the pre-multi-gateway shape validates as invalid, which
+		// would otherwise throw away the account id sitting right there and
+		// re-prompt for everything.
+		if legacy, ok := readLegacyMeta(metaPath); ok {
+			// haveExisting stays false on purpose: the values are carried
+			// forward, but the file itself must be rewritten in the new shape.
+			existing = legacy
+			r.change("migrated %s from the single-gateway format (gateway %q)", metaPath, legacy.Gateways[0])
+			r.warn("the old shared credential %q is no longer referenced; each gateway now uses cf-aig-token-<gateway>. Add the per-gateway token, then revoke the old one in Cloudflare and delete its ciphertext", "cf-aig-token")
+		}
+	}
 
-	m := config.Meta{AccountID: r.o.AccountID, GatewayID: r.o.GatewayID}
-	if m.AccountID == "" && haveExisting {
+	m := config.Meta{AccountID: r.o.AccountID, Gateways: r.o.Gateways}
+	if m.AccountID == "" {
 		m.AccountID = existing.AccountID
 	}
-	if m.GatewayID == "" && haveExisting {
-		m.GatewayID = existing.GatewayID
+	if len(m.Gateways) == 0 {
+		m.Gateways = existing.Gateways
 	}
 	if m.AccountID == "" {
 		m.AccountID = r.prompt("Cloudflare account ID")
 	}
-	if m.GatewayID == "" {
-		m.GatewayID = r.prompt("AI Gateway ID")
+	if len(m.Gateways) == 0 {
+		for _, g := range strings.Split(r.prompt("AI Gateway names (comma-separated)"), ",") {
+			if g = strings.TrimSpace(g); g != "" {
+				m.Gateways = append(m.Gateways, g)
+			}
+		}
 	}
 	if err := m.Validate(); err != nil {
 		return err
 	}
-	if haveExisting && existing == m {
+	if haveExisting && slices.Equal(existing.Gateways, m.Gateways) && existing.AccountID == m.AccountID {
 		r.logf("agentbox.json ok")
 		return nil
 	}
@@ -359,6 +376,30 @@ func (r *runner) ensureMeta() error {
 	}
 	r.change("wrote %s", metaPath)
 	return nil
+}
+
+// readLegacyMeta recognises the pre-multi-gateway {account_id, gateway_id}
+// shape so an upgrade keeps what it can instead of starting over.
+func readLegacyMeta(path string) (config.Meta, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return config.Meta{}, false
+	}
+	var legacy struct {
+		AccountID string `json:"account_id"`
+		GatewayID string `json:"gateway_id"`
+	}
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return config.Meta{}, false
+	}
+	if legacy.GatewayID == "" {
+		return config.Meta{}, false
+	}
+	m := config.Meta{AccountID: legacy.AccountID, Gateways: []string{legacy.GatewayID}}
+	if m.Validate() != nil {
+		return config.Meta{}, false
+	}
+	return m, true
 }
 
 func (r *runner) prompt(label string) string {
@@ -375,36 +416,77 @@ func (r *runner) ensureRoutes() error {
 	if err != nil {
 		return err
 	}
-	cfg := config.Config{Routes: config.DefaultRoutes(m)}
-	if err := cfg.Validate(); err != nil {
-		return err
+	generated := config.DefaultRoutes(m)
+	routesPath := r.prefixed(paths.Routes)
+
+	_, readErr := os.Stat(routesPath)
+	if errors.Is(readErr, fs.ErrNotExist) {
+		return r.writeRoutes(routesPath, config.Config{Routes: generated}, "wrote %s")
 	}
-	data, err := json.MarshalIndent(cfg, "", "  ")
+	if readErr != nil {
+		return readErr
+	}
+
+	// Merge rather than replace-or-refuse. The gateway routes are generated
+	// and must track agentbox.json — leaving them stale is how the pinning
+	// boundary silently stops matching what the operator declared, in both
+	// directions: a removed gateway keeps its route, and an added one never
+	// gets one. Everything the operator added is preserved untouched.
+	cur, err := config.Load(routesPath)
+	if err != nil {
+		return fmt.Errorf("%w\n(the previous format is not compatible: every route now needs a \"gateway\" field, %q for routes any container may use. Move the file aside and re-run to regenerate)",
+			err, config.AnyGateway)
+	}
+	isGenerated := func(name string) bool { return strings.HasPrefix(name, "cloudflare-") }
+	merged := make([]config.Route, 0, len(cur.Routes)+len(generated))
+	for _, rt := range cur.Routes {
+		if !isGenerated(rt.Name) {
+			merged = append(merged, rt)
+		}
+	}
+	merged = append(generated[:len(m.Gateways):len(m.Gateways)], merged...)
+
+	want := config.Config{Routes: merged}
+	if err := want.Validate(); err != nil {
+		return fmt.Errorf("merging generated gateway routes with %s: %w", routesPath, err)
+	}
+	same, err := sameRoutes(routesPath, want)
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
-
-	routesPath := r.prefixed(paths.Routes)
-	existing, readErr := os.ReadFile(routesPath)
-	switch {
-	case errors.Is(readErr, fs.ErrNotExist):
-		if err := os.WriteFile(routesPath, data, 0o644); err != nil {
-			return err
-		}
-		r.change("wrote %s", routesPath)
-	case readErr != nil:
-		return readErr
-	case string(existing) == string(data):
+	if same {
 		r.logf("routes.json ok")
-	default:
-		// Never clobber operator edits: leave the fresh render next door.
-		if err := os.WriteFile(routesPath+".new", data, 0o644); err != nil {
-			return err
-		}
-		r.warn("%s differs from the generated default; wrote %s.new instead (existing file kept)", routesPath, routesPath)
+		return nil
 	}
+	return r.writeRoutes(routesPath, want, "updated %s (gateway routes reconciled with agentbox.json)")
+}
+
+func (r *runner) writeRoutes(path string, c config.Config, msg string) error {
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+		return err
+	}
+	r.change(msg, path)
 	return nil
+}
+
+// sameRoutes reports whether the file already encodes exactly this table.
+func sameRoutes(path string, c config.Config) (bool, error) {
+	data, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return false, err
+	}
+	cur, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	return string(cur) == string(append(data, '\n')), nil
 }
 
 // ensureBasicCompanions writes base64(USER:secret) companion files for every

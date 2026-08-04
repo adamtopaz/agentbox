@@ -16,16 +16,38 @@
 	}
 }
 
-(agentbox_routes_gw_prod) {
+(agentbox_routes_gw_mine) {
 	route {
 		@agentbox_dots vars_regexp {http.request.orig_uri.path} (^|/|\\|%5c|%5C|;|%3b|%3B)(\.|%2e|%2E|%252e|%252E){1,2}(/|\\|%5c|%5C|;|%3b|%3B|$)
 		respond @agentbox_dots 404
 		@agentbox_escapes vars_regexp {http.request.orig_uri.path} ([^\x20-\x7e]|%2[eEfF]|%5[cC]|%25)
 		respond @agentbox_escapes 404
-		@host_gh_api host api.github.com
-		handle @host_gh_api {
-			@nocred_gh_api_0 vars {file./run/credentials/caddy.service/gh-pat} ""
-			respond @nocred_gh_api_0 "route gh-api unavailable: credential not installed" 503
+		redir /cloudflare/mine /cloudflare/mine/ 308
+		handle_path /cloudflare/mine/* {
+			rewrite * /v1/ACCT/mine{uri}
+			@nocred_cf_mine_0 vars {file./run/credentials/caddy.service/cf-aig-token-mine} ""
+			respond @nocred_cf_mine_0 "route cf-mine unavailable: credential not installed" 503
+			request_header -Authorization
+			request_header -Proxy-Authorization
+			request_header -X-Api-Key
+			request_header -Api-Key
+			request_header -X-Goog-Api-Key
+			request_header -X-Auth-Token
+			request_header -Cookie
+			request_header -Cf-Aig-*
+			request_header -X-Aig-*
+			reverse_proxy https://gateway.ai.cloudflare.com {
+				flush_interval -1
+				header_up Host {upstream_hostport}
+				header_up -Forwarded
+				header_up -X-Forwarded-*
+				header_up cf-aig-authorization "Bearer {file./run/credentials/caddy.service/cf-aig-token-mine}"
+			}
+		}
+		redir /github-api /github-api/ 308
+		handle_path /github-api/* {
+			@nocred_github_api_0 vars {file./run/credentials/caddy.service/gh-pat} ""
+			respond @nocred_github_api_0 "route github-api unavailable: credential not installed" 503
 			request_header -Authorization
 			request_header -Proxy-Authorization
 			request_header -X-Api-Key
@@ -43,11 +65,22 @@
 				header_up Authorization "Bearer {file./run/credentials/caddy.service/gh-pat}"
 			}
 		}
-		redir /anthropic /anthropic/ 308
-		handle_path /anthropic/* {
-			rewrite * /v1/ACCT/GW/anthropic{uri}
-			@nocred_anthropic_0 vars {file./run/credentials/caddy.service/cf-aig-token} ""
-			respond @nocred_anthropic_0 "route anthropic unavailable: credential not installed" 503
+		handle {
+			respond "unknown route" 404
+		}
+	}
+}
+(agentbox_routes_gw_other) {
+	route {
+		@agentbox_dots vars_regexp {http.request.orig_uri.path} (^|/|\\|%5c|%5C|;|%3b|%3B)(\.|%2e|%2E|%252e|%252E){1,2}(/|\\|%5c|%5C|;|%3b|%3B|$)
+		respond @agentbox_dots 404
+		@agentbox_escapes vars_regexp {http.request.orig_uri.path} ([^\x20-\x7e]|%2[eEfF]|%5[cC]|%25)
+		respond @agentbox_escapes 404
+		redir /cloudflare/other /cloudflare/other/ 308
+		handle_path /cloudflare/other/* {
+			rewrite * /v1/ACCT/other{uri}
+			@nocred_cf_other_0 vars {file./run/credentials/caddy.service/cf-aig-token-other} ""
+			respond @nocred_cf_other_0 "route cf-other unavailable: credential not installed" 503
 			request_header -Authorization
 			request_header -Proxy-Authorization
 			request_header -X-Api-Key
@@ -62,11 +95,13 @@
 				header_up Host {upstream_hostport}
 				header_up -Forwarded
 				header_up -X-Forwarded-*
-				header_up cf-aig-authorization "Bearer {file./run/credentials/caddy.service/cf-aig-token}"
+				header_up cf-aig-authorization "Bearer {file./run/credentials/caddy.service/cf-aig-token-other}"
 			}
 		}
-		redir /echo /echo/ 308
-		handle_path /echo/* {
+		redir /github-api /github-api/ 308
+		handle_path /github-api/* {
+			@nocred_github_api_0 vars {file./run/credentials/caddy.service/gh-pat} ""
+			respond @nocred_github_api_0 "route github-api unavailable: credential not installed" 503
 			request_header -Authorization
 			request_header -Proxy-Authorization
 			request_header -X-Api-Key
@@ -76,32 +111,12 @@
 			request_header -Cookie
 			request_header -Cf-Aig-*
 			request_header -X-Aig-*
-			reverse_proxy http://127.0.0.1:9999 {
+			reverse_proxy https://api.github.com {
 				flush_interval -1
 				header_up Host {upstream_hostport}
 				header_up -Forwarded
 				header_up -X-Forwarded-*
-			}
-		}
-		redir /github-git /github-git/ 308
-		handle_path /github-git/* {
-			@nocred_github_git_0 vars {file./run/credentials/caddy.service/gh-pat.basic} ""
-			respond @nocred_github_git_0 "route github-git unavailable: credential not installed" 503
-			request_header -Authorization
-			request_header -Proxy-Authorization
-			request_header -X-Api-Key
-			request_header -Api-Key
-			request_header -X-Goog-Api-Key
-			request_header -X-Auth-Token
-			request_header -Cookie
-			request_header -Cf-Aig-*
-			request_header -X-Aig-*
-			reverse_proxy https://github.com {
-				flush_interval -1
-				header_up Host {upstream_hostport}
-				header_up -Forwarded
-				header_up -X-Forwarded-*
-				header_up Authorization "Basic {file./run/credentials/caddy.service/gh-pat.basic}"
+				header_up Authorization "Bearer {file./run/credentials/caddy.service/gh-pat}"
 			}
 		}
 		handle {
@@ -125,10 +140,10 @@
 		}
 	}
 	log_append container alpha
-	import agentbox_routes_gw_prod
+	import agentbox_routes_gw_mine
 }
 
-# container: beta (BLOCKED)
+# container: beta
 :8101 {
 	bind unix//run/agentbox/containers/beta.sock|0660
 	log {
@@ -143,5 +158,5 @@
 		}
 	}
 	log_append container beta
-	respond "container blocked" 403
+	import agentbox_routes_gw_other
 }

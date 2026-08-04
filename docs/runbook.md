@@ -68,17 +68,31 @@ Host header (path untouched; this is how `gh` and anything else that dials
 ```json
 {
   "name": "anthropic-direct",
+  "gateway": "*",
   "prefix": "/anthropic",
   "upstream": "https://api.anthropic.com",
   "inject": [{ "header": "x-api-key", "value": "{secret:anthropic-key}" }]
 },
 {
-  "name": "gitlab-api",
+  "name": "gitlab-prod-only",
+  "gateway": "prod",
   "host": "gitlab.com",
   "upstream": "https://gitlab.com",
   "inject": [{ "header": "Authorization", "value": "Bearer {secret:gitlab-token}" }]
 }
 ```
+
+**`gateway` is required on every route.** Use `"*"` for a route any container
+may use, or a gateway name to restrict it to containers created against that
+gateway. It is mandatory rather than defaulting to universal on purpose: a
+route that forgot it would silently be reachable from every container,
+dissolving the pinning boundary instead of being rejected by it.
+
+Routes named `cloudflare-<gateway>` are generated — `setup` reconciles them
+against `agentbox.json` on every run and will overwrite your edits. Everything
+else you add is preserved untouched. A prefix that contains another
+(`/cloudflare` alongside `/cloudflare/prod`) is refused, because the shorter
+one would shadow the longer and serve it with the wrong credential.
 
 Only add an injecting host route for a host that should receive that
 credential. Redirect targets that carry signed URLs (asset/CDN hosts) should
@@ -92,37 +106,56 @@ live config.
 
 ## Cloudflare AI Gateway: using more than one
 
-One route covers them all. `/cloudflare/<gateway-name>/...` expands to
-`https://gateway.ai.cloudflare.com/v1/<account>/<gateway-name>/...`, so any
-gateway on the account is reachable by naming it in the path — no new route,
-no `setup` re-run, no image rebuild:
+List every gateway in `/etc/agentbox/agentbox.json`; there is no default.
 
-```
-http://127.0.0.1:8787/cloudflare/prod/anthropic/v1/messages
-http://127.0.0.1:8787/cloudflare/experiments/openai/chat/completions
+```json
+{ "account_id": "…", "gateways": ["prod", "experiments"] }
 ```
 
-All of them authenticate with the same `cf-aig-token`. Note that Cloudflare's
-`AI Gateway Read`/`Run`/`Edit` permissions **cannot be restricted to a single
-gateway** — the token is account-wide by construction, and Cloudflare's own
-guidance for isolation is separate accounts or a Worker-side binding. Budgets
-and logging are per-gateway in the dashboard, which is the usual reason to run
-several, but the *credential* does not narrow with them. If a gateway has
-provider keys stored via Bring Your Own Keys, this token can spend against
-those too.
+Each gets its own route and its own credential, named `cf-aig-token-<gateway>`:
 
-`gateway_id` in `/etc/agentbox/agentbox.json` is only the *default* — the one
-the image wires `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL` and Codex to. To point
-an agent elsewhere, override its base URL in the container; to change the
-default for new containers, edit `agentbox.json` and rebuild the image.
+```sh
+sudo agentbox add-secret cf-aig-token-prod
+sudo agentbox add-secret cf-aig-token-experiments
+sudo agentbox setup
+```
 
-This is deliberately **not** a security boundary. A container can reach any
-gateway on the account by changing its path, and the token could not be
-narrowed even if it could not. Compared with the earlier one-gateway-per-route
-design, the proxy no longer pins which gateway a container may use. If you
-need that back, the cheap option is a `path_regexp` allowlist on the segment
-after `/cloudflare` (e.g. `^/(prod|experiments)(/|$)`); the thorough option is
-separate Cloudflare accounts.
+A container is created against exactly one, and **its Caddy site carries only
+that gateway's route** — another gateway is not merely unauthorized for it, it
+returns 404 because it does not exist on that socket:
+
+```sh
+agentbox create --gateway prod dev
+agentbox create --gateway experiments bench
+agentbox list          # the GATEWAY column shows which
+```
+
+Inside the container, `agentbox create` writes
+`/etc/profile.d/agentbox-gateway.sh` with `ANTHROPIC_BASE_URL`,
+`OPENAI_BASE_URL` and `AGENTBOX_GATEWAY`, and regenerates Codex's config. The
+image itself is gateway-agnostic, so changing gateways needs no rebuild — but
+an existing container keeps the gateway it was created with. Recreate it to
+move it (containers are designed to be cheap to recreate).
+
+This *is* an enforceable boundary, and it is the only one available: Cloudflare
+cannot scope a token to one gateway — any token with `AI Gateway Run` reaches
+every gateway on the account, including ones holding provider keys via Bring
+Your Own Keys. Separate tokens therefore buy revocation and attribution
+granularity; the proxy is what stops a container spending against a gateway
+that is not its own.
+
+Adding or removing a gateway: edit `gateways`, `add-secret
+cf-aig-token-<name>` for a new one, then `sudo agentbox setup` — it reconciles
+the generated `cloudflare-*` routes to match, adding and removing as needed,
+and leaves your own routes alone. Existing containers keep the gateway they
+were created with; if that gateway is removed, reconcile warns that the
+container can now reach none.
+
+Upgrading from the single-gateway format: `setup` migrates
+`{account_id, gateway_id}` to a one-entry `gateways` list, keeping the account
+id. The old shared `cf-aig-token` stops being referenced — add
+`cf-aig-token-<gateway>`, then revoke the old token in Cloudflare and delete
+its ciphertext.
 
 ## Revoke / contain a container
 

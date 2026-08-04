@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"agentbox/image"
 	"agentbox/internal/buildimage"
@@ -14,7 +15,7 @@ import (
 func cmdSetup(args []string) int {
 	fs := flag.NewFlagSet("setup", flag.ContinueOnError)
 	account := fs.String("account-id", "", "Cloudflare account ID (prompted if absent)")
-	gateway := fs.String("gateway-id", "", "AI Gateway ID (prompted if absent)")
+	gateways := fs.String("gateways", "", "comma-separated AI Gateway names (prompted if absent)")
 	adminUser := fs.String("admin-user", "", "user to add to the agentbox group (default $SUDO_USER)")
 	noStart := fs.Bool("no-start", false, "prepare everything but do not (re)start services")
 	prefix := fs.String("prefix", "", "root all paths here and skip system mutations (testing)")
@@ -25,7 +26,7 @@ func cmdSetup(args []string) int {
 	err := setup.Run(setup.Options{
 		Prefix:    *prefix,
 		AccountID: *account,
-		GatewayID: *gateway,
+		Gateways:  splitList(*gateways),
 		AdminUser: *adminUser,
 		NoStart:   *noStart,
 		CaddyBin:  *caddyBin,
@@ -35,6 +36,17 @@ func cmdSetup(args []string) int {
 		return fail(err)
 	}
 	return 0
+}
+
+// splitList parses a comma-separated flag into a trimmed, non-empty list.
+func splitList(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func cmdSetupFirewall(args []string) int {

@@ -10,10 +10,10 @@ import (
 
 func validConfig() Config {
 	return Config{Routes: []Route{
-		{Name: "anthropic", Prefix: "/anthropic",
+		{Name: "anthropic", Gateway: AnyGateway, Prefix: "/anthropic",
 			Upstream: "https://gateway.ai.cloudflare.com/v1/acct/gw/anthropic",
 			Inject:   []Header{{Header: "cf-aig-authorization", Value: "Bearer {secret:cf-aig-token}"}}},
-		{Name: "github-git", Prefix: "/github-git", Upstream: "https://github.com",
+		{Name: "github-git", Gateway: AnyGateway, Prefix: "/github-git", Upstream: "https://github.com",
 			Inject: []Header{{Header: "Authorization", Value: "{basic:x-access-token:gh-pat}"}}},
 	}}
 }
@@ -26,7 +26,7 @@ func TestValidateOK(t *testing.T) {
 }
 
 func TestValidateNormalizesTrailingSlash(t *testing.T) {
-	c := Config{Routes: []Route{{Name: "a", Prefix: "/a", Upstream: "https://example.com/base/"}}}
+	c := Config{Routes: []Route{{Name: "a", Gateway: AnyGateway, Prefix: "/a", Upstream: "https://example.com/base/"}}}
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -37,24 +37,26 @@ func TestValidateNormalizesTrailingSlash(t *testing.T) {
 
 func TestValidateRejects(t *testing.T) {
 	cases := map[string]Config{
-		"empty":            {},
-		"bad name":         {Routes: []Route{{Name: "Bad_Name", Prefix: "/a", Upstream: "https://x.com"}}},
-		"dup name":         {Routes: []Route{{Name: "a", Prefix: "/a", Upstream: "https://x.com"}, {Name: "a", Prefix: "/b", Upstream: "https://x.com"}}},
-		"bad prefix":       {Routes: []Route{{Name: "a", Prefix: "/a/b", Upstream: "https://x.com"}}},
-		"no slash prefix":  {Routes: []Route{{Name: "a", Prefix: "a", Upstream: "https://x.com"}}},
-		"dup prefix":       {Routes: []Route{{Name: "a", Prefix: "/a", Upstream: "https://x.com"}, {Name: "b", Prefix: "/a", Upstream: "https://x.com"}}},
-		"relative up":      {Routes: []Route{{Name: "a", Prefix: "/a", Upstream: "example.com"}}},
-		"ftp upstream":     {Routes: []Route{{Name: "a", Prefix: "/a", Upstream: "ftp://x.com"}}},
-		"query upstream":   {Routes: []Route{{Name: "a", Prefix: "/a", Upstream: "https://x.com/p?q=1"}}},
-		"userinfo":         {Routes: []Route{{Name: "a", Prefix: "/a", Upstream: "https://u:p@x.com"}}},
-		"bad header":       {Routes: []Route{{Name: "a", Prefix: "/a", Upstream: "https://x.com", Inject: []Header{{Header: "X Y", Value: "v"}}}}},
-		"unknown template": {Routes: []Route{{Name: "a", Prefix: "/a", Upstream: "https://x.com", Inject: []Header{{Header: "X", Value: "{nope:x}"}}}}},
-		"stray brace":      {Routes: []Route{{Name: "a", Prefix: "/a", Upstream: "https://x.com", Inject: []Header{{Header: "X", Value: "ab}cd"}}}}},
-		"quote in value":   {Routes: []Route{{Name: "a", Prefix: "/a", Upstream: "https://x.com", Inject: []Header{{Header: "X", Value: `a"b`}}}}},
-		"newline in value": {Routes: []Route{{Name: "a", Prefix: "/a", Upstream: "https://x.com", Inject: []Header{{Header: "X", Value: "a\nb"}}}}},
+		"empty":             {},
+		"bad name":          {Routes: []Route{{Name: "Bad_Name", Prefix: "/a", Upstream: "https://x.com"}}},
+		"dup name":          {Routes: []Route{{Name: "a", Gateway: AnyGateway, Prefix: "/a", Upstream: "https://x.com"}, {Name: "a", Gateway: AnyGateway, Prefix: "/b", Upstream: "https://x.com"}}},
+		"bad prefix":        {Routes: []Route{{Name: "a", Gateway: AnyGateway, Prefix: "/a//b", Upstream: "https://x.com"}}},
+		"prefix trailing /": {Routes: []Route{{Name: "a", Gateway: AnyGateway, Prefix: "/a/", Upstream: "https://x.com"}}},
+		"prefix uppercase":  {Routes: []Route{{Name: "a", Gateway: AnyGateway, Prefix: "/A", Upstream: "https://x.com"}}},
+		"no slash prefix":   {Routes: []Route{{Name: "a", Gateway: AnyGateway, Prefix: "a", Upstream: "https://x.com"}}},
+		"dup prefix":        {Routes: []Route{{Name: "a", Gateway: AnyGateway, Prefix: "/a", Upstream: "https://x.com"}, {Name: "b", Gateway: AnyGateway, Prefix: "/a", Upstream: "https://x.com"}}},
+		"relative up":       {Routes: []Route{{Name: "a", Gateway: AnyGateway, Prefix: "/a", Upstream: "example.com"}}},
+		"ftp upstream":      {Routes: []Route{{Name: "a", Gateway: AnyGateway, Prefix: "/a", Upstream: "ftp://x.com"}}},
+		"query upstream":    {Routes: []Route{{Name: "a", Gateway: AnyGateway, Prefix: "/a", Upstream: "https://x.com/p?q=1"}}},
+		"userinfo":          {Routes: []Route{{Name: "a", Gateway: AnyGateway, Prefix: "/a", Upstream: "https://u:p@x.com"}}},
+		"bad header":        {Routes: []Route{{Name: "a", Gateway: AnyGateway, Prefix: "/a", Upstream: "https://x.com", Inject: []Header{{Header: "X Y", Value: "v"}}}}},
+		"unknown template":  {Routes: []Route{{Name: "a", Gateway: AnyGateway, Prefix: "/a", Upstream: "https://x.com", Inject: []Header{{Header: "X", Value: "{nope:x}"}}}}},
+		"stray brace":       {Routes: []Route{{Name: "a", Gateway: AnyGateway, Prefix: "/a", Upstream: "https://x.com", Inject: []Header{{Header: "X", Value: "ab}cd"}}}}},
+		"quote in value":    {Routes: []Route{{Name: "a", Gateway: AnyGateway, Prefix: "/a", Upstream: "https://x.com", Inject: []Header{{Header: "X", Value: `a"b`}}}}},
+		"newline in value":  {Routes: []Route{{Name: "a", Gateway: AnyGateway, Prefix: "/a", Upstream: "https://x.com", Inject: []Header{{Header: "X", Value: "a\nb"}}}}},
 		"basic user clash": {Routes: []Route{
-			{Name: "a", Prefix: "/a", Upstream: "https://x.com", Inject: []Header{{Header: "X", Value: "{basic:u1:tok}"}}},
-			{Name: "b", Prefix: "/b", Upstream: "https://x.com", Inject: []Header{{Header: "X", Value: "{basic:u2:tok}"}}},
+			{Name: "a", Gateway: AnyGateway, Prefix: "/a", Upstream: "https://x.com", Inject: []Header{{Header: "X", Value: "{basic:u1:tok}"}}},
+			{Name: "b", Gateway: AnyGateway, Prefix: "/b", Upstream: "https://x.com", Inject: []Header{{Header: "X", Value: "{basic:u2:tok}"}}},
 		}},
 	}
 	for name, c := range cases {
@@ -100,7 +102,7 @@ func TestSecretNamesAndBasics(t *testing.T) {
 func TestLoad(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "routes.json")
-	good := `{"routes":[{"name":"a","prefix":"/a","upstream":"https://x.com","inject":[{"header":"X","value":"{secret:tok}"}]}]}`
+	good := `{"routes":[{"name":"a","gateway":"*","prefix":"/a","upstream":"https://x.com","inject":[{"header":"X","value":"{secret:tok}"}]}]}`
 	if err := os.WriteFile(p, []byte(good), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -108,8 +110,18 @@ func TestLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// A route that omits "gateway" must be refused: silently treating it as
+	// universal is what let a legacy route dissolve the pinning boundary.
+	nogw := `{"routes":[{"name":"a","prefix":"/a","upstream":"https://x.com"}]}`
+	if err := os.WriteFile(p, []byte(nogw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "gateway") {
+		t.Fatalf("expected a missing-gateway error, got %v", err)
+	}
+
 	// Unknown fields fail closed.
-	bad := `{"routes":[{"name":"a","prefix":"/a","upstream":"https://x.com","surprise":true}]}`
+	bad := `{"routes":[{"name":"a","gateway":"*","prefix":"/a","upstream":"https://x.com","surprise":true}]}`
 	if err := os.WriteFile(p, []byte(bad), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -119,15 +131,21 @@ func TestLoad(t *testing.T) {
 }
 
 func TestMeta(t *testing.T) {
-	if err := (Meta{AccountID: "abc-123", GatewayID: "gw_1"}).Validate(); err != nil {
+	if err := (Meta{AccountID: "abc-123", Gateways: []string{"prod"}}).Validate(); err != nil {
 		t.Fatal(err)
 	}
-	for _, bad := range []Meta{{}, {AccountID: "a b", GatewayID: "g"}, {AccountID: "a", GatewayID: "g/w"}} {
+	for _, bad := range []Meta{
+		{},
+		{AccountID: "a b", Gateways: []string{"g"}},
+		{AccountID: "a"}, // no gateways
+		{AccountID: "a", Gateways: []string{"Bad Gateway"}},
+		{AccountID: "a", Gateways: []string{"g", "g"}}, // duplicate
+	} {
 		if err := bad.Validate(); err == nil {
 			t.Errorf("expected error for %+v", bad)
 		}
 	}
-	routes := DefaultRoutes(Meta{AccountID: "ACCT", GatewayID: "GW"})
+	routes := DefaultRoutes(Meta{AccountID: "ACCT", Gateways: []string{"prod", "experiments"}})
 	c := Config{Routes: routes}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("default routes must validate: %v", err)
@@ -139,28 +157,44 @@ func TestMeta(t *testing.T) {
 		} else {
 			prefixes++
 		}
-	}
-	if prefixes != 3 || hosts != 4 {
-		t.Fatalf("day-one table = %d prefix + %d host routes, want 3 + 4", prefixes, hosts)
-	}
-	// One route serves every Cloudflare gateway: the gateway name is the next
-	// path segment, so /cloudflare/<gw>/anthropic/v1/messages reaches
-	// https://gateway.ai.cloudflare.com/v1/<acct>/<gw>/anthropic/v1/messages.
-	var cf *Route
-	for i, r := range routes {
-		if r.Name == "cloudflare" {
-			cf = &routes[i]
-		}
-		// /anthropic and /openai stay free for talking to those APIs directly.
 		if r.Prefix == "/anthropic" || r.Prefix == "/openai" {
 			t.Errorf("%q must stay reserved for direct (non-Cloudflare) API access", r.Prefix)
 		}
 	}
-	if cf == nil {
-		t.Fatal("no /cloudflare route")
+	if prefixes != 4 || hosts != 4 {
+		t.Fatalf("table = %d prefix + %d host routes, want 4 + 4 (2 gateways + 2 github)", prefixes, hosts)
 	}
-	if cf.Prefix != "/cloudflare" || cf.Upstream != "https://gateway.ai.cloudflare.com/v1/ACCT" {
-		t.Fatalf("cloudflare route = %+v", *cf)
+
+	// Each gateway gets its own route, tagged with its gateway, injecting its
+	// own credential — that separation is the point of per-gateway tokens.
+	byGateway := map[string]Route{}
+	for _, r := range routes {
+		if r.Gateway != "" && r.Gateway != AnyGateway {
+			byGateway[r.Gateway] = r
+		}
+	}
+	if len(byGateway) != 2 {
+		t.Fatalf("want one route per gateway, got %d", len(byGateway))
+	}
+	for _, gw := range []string{"prod", "experiments"} {
+		r, ok := byGateway[gw]
+		if !ok {
+			t.Fatalf("no route for gateway %q", gw)
+		}
+		if r.Prefix != "/cloudflare/"+gw {
+			t.Errorf("gateway %q prefix = %q", gw, r.Prefix)
+		}
+		if r.Upstream != "https://gateway.ai.cloudflare.com/v1/ACCT/"+gw {
+			t.Errorf("gateway %q upstream = %q", gw, r.Upstream)
+		}
+		want := "Bearer {secret:cf-aig-token-" + gw + "}"
+		if len(r.Inject) != 1 || r.Inject[0].Value != want {
+			t.Errorf("gateway %q injects %+v, want %q", gw, r.Inject, want)
+		}
+	}
+	// No two gateways may share a credential.
+	if byGateway["prod"].Inject[0].Value == byGateway["experiments"].Inject[0].Value {
+		t.Error("gateways share a credential")
 	}
 	// gh follows redirects to the asset host with a signed URL; sending the
 	// PAT there would leak it outside the API surface it was scoped for.
@@ -173,14 +207,14 @@ func TestMeta(t *testing.T) {
 
 func TestRouteSelectors(t *testing.T) {
 	bad := map[string]Config{
-		"neither":       {Routes: []Route{{Name: "a", Upstream: "https://x.com"}}},
-		"both":          {Routes: []Route{{Name: "a", Prefix: "/a", Host: "x.com", Upstream: "https://x.com"}}},
-		"bad host":      {Routes: []Route{{Name: "a", Host: "not a host", Upstream: "https://x.com"}}},
-		"host no dot":   {Routes: []Route{{Name: "a", Host: "localhost", Upstream: "https://x.com"}}},
-		"host trailing": {Routes: []Route{{Name: "a", Host: "x.com.", Upstream: "https://x.com"}}},
+		"neither":       {Routes: []Route{{Name: "a", Gateway: AnyGateway, Upstream: "https://x.com"}}},
+		"both":          {Routes: []Route{{Name: "a", Gateway: AnyGateway, Prefix: "/a", Host: "x.com", Upstream: "https://x.com"}}},
+		"bad host":      {Routes: []Route{{Name: "a", Gateway: AnyGateway, Host: "not a host", Upstream: "https://x.com"}}},
+		"host no dot":   {Routes: []Route{{Name: "a", Gateway: AnyGateway, Host: "localhost", Upstream: "https://x.com"}}},
+		"host trailing": {Routes: []Route{{Name: "a", Gateway: AnyGateway, Host: "x.com.", Upstream: "https://x.com"}}},
 		"dup host": {Routes: []Route{
-			{Name: "a", Host: "x.com", Upstream: "https://x.com"},
-			{Name: "b", Host: "x.com", Upstream: "https://y.com"},
+			{Name: "a", Gateway: AnyGateway, Host: "x.com", Upstream: "https://x.com"},
+			{Name: "b", Gateway: AnyGateway, Host: "x.com", Upstream: "https://y.com"},
 		}},
 	}
 	for name, c := range bad {
@@ -189,8 +223,8 @@ func TestRouteSelectors(t *testing.T) {
 		}
 	}
 	ok := Config{Routes: []Route{
-		{Name: "a", Prefix: "/a", Upstream: "https://x.com"},
-		{Name: "b", Host: "api.x.com", Upstream: "https://api.x.com"},
+		{Name: "a", Gateway: AnyGateway, Prefix: "/a", Upstream: "https://x.com"},
+		{Name: "b", Gateway: AnyGateway, Host: "api.x.com", Upstream: "https://api.x.com"},
 	}}
 	if err := ok.Validate(); err != nil {
 		t.Fatal(err)

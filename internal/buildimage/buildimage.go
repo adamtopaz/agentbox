@@ -59,14 +59,13 @@ func Run(o Options) error {
 		return errors.New("no provision script")
 	}
 
-	accountID, gatewayID := "", ""
+	// The image is deliberately gateway-agnostic: `agentbox create --gateway`
+	// wires each container, so nothing here depends on which gateways exist.
+	accountID := ""
 	if m, err := config.LoadMeta(o.MetaPath); err == nil {
-		accountID, gatewayID = m.AccountID, m.GatewayID
+		accountID = m.AccountID
 	} else if errors.Is(err, fs.ErrNotExist) {
-		// The gateway name is baked into the image's base URLs, so an empty
-		// one produces containers that fail against Cloudflare with a 404
-		// that looks like an API fault.
-		return fmt.Errorf("%s not found: run `agentbox setup` first so the image can be wired to a gateway", o.MetaPath)
+		fmt.Fprintf(out, "warning: %s not found; building without an account id (run `agentbox setup` to create it)\n", o.MetaPath)
 	} else {
 		return err
 	}
@@ -129,7 +128,6 @@ func Run(o Options) error {
 	fmt.Fprintln(out, "running provision.sh (streaming)")
 	if err := inc.RunStreaming("exec", buildContainer,
 		"--env", "AGENTBOX_ACCOUNT_ID="+accountID,
-		"--env", "AGENTBOX_GATEWAY_ID="+gatewayID,
 		"--env", "AGENTBOX_BUILD_DATE="+time.Now().UTC().Format("2006-01-02"),
 		"--", "bash", "-euo", "pipefail", "/root/provision.sh"); err != nil {
 		keepForDebug = true

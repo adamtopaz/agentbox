@@ -13,7 +13,7 @@ import (
 	"agentbox/internal/state"
 )
 
-const routesJSON = `{"routes":[{"name":"echo","prefix":"/echo","upstream":"http://127.0.0.1:9999","inject":[{"header":"x-test","value":"Bearer {secret:tok}"}]}]}`
+const routesJSON = `{"routes":[{"name":"echo","gateway":"*","prefix":"/echo","upstream":"http://127.0.0.1:9999","inject":[{"header":"x-test","value":"Bearer {secret:tok}"}]}]}`
 
 func testParams(t *testing.T, caddyBin string) Params {
 	t.Helper()

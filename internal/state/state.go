@@ -39,6 +39,11 @@ type Container struct {
 	Name    string    `json:"name"`
 	Created time.Time `json:"created"`
 	Blocked bool      `json:"blocked"`
+	// Gateway is the AI Gateway this container was created against. Its Caddy
+	// site carries only that gateway's route, so the container cannot spend
+	// against another gateway's budget — the one place that isolation is
+	// enforceable, since Cloudflare tokens are account-scoped.
+	Gateway string `json:"gateway,omitempty"`
 }
 
 // Dir manages the containers.d directory under a base path.

@@ -16,10 +16,12 @@
 	}
 }
 
-(agentbox_routes) {
+(agentbox_routes_gw_prod) {
 	route {
 		@agentbox_dots vars_regexp {http.request.orig_uri.path} (^|/|\\|%5c|%5C|;|%3b|%3B)(\.|%2e|%2E|%252e|%252E){1,2}(/|\\|%5c|%5C|;|%3b|%3B|$)
 		respond @agentbox_dots 404
+		@agentbox_escapes vars_regexp {http.request.orig_uri.path} ([^\x20-\x7e]|%2[eEfF]|%5[cC]|%25)
+		respond @agentbox_escapes 404
 		@host_gh_api host api.github.com
 		handle @host_gh_api {
 			@nocred_gh_api_0 vars {file./run/credentials/caddy.service/gh-pat} ""
@@ -123,5 +125,5 @@
 		}
 	}
 	log_append container dev
-	import agentbox_routes
+	import agentbox_routes_gw_prod
 }

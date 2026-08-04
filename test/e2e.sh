@@ -69,8 +69,17 @@ abx() {
 
 say "test fixtures (dummy secret material only)"
 printf 'e2e-dummy-secret' > "$W/creds/e2e-token"
-printf '# names only\ne2e-token\n' > "$W/secrets.installed"
-printf '[Service]\nLoadCredentialEncrypted=e2e-token:%s/creds/e2e-token\n' "$W" > "$W/dropin.conf"
+# Distinct per-gateway values: with one shared value the pinning assertion
+# below could only ever catch a 404, never "got the other gateway's token".
+printf 'token-for-mine' > "$W/creds/e2e-token-mine"
+printf 'token-for-other' > "$W/creds/e2e-token-other"
+printf '# names only\ne2e-token\ne2e-token-mine\ne2e-token-other\n' > "$W/secrets.installed"
+{
+  echo '[Service]'
+  for n in e2e-token e2e-token-mine e2e-token-other; do
+    printf 'LoadCredentialEncrypted=%s:%s/creds/%s\n' "$n" "$W" "$n"
+  done
+} > "$W/dropin.conf"
 
 "$W/agentbox" debug-echo --listen 127.0.0.1:0 > "$W/echo.out" 2>&1 &
 ECHO_PID=$!
@@ -84,13 +93,17 @@ UPSTREAM_PORT=$(grep -oP 'LISTEN 127.0.0.1:\K[0-9]+' "$W/echo.out" || true)
 # the case that would silently forward an unauthenticated request.
 cat > "$W/routes.json" <<EOF
 {"routes":[
- {"name":"echo","prefix":"/echo","upstream":"http://127.0.0.1:${UPSTREAM_PORT}","inject":[
+ {"name":"echo","gateway":"*","prefix":"/echo","upstream":"http://127.0.0.1:${UPSTREAM_PORT}","inject":[
    {"header":"Authorization","value":"Bearer {secret:e2e-token}"},
    {"header":"cf-aig-authorization","value":"Bearer {secret:e2e-token}"}]},
- {"name":"nocred","prefix":"/nocred","upstream":"http://127.0.0.1:${UPSTREAM_PORT}","inject":[
+ {"name":"nocred","gateway":"*","prefix":"/nocred","upstream":"http://127.0.0.1:${UPSTREAM_PORT}","inject":[
    {"header":"X-Absent","value":"{secret:not-installed}"}]},
- {"name":"hostroute","host":"api.example.test","upstream":"http://127.0.0.1:${UPSTREAM_PORT}","inject":[
-   {"header":"Authorization","value":"Bearer {secret:e2e-token}"}]}
+ {"name":"hostroute","gateway":"*","host":"api.example.test","upstream":"http://127.0.0.1:${UPSTREAM_PORT}","inject":[
+   {"header":"Authorization","value":"Bearer {secret:e2e-token}"}]},
+ {"name":"gw-mine","prefix":"/cloudflare/mine","gateway":"mine","upstream":"http://127.0.0.1:${UPSTREAM_PORT}/v1/ACCT/mine","inject":[
+   {"header":"cf-aig-authorization","value":"Bearer {secret:e2e-token-mine}"}]},
+ {"name":"gw-other","prefix":"/cloudflare/other","gateway":"other","upstream":"http://127.0.0.1:${UPSTREAM_PORT}/v1/ACCT/other","inject":[
+   {"header":"cf-aig-authorization","value":"Bearer {secret:e2e-token-other}"}]}
 ]}
 EOF
 
@@ -104,7 +117,7 @@ for _ in $(seq 1 20); do [ -S "$W/admin.sock" ] && break; sleep 0.2; done
 
 say "control plane: agentbox create (the real path — state, reconcile, incus, devices)"
 incus delete --force "$CONTAINER" 2>/dev/null || true
-abx create "$CONTAINER" || die "agentbox create failed"
+abx create --gateway mine "$CONTAINER" || die "agentbox create failed"
 incus config device get "$CONTAINER" agentbox-proxy connect >/dev/null || die "tcp proxy device missing"
 incus config device get "$CONTAINER" agentbox-socket connect >/dev/null || die "unix proxy device missing"
 abx list | grep -q "^${CONTAINER}.*Running.*present" \
@@ -161,6 +174,22 @@ if incus exec "$CONTAINER" -- sh -c 'command -v gh' >/dev/null 2>&1; then
     [ "$GHSOCK" = /run/agentbox.sock ] || die "gh not wired to the proxy socket (got '$GHSOCK')"
     echo "   ok (gh wired to $GHSOCK)"
 fi
+
+say "assert: the container reaches only the gateway it was created with"
+MINE=$(ccurl "http://127.0.0.1:8787/cloudflare/mine/anthropic/v1/messages")
+python3 - "$MINE" <<'PYEOF'
+import json, sys
+d = json.loads(sys.argv[1])
+h = {k.lower(): v for k, v in d["headers"].items()}
+assert d["path"] == "/v1/ACCT/mine/anthropic/v1/messages", d
+assert h.get("cf-aig-authorization") == "Bearer token-for-mine", h
+assert "token-for-other" not in json.dumps(h), h
+print("   ok (its own gateway, its own credential — not the other's)")
+PYEOF
+# The other gateway's route is configured, but must not exist on this socket.
+[ "$(ccurl -o /dev/null -w '%{http_code}' "http://127.0.0.1:8787/cloudflare/other/anthropic/v1/messages")" = 404 ] \
+    || die "container reached a gateway it was not created against"
+echo "   ok (another gateway -> 404, not merely unauthorized)"
 
 say "assert: uninstalled credential fails closed (503, no upstream call)"
 [ "$(ccurl -o /dev/null -w '%{http_code}' "http://127.0.0.1:8787/nocred/x")" = 503 ] \

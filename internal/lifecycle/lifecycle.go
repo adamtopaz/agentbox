@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -85,10 +86,16 @@ func (m *Manager) socketWait() time.Duration {
 // Create brings up a fully wired container: state file → reconcile → socket
 // bound by Caddy → incus launch → proxy device. Any failure past the state
 // file rolls everything back.
-func (m *Manager) Create(name string) error {
+func (m *Manager) Create(name, gateway string) error {
 	return m.locked(func() error {
 		if !state.ValidName(name) {
 			return fmt.Errorf("invalid container name %q (lowercase slug, max 63 chars; %q is reserved)", name, state.ReservedName)
+		}
+		// Before anything is written or launched: the gateway ends up in the
+		// state file and the rendered config, so it is checked here rather
+		// than at the point of use.
+		if !configValidGateway(gateway) {
+			return fmt.Errorf("invalid gateway %q (lowercase letters, digits and dashes)", gateway)
 		}
 		if _, found, err := m.States.Get(name); err != nil {
 			return err
@@ -101,7 +108,7 @@ func (m *Manager) Create(name string) error {
 			return fmt.Errorf("incus instance %q already exists but is not agentbox-managed here", name)
 		}
 
-		if err := m.States.Put(state.Container{Name: name, Created: time.Now().UTC()}); err != nil {
+		if err := m.States.Put(state.Container{Name: name, Created: time.Now().UTC(), Gateway: gateway}); err != nil {
 			return err
 		}
 		launched := false
@@ -140,10 +147,79 @@ func (m *Manager) Create(name string) error {
 			}
 		}
 
-		fmt.Fprintf(m.out(), "container %q ready — proxy at http://127.0.0.1:8787 (and %s) inside; enter it with: agentbox shell %s\n",
-			name, SocketListenPath, name)
+		// Wire the agents to this container's gateway. Deliberately done here
+		// rather than baked into the image: there is no default gateway, and
+		// an image that hard-coded one would strand every container built
+		// from it when the choice changed.
+		if err := m.wireGateway(name, gateway); err != nil {
+			return rollback(err)
+		}
+
+		fmt.Fprintf(m.out(), "container %q ready on gateway %q — proxy at http://127.0.0.1:8787 (and %s) inside; enter it with: agentbox shell %s\n",
+			name, gateway, SocketListenPath, name)
 		return nil
 	})
+}
+
+// wireGateway writes the gateway-dependent agent configuration inside the
+// container. Everything it writes is a URL: no credential crosses this line.
+//
+// This happens at create time rather than image build because there is no
+// default gateway — an image with one baked in would strand every container
+// built from it the moment the choice changed.
+func (m *Manager) wireGateway(name, gateway string) error {
+	if !configValidGateway(gateway) {
+		return fmt.Errorf("invalid gateway name %q", gateway)
+	}
+	base := "http://127.0.0.1:8787/cloudflare/" + gateway
+	// The gateway name is validated above, so it cannot break out of these
+	// here-docs; nothing else is interpolated.
+	script := `set -eu
+GW=` + base + `
+cat > /etc/profile.d/agentbox-gateway.sh <<EOF
+# agentbox: this container's AI Gateway. Written by agentbox create.
+export AGENTBOX_GATEWAY=` + gateway + `
+export ANTHROPIC_BASE_URL=$GW/anthropic
+export OPENAI_BASE_URL=$GW/openai
+export CLOUDFLARE_GATEWAY_ID=` + gateway + `
+EOF
+chmod 0644 /etc/profile.d/agentbox-gateway.sh
+
+# /etc/environment is not shell: KEY=value lines only, managed marker block.
+touch /etc/environment
+awk '/^# BEGIN agentbox-gateway$/{skip=1} /^# END agentbox-gateway$/{skip=0; next} !skip{print}' \
+    /etc/environment > /etc/environment.tmp
+{
+  cat /etc/environment.tmp
+  echo "# BEGIN agentbox-gateway"
+  echo "AGENTBOX_GATEWAY=` + gateway + `"
+  echo "ANTHROPIC_BASE_URL=$GW/anthropic"
+  echo "OPENAI_BASE_URL=$GW/openai"
+  echo "CLOUDFLARE_GATEWAY_ID=` + gateway + `"
+  echo "# END agentbox-gateway"
+} > /etc/environment
+rm -f /etc/environment.tmp
+
+# Codex takes a base URL from its config file, not the environment, so the
+# whole stanza is regenerated rather than patched in place.
+if id agent >/dev/null 2>&1; then
+  install -d -o agent -g agent -m 0755 /home/agent/.codex
+  cat > /home/agent/.codex/config.toml <<EOF
+# agentbox: route Codex through the host-side proxy (dummy key; real auth is
+# injected by the proxy). Codex speaks the Responses API -> OpenAI models.
+model_provider = "agentbox"
+
+[model_providers.agentbox]
+name = "agentbox proxy"
+base_url = "$GW/openai"
+wire_api = "responses"
+env_key = "OPENAI_API_KEY"
+EOF
+  chown agent:agent /home/agent/.codex/config.toml
+  chmod 0644 /home/agent/.codex/config.toml
+fi
+`
+	return m.Incus.RunInput(script, "exec", name, "--", "sh", "-s")
 }
 
 // deviceArgs returns the incus invocations that wire both proxy devices for a
@@ -325,6 +401,7 @@ func (m *Manager) Unblock(name string) error {
 // socket) must be visible, never papered over.
 type Row struct {
 	Name    string
+	Gateway string
 	Incus   string // instance status, or "MISSING!" / "untracked"
 	Blocked bool
 	Socket  bool
@@ -356,7 +433,7 @@ func (m *Manager) List() ([]Row, error) {
 	var rows []Row
 	seen := make(map[string]bool)
 	for _, c := range states {
-		row := Row{Name: c.Name, Blocked: c.Blocked, Created: c.Created, Incus: "MISSING!"}
+		row := Row{Name: c.Name, Gateway: c.Gateway, Blocked: c.Blocked, Created: c.Created, Incus: "MISSING!"}
 		if inst, ok := byName[c.Name]; ok {
 			row.Incus = inst.Status
 		}
@@ -406,3 +483,10 @@ func containsLine(s, line string) bool {
 	}
 	return false
 }
+
+// configValidGateway mirrors config.ValidGatewayName. Duplicated rather than
+// imported to keep lifecycle free of the config package; the renderer and
+// setup validate against the canonical rule before anything reaches here.
+var gatewayNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,49}$`)
+
+func configValidGateway(s string) bool { return gatewayNameRE.MatchString(s) }

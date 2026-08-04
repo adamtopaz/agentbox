@@ -5,8 +5,9 @@ Incus containers. **No real credential ever exists inside a container** — not
 even a pseudo-token. Agents talk to `http://127.0.0.1:8787` inside their
 container; on the host, Caddy strips every auth header they send and injects
 the real one, per route, before forwarding upstream (Cloudflare AI Gateway for
-inference, GitHub for git). Any AI Gateway on the account is reachable as
-`/cloudflare/<gateway-name>/...`.
+inference, GitHub for git). Each configured AI Gateway gets its own route
+(`/cloudflare/<name>/...`) and its own credential, and a container reaches
+only the gateway it was created against.
 
 ## How it works
 
@@ -54,8 +55,8 @@ Caddy's official apt repo if missing or too old.
 
 ```sh
 make bin
-sudo ./bin/agentbox setup          # prompts for Cloudflare account + gateway ID
-sudo agentbox add-secret cf-aig-token   # value read without echo
+sudo ./bin/agentbox setup          # prompts for Cloudflare account + gateway names
+sudo agentbox add-secret cf-aig-token-prod   # one token per gateway
 sudo agentbox add-secret gh-pat
 sudo agentbox setup                # loads the new secrets into caddy
 agentbox build-image               # bake the agentbox-base container image
@@ -67,7 +68,7 @@ in before running container commands as a non-root user.
 ## Use
 
 ```sh
-agentbox create dev        # new container, proxy wired
+agentbox create --gateway prod dev   # --gateway is required; no default
 agentbox shell dev         # login shell as user 'agent'; claude/codex/pi ready
 agentbox list              # state vs incus vs socket — drift is visible
 agentbox destroy dev

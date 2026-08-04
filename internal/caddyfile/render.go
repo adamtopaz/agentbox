@@ -9,6 +9,7 @@ package caddyfile
 
 import (
 	"fmt"
+	"log/slog"
 	"net/url"
 	"path"
 	"regexp"
@@ -75,6 +76,17 @@ var proxyHeaderStrips = []string{
 // the end of the path.
 const dotsPattern = `(^|/|\\|%5c|%5C|;|%3b|%3B)(\.|%2e|%2E|%252e|%252E){1,2}(/|\\|%5c|%5C|;|%3b|%3B|$)`
 
+// escapePattern is the companion guard. The matcher sees the *decoded* path,
+// which is why the dot rule above catches %2e forms — but it also means a
+// percent-escape cannot be matched as text. Anything that decodes to a
+// control byte or a non-ASCII byte is refused instead: %00, %09 and overlong
+// UTF-8 (%c0%ae) all reached the upstream verbatim in review, and with
+// per-gateway routes the neighbouring gateway sits one successful "../" away.
+// Doubly-encoded forms survive decoding as literal %2e/%2f/%5c/%25 text, so
+// those are matched directly. Printable ASCII, spaces included, passes: real
+// GitHub paths contain encoded spaces.
+const escapePattern = `([^\x20-\x7e]|%2[eEfF]|%5[cC]|%25)`
+
 // sitePortBase numbers the per-container site addresses. These ports are
 // never bound (the bind directive replaces the listener with the unix
 // socket); they only give each site a unique address.
@@ -137,21 +149,49 @@ func Render(o Options) (string, error) {
 	// path for matcher evaluation, so a path_regexp matcher never sees the
 	// dot segments that are nevertheless forwarded upstream (verified
 	// empirically against caddy 2.11).
-	b.WriteString("(agentbox_routes) {\n")
-	b.WriteString("\troute {\n")
-	fmt.Fprintf(&b, "\t\t@agentbox_dots vars_regexp {http.request.orig_uri.path} %s\n", dotsPattern)
-	b.WriteString("\t\trespond @agentbox_dots 404\n")
+	// A container pinned to a gateway with no route reaches no gateway at
+	// all. That fails closed, but silently, so say so — it is the shape of
+	// "added a gateway to agentbox.json but never regenerated routes.json".
+	haveGateway := map[string]bool{}
 	for _, r := range routes {
-		if err := writeRoute(&b, r, o.CredentialsDir, missingSecrets(r, o.InstalledSecrets)); err != nil {
-			return "", err
+		if r.Gateway != "" && r.Gateway != config.AnyGateway {
+			haveGateway[r.Gateway] = true
 		}
 	}
-	// Fallback: never enumerate routes to the container.
-	b.WriteString("\t\thandle {\n")
-	b.WriteString("\t\t\trespond \"unknown route\" 404\n")
-	b.WriteString("\t\t}\n")
-	b.WriteString("\t}\n")
-	b.WriteString("}\n")
+	for _, c := range containers {
+		if c.Gateway != "" && !haveGateway[c.Gateway] {
+			slog.Warn("container is pinned to a gateway with no route; it can reach no gateway",
+				"container", c.Name, "gateway", c.Gateway,
+				"hint", "add it to agentbox.json's gateways and run: sudo agentbox setup")
+		}
+	}
+
+	// A snippet per gateway in use, plus one for containers with no gateway.
+	// A container's site imports only its own, so a route belonging to another
+	// gateway is not merely unauthorized for it — it does not exist on that
+	// socket at all.
+	for _, gw := range snippetGateways(containers) {
+		fmt.Fprintf(&b, "(%s) {\n", snippetName(gw))
+		b.WriteString("\troute {\n")
+		fmt.Fprintf(&b, "\t\t@agentbox_dots vars_regexp {http.request.orig_uri.path} %s\n", dotsPattern)
+		b.WriteString("\t\trespond @agentbox_dots 404\n")
+		fmt.Fprintf(&b, "\t\t@agentbox_escapes vars_regexp {http.request.orig_uri.path} %s\n", escapePattern)
+		b.WriteString("\t\trespond @agentbox_escapes 404\n")
+		for _, r := range routes {
+			if r.Gateway != config.AnyGateway && r.Gateway != gw {
+				continue
+			}
+			if err := writeRoute(&b, r, o.CredentialsDir, missingSecrets(r, o.InstalledSecrets)); err != nil {
+				return "", err
+			}
+		}
+		// Fallback: never enumerate routes to the container.
+		b.WriteString("\t\thandle {\n")
+		b.WriteString("\t\t\trespond \"unknown route\" 404\n")
+		b.WriteString("\t\t}\n")
+		b.WriteString("\t}\n")
+		b.WriteString("}\n")
+	}
 
 	if len(containers) > maxContainers {
 		return "", fmt.Errorf("too many containers (%d); maximum is %d", len(containers), maxContainers)
@@ -159,6 +199,10 @@ func Render(o Options) (string, error) {
 	for i, c := range containers {
 		if !state.ValidName(c.Name) {
 			return "", fmt.Errorf("invalid container name %q", c.Name)
+		}
+		// Render must be safe even if a caller skipped validation.
+		if c.Gateway != "" && !config.ValidGatewayName(c.Gateway) {
+			return "", fmt.Errorf("container %q has invalid gateway %q", c.Name, c.Gateway)
 		}
 		sock := path.Join(o.SocketDir, c.Name+".sock")
 		if len(sock) > maxSocketPath {
@@ -186,7 +230,7 @@ func Render(o Options) (string, error) {
 		if c.Blocked {
 			b.WriteString("\trespond \"container blocked\" 403\n")
 		} else {
-			b.WriteString("\timport agentbox_routes\n")
+			fmt.Fprintf(&b, "\timport %s\n", snippetName(c.Gateway))
 		}
 		b.WriteString("}\n")
 	}
@@ -232,6 +276,36 @@ func safePathToken(s string) bool {
 		}
 	}
 	return s != "" && !strings.Contains(s, "..")
+}
+
+// snippetName is the route-set a container with this gateway imports. Real
+// gateways are namespaced under _gw_ so no gateway name can collide with the
+// sentinel used for containers that have none (an older state file).
+func snippetName(gateway string) string {
+	if gateway == "" {
+		return "agentbox_routes_nogateway"
+	}
+	return "agentbox_routes_gw_" + sanitizeLabel(gateway)
+}
+
+// snippetGateways lists the gateways needing a rendered route set: every
+// gateway a container is assigned to, plus "" when some container has none.
+// Gateways with no container get no snippet — nothing would import it.
+func snippetGateways(containers []state.Container) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, c := range containers {
+		if !seen[c.Gateway] {
+			seen[c.Gateway] = true
+			out = append(out, c.Gateway)
+		}
+	}
+	// Always emit at least one so the config is valid with no containers.
+	if len(out) == 0 {
+		out = append(out, "")
+	}
+	sort.Strings(out)
+	return out
 }
 
 // sanitizeLabel makes a route name usable inside a Caddyfile matcher token.

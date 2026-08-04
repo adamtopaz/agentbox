@@ -14,12 +14,10 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 PROXY="http://127.0.0.1:8787"
-# Cloudflare AI Gateway is reached as /cloudflare/<gateway-name>/<provider>/...
-# so any gateway on the account is addressable; this is just the default one.
-# Fail loudly rather than baking a plausible-but-wrong gateway name: agents
-# would then get a Cloudflare 404 that looks like an API problem.
-: "${AGENTBOX_GATEWAY_ID:?not set — run \`agentbox setup\` before build-image}"
-GW="${PROXY}/cloudflare/${AGENTBOX_GATEWAY_ID}"
+# Nothing gateway-dependent is baked in: there is no default gateway, and
+# `agentbox create --gateway <name>` writes the base URLs into each container.
+# An image with a gateway baked in would strand every container built from it
+# the moment that choice changed.
 # Same host-side proxy, reached as a unix socket (incus proxy device) for
 # clients that address real hostnames instead of a base URL.
 GH_SOCKET="/run/agentbox.sock"
@@ -76,12 +74,11 @@ echo "==> proxy wiring: environment"
 # Login shells (agentbox shell) read profile.d; PAM-less exec paths read
 # /etc/environment. Both are generated from the same list below.
 ENV_VARS=(
-    "ANTHROPIC_BASE_URL=${GW}/anthropic"
+    # ANTHROPIC_BASE_URL / OPENAI_BASE_URL / CLOUDFLARE_GATEWAY_ID are written
+    # per container by `agentbox create` into /etc/profile.d/agentbox-gateway.sh.
     "ANTHROPIC_API_KEY=agentbox-dummy"
-    "OPENAI_BASE_URL=${GW}/openai"
     "OPENAI_API_KEY=agentbox-dummy"
     "CLOUDFLARE_ACCOUNT_ID=${AGENTBOX_ACCOUNT_ID:-}"
-    "CLOUDFLARE_GATEWAY_ID=${AGENTBOX_GATEWAY_ID:-}"
     "CLOUDFLARE_API_KEY=agentbox-dummy"
     "DISABLE_AUTOUPDATER=1"
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
@@ -125,19 +122,8 @@ install -o agent -g agent -m 0644 /dev/stdin /home/agent/.claude.json <<'EOF'
 }
 EOF
 
-echo "==> codex wiring"
+echo "==> codex dir (config written per container by agentbox create)"
 install -d -o agent -g agent /home/agent/.codex
-install -o agent -g agent -m 0644 /dev/stdin /home/agent/.codex/config.toml <<EOF
-# agentbox: route Codex through the host-side proxy (dummy key; real auth is
-# injected by the proxy). Codex speaks the Responses API -> OpenAI models.
-model_provider = "agentbox"
-
-[model_providers.agentbox]
-name = "agentbox proxy"
-base_url = "${GW}/openai"
-wire_api = "responses"
-env_key = "OPENAI_API_KEY"
-EOF
 
 echo "==> gh wiring (http_unix_socket)"
 # gh has no base-URL override, but http_unix_socket makes it dial a unix
