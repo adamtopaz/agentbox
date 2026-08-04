@@ -161,15 +161,19 @@ func TestMeta(t *testing.T) {
 			t.Errorf("%q must stay reserved for direct (non-Cloudflare) API access", r.Prefix)
 		}
 	}
-	if prefixes != 4 || hosts != 4 {
-		t.Fatalf("table = %d prefix + %d host routes, want 4 + 4 (2 gateways + 2 github)", prefixes, hosts)
+	// Two prefix routes per gateway (provider-native + REST), plus the two
+	// github prefix routes.
+	if prefixes != 6 || hosts != 4 {
+		t.Fatalf("table = %d prefix + %d host routes, want 6 + 4 (2 gateways x 2 routes + 2 github)", prefixes, hosts)
 	}
 
 	// Each gateway gets its own route, tagged with its gateway, injecting its
 	// own credential — that separation is the point of per-gateway tokens.
 	byGateway := map[string]Route{}
 	for _, r := range routes {
-		if r.Gateway != "" && r.Gateway != AnyGateway {
+		// The provider-native route only; the REST route for the same gateway
+		// is asserted separately below.
+		if r.Gateway != "" && r.Gateway != AnyGateway && r.Prefix == GatewayPrefix+"/"+r.Gateway {
 			byGateway[r.Gateway] = r
 		}
 	}
@@ -231,5 +235,112 @@ func TestRouteSelectors(t *testing.T) {
 	}
 	if ok.Routes[0].Selector() != "/a" || ok.Routes[1].Selector() != "api.x.com" {
 		t.Fatal("selectors wrong")
+	}
+}
+
+func TestPathMapValidation(t *testing.T) {
+	base := func(pm []PathMap, host string) *Config {
+		r := Route{Name: "cf", Gateway: "prod", Upstream: "https://gateway.ai.cloudflare.com/v1/A/prod", PathMap: pm}
+		if host != "" {
+			r.Host = host
+		} else {
+			r.Prefix = "/cloudflare/prod"
+		}
+		return &Config{Routes: []Route{r}}
+	}
+
+	if err := base(GatewayPathMap, "").Validate(); err != nil {
+		t.Fatalf("the generated gateway mapping must validate: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		pm   []PathMap
+		host string
+	}{
+		{"host route", GatewayPathMap, "api.github.com"},
+		{"relative path", []PathMap{{Path: "v1/messages", To: "/anthropic/v1/messages"}}, ""},
+		{"traversal in target", []PathMap{{Path: "/v1/messages", To: "/anthropic/../openai"}}, ""},
+		{"wildcard path", []PathMap{{Path: "/v1/*", To: "/anthropic/v1"}}, ""},
+		{"empty target", []PathMap{{Path: "/v1/messages", To: ""}}, ""},
+		{"empty path", []PathMap{{Path: "", To: "/anthropic"}}, ""},
+		{"placeholder injection", []PathMap{{Path: "/v1/messages", To: "/{http.request.uri}"}}, ""},
+		{"token break-out", []PathMap{{Path: "/v1/messages", To: `/a" "b`}}, ""},
+		{"duplicate path", []PathMap{
+			{Path: "/v1/messages", To: "/anthropic/v1/messages"},
+			{Path: "/v1/messages", To: "/openai/v1/messages"},
+		}, ""},
+		// A target that is another entry's source. Caddy would not actually
+		// chain these, but a table whose reach cannot be read off it defeats the
+		// reason whole-path matching was chosen.
+		{"chained mapping", []PathMap{
+			{Path: "/a", To: "/b"},
+			{Path: "/b", To: "/c"},
+		}, ""},
+		{"self-referential mapping", []PathMap{{Path: "/a", To: "/a"}}, ""},
+	}
+	for _, c := range cases {
+		if err := base(c.pm, c.host).Validate(); err == nil {
+			t.Errorf("%s: accepted %+v", c.name, c.pm)
+		}
+	}
+}
+
+// TestDefaultRoutesCarryGatewayPathMap pins the reason path_map exists: without
+// it on the generated provider-native route, pointing pi's
+// cloudflare-ai-gateway provider at /cloudflare/<gw> can only ever work for one
+// of its three model families.
+func TestDefaultRoutesCarryGatewayPathMap(t *testing.T) {
+	routes := DefaultRoutes(Meta{AccountID: "ACCT", Gateways: []string{"prod", "bench"}})
+	native, rest := 0, 0
+	for _, r := range routes {
+		switch {
+		case strings.HasPrefix(r.Name, "cloudflare-rest-"):
+			rest++
+			if len(r.PathMap) != len(RestPathMap) {
+				t.Errorf("route %q: path_map = %+v, want the REST mapping", r.Name, r.PathMap)
+			}
+			// /v1/messages must NOT be mapped here: RestBase already ends in
+			// /ai, so the pass-through produces the correct URL. Mapping it
+			// would double the /v1.
+			for _, m := range r.PathMap {
+				if m.Path == "/v1/messages" {
+					t.Errorf("route %q must not map /v1/messages; the pass-through is already correct", r.Name)
+				}
+			}
+			// The gateway is injected, never taken from the request, so a
+			// container cannot select one here at all.
+			var gotGatewayID bool
+			for _, h := range r.Inject {
+				if h.Header == "cf-aig-gateway-id" {
+					gotGatewayID = true
+					if h.Value != r.Gateway {
+						t.Errorf("route %q injects gateway id %q, want %q", r.Name, h.Value, r.Gateway)
+					}
+				}
+			}
+			if !gotGatewayID {
+				t.Errorf("route %q must inject cf-aig-gateway-id, or it reaches the account default gateway", r.Name)
+			}
+		case strings.HasPrefix(r.Name, "cloudflare-"):
+			native++
+			if len(r.PathMap) != len(GatewayPathMap) {
+				t.Fatalf("route %q: path_map = %+v, want the gateway mapping", r.Name, r.PathMap)
+			}
+			// Each alias must land on the same upstream path the explicit form
+			// reaches, so both spellings are interchangeable.
+			for _, m := range r.PathMap {
+				if !strings.HasSuffix(m.To, m.Path) {
+					t.Errorf("route %q: mapping %q -> %q changes more than the provider segment", r.Name, m.Path, m.To)
+				}
+			}
+		default:
+			if len(r.PathMap) != 0 {
+				t.Errorf("route %q should carry no path_map", r.Name)
+			}
+		}
+	}
+	if native != 2 || rest != 2 {
+		t.Fatalf("want one provider-native and one REST route per gateway, got %d and %d", native, rest)
 	}
 }

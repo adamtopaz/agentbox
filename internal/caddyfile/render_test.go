@@ -1,12 +1,19 @@
 package caddyfile
 
 import (
+	"context"
 	"flag"
+	"fmt"
+	"io"
 	"math/rand"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -420,7 +427,9 @@ func TestRenderRejects(t *testing.T) {
 // TestCaddyValidate runs the real caddy against a representative rendered
 // config — the main guard that the generated syntax is real. Skipped unless a
 // caddy >= 2.8 is available (env AGENTBOX_TEST_CADDY or PATH).
-func TestCaddyValidate(t *testing.T) {
+// caddyBinOrSkip resolves a usable caddy binary, or skips the test.
+func caddyBinOrSkip(t *testing.T) string {
+	t.Helper()
 	bin := os.Getenv("AGENTBOX_TEST_CADDY")
 	if bin == "" {
 		bin = "caddy"
@@ -436,18 +445,254 @@ func TestCaddyValidate(t *testing.T) {
 	if !caddyctl.VersionAtLeast(v, 2, 8) {
 		t.Skipf("caddy %s too old for the rendered config (need >= 2.8)", v)
 	}
+	return bin
+}
 
+// validateWithCaddy runs `caddy validate` over a rendered config, or skips if
+// no usable caddy binary is available.
+func validateWithCaddy(t *testing.T, rendered string) {
+	t.Helper()
+	client := caddyctl.Client{Bin: caddyBinOrSkip(t)}
+	path := filepath.Join(t.TempDir(), "Caddyfile")
+	if err := os.WriteFile(path, []byte(rendered), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Validate(path); err != nil {
+		t.Fatalf("caddy validate rejected rendered config:\n%v\n--- config ---\n%s", err, rendered)
+	}
+}
+
+func TestCaddyValidate(t *testing.T) {
 	o := baseOptions()
 	// Unix socket paths must exist-able but validate doesn't bind; still use
 	// a temp dir to stay hermetic.
 	o.SocketDir = filepath.Join(t.TempDir(), "sockets")
 	o.Containers = []state.Container{{Name: "dev", Gateway: "prod"}, {Name: "bad", Gateway: "prod", Blocked: true}}
-	got := render(t, o)
-	path := filepath.Join(t.TempDir(), "Caddyfile")
-	if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
+	validateWithCaddy(t, render(t, o))
+}
+
+// TestPathMapRenderedShape pins the rendering path_map is meant to produce.
+// It asserts SHAPE, not the safety property: what actually keeps only one
+// rewrite in effect is Caddy's adapter grouping every `rewrite` in a block into
+// one mutually-exclusive route group (see render.go). The behavioural guarantee
+// is covered by TestPathMapRoutesThroughCaddy, which routes real requests. This
+// test exists so the deliberate belt-and-braces negation is not dropped
+// silently.
+func TestPathMapRenderedShape(t *testing.T) {
+	o := baseOptions()
+	o.Containers = []state.Container{{Name: "dev", Gateway: "prod"}}
+	o.InstalledSecrets = map[string]bool{"cf-aig-token": true, "gh-pat.basic": true}
+	o.Routes = []config.Route{{
+		Name: "cf-prod", Prefix: "/cloudflare/prod", Gateway: "prod",
+		Upstream: "https://gateway.ai.cloudflare.com/v1/ACCT/prod",
+		PathMap:  config.GatewayPathMap,
+		Inject:   []config.Header{{Header: "cf-aig-authorization", Value: "Bearer {secret:cf-aig-token}"}},
+	}}
+	block := routeBlock(t, render(t, o), "/cloudflare/prod")
+
+	// The pass-through must stay gated. Caddy's route grouping means an
+	// ungated one would in fact still behave correctly, so this is a
+	// defence-in-depth check, not the correctness proof.
+	if strings.Contains(block, "rewrite * ") {
+		t.Errorf("pass-through rewrite is ungated alongside a path_map; the negation is deliberate:\n%s", block)
+	}
+	want := []string{
+		"@map_cf_prod_0 path /v1/messages",
+		"rewrite @map_cf_prod_0 /v1/ACCT/prod/anthropic/v1/messages",
+		"@map_cf_prod_1 path /responses",
+		"rewrite @map_cf_prod_1 /v1/ACCT/prod/openai/responses",
+		"@map_cf_prod_2 path /chat/completions",
+		"rewrite @map_cf_prod_2 /v1/ACCT/prod/compat/chat/completions",
+		"@unmapped_cf_prod not path /v1/messages /responses /chat/completions",
+		"rewrite @unmapped_cf_prod /v1/ACCT/prod{uri}",
+	}
+	for _, w := range want {
+		if !strings.Contains(block, w) {
+			t.Errorf("missing %q in:\n%s", w, block)
+		}
+	}
+	// A mapped path must not become a way around the fail-closed guard. Source
+	// order is not the thing to assert here — Caddy sorts directives by its own
+	// order, in which `rewrite` always precedes `respond` regardless of how
+	// they are written — so what matters is that the guard is present in the
+	// same block and short-circuits before the proxy. A rewritten path that
+	// then 503s is fine; a rewritten path that reaches the upstream with an
+	// empty credential is not.
+	for _, w := range []string{
+		`@nocred_cf_prod_0 vars {file./run/credentials/caddy.service/cf-aig-token} ""`,
+		`respond @nocred_cf_prod_0 "route cf-prod unavailable: credential not installed" 503`,
+	} {
+		if !strings.Contains(block, w) {
+			t.Errorf("path_map route lost its fail-closed guard: missing %q in:\n%s", w, block)
+		}
+	}
+}
+
+// TestPathMapRoutesThroughCaddy is the behavioural test: it runs the rendered
+// config on a real caddy and asserts the upstream path each request lands on.
+// Only one rewrite may take effect per request — if two did, the upstream base
+// would be prepended twice — and the explicitly-addressed path must keep
+// reaching what it always reached.
+func TestPathMapRoutesThroughCaddy(t *testing.T) {
+	bin := caddyBinOrSkip(t)
+
+	var got struct {
+		mu    sync.Mutex
+		paths []string
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got.mu.Lock()
+		got.paths = append(got.paths, r.URL.Path)
+		got.mu.Unlock()
+		fmt.Fprintf(w, "%s", r.URL.Path)
+	}))
+	defer upstream.Close()
+
+	work := t.TempDir()
+	sockDir := filepath.Join(work, "sockets")
+	credsDir := filepath.Join(work, "creds")
+	for _, d := range []string{sockDir, credsDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(credsDir, "cf-aig-token"), []byte("dummy"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := client.Validate(path); err != nil {
-		t.Fatalf("caddy validate rejected rendered config:\n%v\n--- config ---\n%s", err, got)
+
+	o := baseOptions()
+	o.SocketDir = sockDir
+	o.CredentialsDir = credsDir
+	o.AdminAddr = "off"
+	o.GracePeriod = "1s"
+	o.Containers = []state.Container{{Name: "dev", Gateway: "prod"}}
+	o.InstalledSecrets = map[string]bool{"cf-aig-token": true}
+	o.Routes = []config.Route{
+		{
+			Name: "cf-prod", Prefix: "/cloudflare/prod", Gateway: "prod",
+			Upstream: upstream.URL + "/v1/ACCT/prod",
+			PathMap:  config.GatewayPathMap,
+			Inject:   []config.Header{{Header: "cf-aig-authorization", Value: "Bearer {secret:cf-aig-token}"}},
+		},
+		// The REST route's mapping has the opposite shape: /v1/messages is the
+		// one path it must NOT rewrite, because the upstream base already ends
+		// where that suffix belongs.
+		{
+			Name: "cf-rest-prod", Prefix: "/cloudflare-rest/prod", Gateway: "prod",
+			Upstream: upstream.URL + "/client/v4/accounts/ACCT/ai",
+			PathMap:  config.RestPathMap,
+			Inject: []config.Header{
+				{Header: "Authorization", Value: "Bearer {secret:cf-aig-token}"},
+				{Header: "cf-aig-gateway-id", Value: "prod"},
+			},
+		},
 	}
+	cfPath := filepath.Join(work, "Caddyfile")
+	if err := os.WriteFile(cfPath, []byte(render(t, o)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bin, "run", "--config", cfPath, "--adapter", "caddyfile")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cmd.Process.Kill()
+		cmd.Wait()
+	}()
+
+	sock := filepath.Join(sockDir, "dev.sock")
+	hc := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+		},
+	}}
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		c, err := net.Dial("unix", sock)
+		if err == nil {
+			c.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("caddy never bound %s: %v", sock, err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	cases := []struct{ req, want string }{
+		// The three aliases, one per API shape pi speaks.
+		{"/cloudflare/prod/v1/messages", "/v1/ACCT/prod/anthropic/v1/messages"},
+		{"/cloudflare/prod/responses", "/v1/ACCT/prod/openai/responses"},
+		{"/cloudflare/prod/chat/completions", "/v1/ACCT/prod/compat/chat/completions"},
+		// The explicit form claude and codex use, which must be untouched.
+		{"/cloudflare/prod/anthropic/v1/messages", "/v1/ACCT/prod/anthropic/v1/messages"},
+		{"/cloudflare/prod/openai/responses", "/v1/ACCT/prod/openai/responses"},
+		// Unmapped paths keep the plain pass-through.
+		{"/cloudflare/prod/some/other/path", "/v1/ACCT/prod/some/other/path"},
+		// Matching is by whole path, not by prefix: this is not the mapped path.
+		{"/cloudflare/prod/v1/messages/extra", "/v1/ACCT/prod/v1/messages/extra"},
+
+		// REST route: /v1/messages must arrive unrewritten, the two OpenAI
+		// shapes must gain the /v1 the endpoint expects.
+		{"/cloudflare-rest/prod/v1/messages", "/client/v4/accounts/ACCT/ai/v1/messages"},
+		{"/cloudflare-rest/prod/chat/completions", "/client/v4/accounts/ACCT/ai/v1/chat/completions"},
+		{"/cloudflare-rest/prod/responses", "/client/v4/accounts/ACCT/ai/v1/responses"},
+	}
+	for _, c := range cases {
+		resp, err := hc.Post("http://caddy"+c.req, "application/json", strings.NewReader("{}"))
+		if err != nil {
+			t.Fatalf("%s: %v", c.req, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Errorf("%s: status %d", c.req, resp.StatusCode)
+			continue
+		}
+		if string(body) != c.want {
+			t.Errorf("%s reached %q, want %q", c.req, body, c.want)
+		}
+	}
+}
+
+// TestPathMapWithPathlessUpstream covers the branch where the upstream carries
+// no path of its own: the mappings must still render, and there must be no
+// pass-through rewrite at all (there is nothing to prepend). Untested branches
+// in a renderer that emits security-relevant config are how silent breakage
+// gets in.
+func TestPathMapWithPathlessUpstream(t *testing.T) {
+	o := baseOptions()
+	o.Containers = []state.Container{{Name: "dev", Gateway: "prod"}}
+	o.InstalledSecrets = map[string]bool{"cf-aig-token": true, "gh-pat.basic": true}
+	o.Routes = []config.Route{{
+		Name: "bare", Prefix: "/bare", Gateway: config.AnyGateway,
+		Upstream: "http://127.0.0.1:9911",
+		PathMap:  []config.PathMap{{Path: "/a", To: "/b"}},
+	}}
+	block := routeBlock(t, render(t, o), "/bare")
+
+	if !strings.Contains(block, "@map_bare_0 path /a") || !strings.Contains(block, "rewrite @map_bare_0 /b") {
+		t.Errorf("mapping not rendered for a pathless upstream:\n%s", block)
+	}
+	// No upstream base to prepend, so neither a gated nor an ungated
+	// pass-through rewrite should appear.
+	if strings.Contains(block, "rewrite * ") || strings.Contains(block, "@unmapped_bare") {
+		t.Errorf("pathless upstream should emit no pass-through rewrite:\n%s", block)
+	}
+	validateWithCaddy(t, render(t, o))
+}
+
+// TestGoldenPathMap keeps the package's golden-file discipline covering the
+// path_map output shape, including the REST route's mapping, which differs from
+// the provider-native one.
+func TestGoldenPathMap(t *testing.T) {
+	m := config.Meta{AccountID: "ACCT", Gateways: []string{"prod"}}
+	o := baseOptions()
+	o.Routes = config.DefaultRoutes(m)
+	o.Containers = []state.Container{{Name: "dev", Gateway: "prod"}}
+	o.InstalledSecrets = map[string]bool{
+		config.GatewaySecret("prod"): true, "gh-pat": true, "gh-pat.basic": true,
+	}
+	checkGolden(t, "pathmap.Caddyfile", render(t, o))
 }

@@ -25,6 +25,40 @@ type Header struct {
 	Value  string `json:"value"`
 }
 
+// PathMap rewrites one exact request path to another before proxying, so a
+// single base URL can front upstreams that live at different paths.
+//
+// It exists because clients that take one base URL per provider still append a
+// different suffix per API shape. pi, for instance, gives its
+// cloudflare-ai-gateway provider a single base URL and then appends
+// /v1/messages, /responses or /chat/completions depending on the model — which
+// on Cloudflare live under /anthropic, /openai and /compat respectively. The
+// suffixes are disjoint, so the segment is recoverable from the path alone.
+//
+// Path is matched as a whole path — no wildcard, no prefix match — against the
+// request path after the route's prefix has been stripped; To replaces it
+// (still relative to the upstream's own path). Whole-path rather than pattern
+// matching is deliberate: a finite set is enumerable, so what a mapping can
+// reach is decidable by reading it.
+//
+// "Whole path", not "byte-exact": Caddy's `path` matcher is case-insensitive
+// and sees the cleaned, percent-decoded path, so /V1/Messages, //v1/messages
+// and /v1%2Fmessages all hit a mapping written as /v1/messages. That widens
+// which spellings reach the mapped target, never which target they reach — the
+// target is a literal under the route's own upstream path, so no spelling
+// yields a URL the pass-through could not already produce. Anything
+// unmatched falls through to the route's normal pass-through behaviour, which
+// is what keeps an explicitly-addressed path (/cloudflare/gw/anthropic/v1/messages)
+// working unchanged alongside its mapped alias (/cloudflare/gw/v1/messages).
+//
+// A mapping grants no authority the route did not already have: it targets the
+// same upstream with the same injected credential, and is reachable only from
+// containers that already carry the route.
+type PathMap struct {
+	Path string `json:"path"`
+	To   string `json:"to"`
+}
+
 // Route maps container traffic to an upstream, with headers to inject.
 // Exactly one selector is set:
 //
@@ -42,6 +76,9 @@ type Route struct {
 	Host     string   `json:"host,omitempty"`
 	Upstream string   `json:"upstream"`
 	Inject   []Header `json:"inject,omitempty"`
+	// PathMap aliases exact paths onto other upstream paths; see PathMap.
+	// Prefix routes only.
+	PathMap []PathMap `json:"path_map,omitempty"`
 	// Gateway restricts this route to containers created against that AI
 	// Gateway. It is REQUIRED: "*" declares a route universal. Making it
 	// mandatory rather than defaulting an empty value to universal is
@@ -157,6 +194,37 @@ func (c *Config) Validate() error {
 		u.Path = strings.TrimSuffix(u.Path, "/")
 		u.RawPath = ""
 		r.Upstream = u.String()
+
+		// Path mappings are only meaningful where a prefix was stripped: a host
+		// route forwards the path verbatim by design, and silently rewriting it
+		// there would contradict that.
+		if len(r.PathMap) > 0 && r.IsHostRoute() {
+			return fmt.Errorf("route %q: path_map needs a prefix route (a host route forwards the path unchanged)", r.Name)
+		}
+		mapped := make(map[string]bool)
+		for _, m := range r.PathMap {
+			if !prefixRE.MatchString(m.Path) {
+				return fmt.Errorf("route %q: invalid path_map path %q (want exact slug path segments like /v1/messages)", r.Name, m.Path)
+			}
+			if !prefixRE.MatchString(m.To) {
+				return fmt.Errorf("route %q: invalid path_map target %q for %q (want exact slug path segments like /anthropic/v1/messages)", r.Name, m.To, m.Path)
+			}
+			if mapped[m.Path] {
+				return fmt.Errorf("route %q: duplicate path_map path %q", r.Name, m.Path)
+			}
+			mapped[m.Path] = true
+		}
+		// Refuse a target that is another entry's source. Caddy will not
+		// actually chain them (the adapter puts a block's rewrites in one
+		// mutually-exclusive group), but a reader cannot see that from the
+		// config, and "what this mapping reaches is decidable by reading it" is
+		// the property that makes an exact-match table reviewable. A->B->C
+		// spelled out in the table defeats it whether or not it executes.
+		for _, m := range r.PathMap {
+			if mapped[m.To] {
+				return fmt.Errorf("route %q: path_map target %q is also a mapped path; chained mappings are refused because they make the table's reach unreadable", r.Name, m.To)
+			}
+		}
 
 		for _, h := range r.Inject {
 			if !headerRE.MatchString(h.Header) {

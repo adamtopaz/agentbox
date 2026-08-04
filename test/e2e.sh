@@ -100,7 +100,12 @@ cat > "$W/routes.json" <<EOF
    {"header":"X-Absent","value":"{secret:not-installed}"}]},
  {"name":"hostroute","gateway":"*","host":"api.example.test","upstream":"http://127.0.0.1:${UPSTREAM_PORT}","inject":[
    {"header":"Authorization","value":"Bearer {secret:e2e-token}"}]},
- {"name":"gw-mine","prefix":"/cloudflare/mine","gateway":"mine","upstream":"http://127.0.0.1:${UPSTREAM_PORT}/v1/ACCT/mine","inject":[
+ {"name":"gw-mine","prefix":"/cloudflare/mine","gateway":"mine","upstream":"http://127.0.0.1:${UPSTREAM_PORT}/v1/ACCT/mine",
+  "path_map":[
+   {"path":"/v1/messages","to":"/anthropic/v1/messages"},
+   {"path":"/responses","to":"/openai/responses"},
+   {"path":"/chat/completions","to":"/compat/chat/completions"}],
+  "inject":[
    {"header":"cf-aig-authorization","value":"Bearer {secret:e2e-token-mine}"}]},
  {"name":"gw-other","prefix":"/cloudflare/other","gateway":"other","upstream":"http://127.0.0.1:${UPSTREAM_PORT}/v1/ACCT/other","inject":[
    {"header":"cf-aig-authorization","value":"Bearer {secret:e2e-token-other}"}]}
@@ -190,6 +195,38 @@ PYEOF
 [ "$(ccurl -o /dev/null -w '%{http_code}' "http://127.0.0.1:8787/cloudflare/other/anthropic/v1/messages")" = 404 ] \
     || die "container reached a gateway it was not created against"
 echo "   ok (another gateway -> 404, not merely unauthorized)"
+
+say "assert: path_map aliases resolve, and pass-through survives alongside them"
+# One base URL has to serve three API shapes, because a client like pi gives a
+# provider a single base URL and appends a different suffix per shape. The alias
+# and the explicitly-addressed path must land on the SAME upstream path, and an
+# unmapped path must still pass through untouched. Exactly one rewrite may take
+# effect per request: two would prepend the upstream base twice. (Caddy's
+# adapter enforces that by grouping a block's rewrites; the `not path` gate the
+# renderer also emits is belt-and-braces — see internal/caddyfile/render.go.)
+python3 - "$(ccurl "http://127.0.0.1:8787/cloudflare/mine/v1/messages")" \
+         "$(ccurl "http://127.0.0.1:8787/cloudflare/mine/responses")" \
+         "$(ccurl "http://127.0.0.1:8787/cloudflare/mine/chat/completions")" \
+         "$(ccurl "http://127.0.0.1:8787/cloudflare/mine/anthropic/v1/messages")" \
+         "$(ccurl "http://127.0.0.1:8787/cloudflare/mine/some/other/path")" \
+         "$(ccurl "http://127.0.0.1:8787/cloudflare/mine/v1/messages/extra")" <<'PYEOF'
+import json, sys
+alias_msg, alias_resp, alias_chat, explicit, passthru, deeper = (
+    json.loads(a) for a in sys.argv[1:7])
+assert alias_msg["path"] == "/v1/ACCT/mine/anthropic/v1/messages", alias_msg
+assert alias_resp["path"] == "/v1/ACCT/mine/openai/responses", alias_resp
+assert alias_chat["path"] == "/v1/ACCT/mine/compat/chat/completions", alias_chat
+# The alias is exactly an alias: same upstream path as addressing it directly.
+assert explicit["path"] == alias_msg["path"], (explicit, alias_msg)
+# Unmapped paths keep the plain pass-through behaviour.
+assert passthru["path"] == "/v1/ACCT/mine/some/other/path", passthru
+# Matching is exact, not prefix: /v1/messages/extra is not the mapped path.
+assert deeper["path"] == "/v1/ACCT/mine/v1/messages/extra", deeper
+# And a mapped path is still credentialed like any other.
+h = {k.lower(): v for k, v in alias_msg["headers"].items()}
+assert h.get("cf-aig-authorization") == "Bearer token-for-mine", h
+print("   ok (3 aliases mapped, explicit form unchanged, pass-through intact)")
+PYEOF
 
 say "assert: uninstalled credential fails closed (503, no upstream call)"
 [ "$(ccurl -o /dev/null -w '%{http_code}' "http://127.0.0.1:8787/nocred/x")" = 503 ] \

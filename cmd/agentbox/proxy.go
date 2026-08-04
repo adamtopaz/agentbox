@@ -77,7 +77,7 @@ func cmdProxyRoutes(args []string) int {
 		return fail(err)
 	}
 	w := tabwriter.NewWriter(os.Stdout, 2, 8, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tMATCH\tSELECTOR\tUPSTREAM\tINJECTS")
+	fmt.Fprintln(w, "NAME\tMATCH\tSELECTOR\tUPSTREAM\tINJECTS\tREWRITES")
 	for _, r := range cfg.Routes {
 		match := "path"
 		if r.IsHostRoute() {
@@ -93,7 +93,18 @@ func cmdProxyRoutes(args []string) int {
 		if names == "" {
 			names = "-"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", r.Name, match, r.Selector(), r.Upstream, names)
+		// A path_map silently changes which upstream path a request reaches, so
+		// it belongs in the audit view too: a route table that hides its
+		// rewrites is not one an operator can reason about by reading.
+		var rewrites []string
+		for _, m := range r.PathMap {
+			rewrites = append(rewrites, m.Path+"->"+m.To)
+		}
+		maps := strings.Join(rewrites, " ")
+		if maps == "" {
+			maps = "-"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", r.Name, match, r.Selector(), r.Upstream, names, maps)
 	}
 	w.Flush()
 	return 0

@@ -282,11 +282,25 @@ func TestReconcilesGatewayRoutesKeepingOperatorEdits(t *testing.T) {
 	for _, r := range got.Routes {
 		byName[r.Name] = r
 	}
-	if _, ok := byName["cloudflare-experiments"]; !ok {
-		t.Error("route for the newly configured gateway was not added")
+	// Every generated route for the configured gateway must be present. This is
+	// per-gateway, not one-per-gateway: the merge used to select the generated
+	// block by slicing to len(gateways), which kept only the first route of each
+	// and silently dropped the rest the moment a second was added.
+	for _, want := range []string{"cloudflare-experiments", "cloudflare-rest-experiments"} {
+		if _, ok := byName[want]; !ok {
+			t.Errorf("generated route %q missing after reconcile", want)
+		}
 	}
-	if _, ok := byName["cloudflare-prod"]; ok {
-		t.Error("route for a removed gateway was left behind — that container could still reach it")
+	for _, gone := range []string{"cloudflare-prod", "cloudflare-rest-prod"} {
+		if _, ok := byName[gone]; ok {
+			t.Errorf("route %q for a removed gateway was left behind — that container could still reach it", gone)
+		}
+	}
+	// Cross-check against the generator so this cannot drift as routes are added.
+	for _, r := range config.DefaultRoutes(config.Meta{AccountID: "acct123", Gateways: []string{"experiments"}}) {
+		if _, ok := byName[r.Name]; !ok {
+			t.Errorf("generated route %q was not merged into routes.json", r.Name)
+		}
 	}
 	if r, ok := byName["mine"]; !ok || r.Upstream != "https://example.com" {
 		t.Error("operator-added route was not preserved")
@@ -322,6 +336,38 @@ func TestLegacyRoutesAreRefusedLoudly(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "gateway") {
 		t.Fatalf("error should explain the missing gateway field: %v", err)
+	}
+	if !strings.Contains(err.Error(), "Move the file aside") {
+		t.Fatalf("the legacy format should get the migration hint: %v", err)
+	}
+}
+
+// TestOrdinaryRouteErrorGetsNoMigrationAdvice: the migration hint tells the
+// operator to move routes.json aside. That is right for the pre-pinning format
+// and destructive for an ordinary mistake in a current-format file, so it must
+// not be attached to every load failure.
+func TestOrdinaryRouteErrorGetsNoMigrationAdvice(t *testing.T) {
+	prefix := t.TempDir()
+	run(t, prefix, Options{AccountID: "acct123", Gateways: []string{"prod"}})
+	routesPath := filepath.Join(prefix, "etc/agentbox/routes.json")
+	// Current format, one bad path_map target.
+	broken := `{"routes":[{"name":"x","gateway":"*","prefix":"/x",` +
+		`"upstream":"https://example.com","path_map":[{"path":"/a","to":"../b"}]}]}` + "\n"
+	if err := os.WriteFile(routesPath, []byte(broken), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", "")
+	var out bytes.Buffer
+	err := Run(Options{Prefix: prefix, Out: &out, CredsBin: fakebin.SystemdCreds(t)})
+	if err == nil {
+		t.Fatal("an invalid path_map target must be refused")
+	}
+	if strings.Contains(err.Error(), "Move the file aside") {
+		t.Errorf("a typo must not be answered with advice to discard the route table: %v", err)
+	}
+	if !strings.Contains(err.Error(), "path_map") {
+		t.Errorf("error should name the offending field: %v", err)
 	}
 }
 

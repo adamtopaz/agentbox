@@ -88,11 +88,57 @@ gateway. It is mandatory rather than defaulting to universal on purpose: a
 route that forgot it would silently be reachable from every container,
 dissolving the pinning boundary instead of being rejected by it.
 
-Routes named `cloudflare-<gateway>` are generated — `setup` reconciles them
-against `agentbox.json` on every run and will overwrite your edits. Everything
-else you add is preserved untouched. A prefix that contains another
-(`/cloudflare` alongside `/cloudflare/prod`) is refused, because the shorter
-one would shadow the longer and serve it with the wrong credential.
+Any route whose name begins with `cloudflare-` is treated as generated: `setup`
+reconciles those against `agentbox.json` on every run, overwriting edits and
+**deleting ones it did not generate**. Do not name your own routes
+`cloudflare-*`. Everything else you add is preserved untouched.
+
+A prefix that contains another (`/cloudflare` alongside `/cloudflare/prod`) is
+refused, because the shorter one would shadow the longer and serve it with the
+wrong credential.
+
+### path_map: one base URL, several upstream paths
+
+A prefix route may carry `path_map`, which aliases whole request paths onto
+other upstream paths:
+
+```json
+{
+  "name": "cloudflare-prod",
+  "gateway": "prod",
+  "prefix": "/cloudflare/prod",
+  "upstream": "https://gateway.ai.cloudflare.com/v1/<acct>/prod",
+  "path_map": [
+    { "path": "/v1/messages", "to": "/anthropic/v1/messages" },
+    { "path": "/responses", "to": "/openai/responses" }
+  ]
+}
+```
+
+It exists for clients that accept a single base URL per provider but speak
+several API shapes underneath it — see the pi notes below. `path` matches the
+whole path left after the prefix is stripped (not a prefix, not a pattern), and
+`to` replaces it, still relative to the upstream's own path. Anything unmatched
+falls through to the route's normal pass-through behaviour, so a target
+addressed explicitly keeps working alongside its alias.
+
+Whole-path matching is deliberate: a finite set means what a mapping can reach
+is decidable by reading it. Wildcards, regexes, `..`, Caddy placeholders, and a
+`to` that is another entry's `path` are all rejected. A mapping grants no
+authority the route did not already have — same upstream, same injected
+credential, same gateway restriction, and the fail-closed 503 still applies when
+the credential is missing.
+
+Two details worth knowing before relying on it:
+
+- Matching is **not byte-exact**. Caddy's `path` matcher is case-insensitive and
+  sees the cleaned, percent-decoded path, so `/V1/Messages`, `//v1/messages` and
+  `/v1%2Fmessages` all hit a mapping written `/v1/messages`. This changes which
+  spellings reach the mapped target, never which target they reach.
+- The alias is additive for *targets*, not for *sources*. Once `/v1/messages` is
+  mapped, it can no longer reach `<upstream>/v1/messages` — that spelling now
+  goes to the mapped target instead. Only map paths that are not themselves
+  meaningful on the upstream.
 
 Only add an injecting host route for a host that should receive that
 credential. Redirect targets that carry signed URLs (asset/CDN hosts) should
@@ -104,6 +150,50 @@ Then `agentbox proxy reload`. If the route references a new secret, add it with
 drop-in must know the name). Validation fails closed: a broken routes.json never replaces the
 live config.
 
+## Two Cloudflare endpoints per gateway
+
+Each configured gateway gets **two** generated routes, because Cloudflare serves
+its models on two different endpoints and not every model is on both:
+
+| Route | Container-visible | Upstream | Auth injected |
+|---|---|---|---|
+| `cloudflare-<gw>` | `/cloudflare/<gw>/…` | `gateway.ai.cloudflare.com/v1/<acct>/<gw>/…` | `cf-aig-authorization` |
+| `cloudflare-rest-<gw>` | `/cloudflare-rest/<gw>/…` | `api.cloudflare.com/client/v4/accounts/<acct>/ai/…` | `Authorization` + `cf-aig-gateway-id` |
+
+The first is the **provider-native passthrough**: the provider is a path segment
+(`/anthropic`, `/openai`, `/compat`) and the model is named the provider's own
+way. This is what `claude`, `codex` and `pi` use.
+
+The second is Cloudflare's **REST API**, which Cloudflare's docs group with
+`env.AI.run()` as the "Unified Billing endpoints". Here the gateway is a header
+rather than a path segment — injected by the proxy, so a container cannot select
+a gateway at all on this route — and the model is named `provider/model` in the
+request **body**:
+
+```sh
+incus exec <container> -- su - agent -c 'curl -sS -X POST \
+  http://127.0.0.1:8787/cloudflare-rest/<gw>/v1/messages \
+  -H "content-type: application/json" \
+  -d "{\"model\":\"anthropic/claude-fable-5\",\"max_tokens\":64,
+       \"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"'
+```
+
+**Why both exist:** the newest models are served only on the REST endpoint. On
+the provider-native passthrough they get no credential attached and are
+forwarded bare, so the provider answers `401 x-api-key header is required` —
+see the 401 note above. Confirmed 2026-08-04 with `claude-fable-5`.
+
+**What the REST route cannot do:** because the model name lives in the body and
+agentbox never rewrites bodies, a client that sends bare model ids cannot reach
+these models through it. That includes `claude`, `codex` and `pi` as wired.
+Today the REST route is for `curl` and for anything you can hand a full
+`provider/model` string.
+
+Both routes reuse the same `cf-aig-token-<gw>` secret. They need different
+*permissions* on it, though: the passthrough needs `AI Gateway Run`, and the
+REST API is documented as needing `AI Gateway`. If the REST route answers 403
+while the passthrough works, mint a token with both and re-add the secret.
+
 ## Cloudflare AI Gateway: using more than one
 
 List every gateway in `/etc/agentbox/agentbox.json`; there is no default.
@@ -112,7 +202,8 @@ List every gateway in `/etc/agentbox/agentbox.json`; there is no default.
 { "account_id": "…", "gateways": ["prod", "experiments"] }
 ```
 
-Each gets its own route and its own credential, named `cf-aig-token-<gateway>`:
+Each gets its own routes (both of the above) and its own credential, named
+`cf-aig-token-<gateway>`:
 
 ```sh
 sudo agentbox add-secret cf-aig-token-prod
@@ -185,12 +276,8 @@ Provisioning fails the build if any agent installs without producing its
 binary — npm exiting 0 does not prove the command exists, as a package can
 install cleanly and ship a differently-named one.
 
-In pi, use the **`anthropic`** and **`openai`** providers
-(`pi --model anthropic/claude-opus-5`). Its `cloudflare-ai-gateway` provider is
-deliberately not proxied: those models carry a per-model `baseUrl` from pi's
-remote catalog that already includes the provider segment, so a provider-level
-override loses it and Cloudflare answers `400 Invalid provider`. They reach the
-same upstreams as the two proxied providers anyway.
+In pi, all three providers are proxied — `anthropic`, `openai`, and
+`cloudflare-ai-gateway` (`pi --model cloudflare-ai-gateway/claude-opus-5`).
 
 `pi` is routed by `~/.pi/agent/models.json`, written per container by
 `agentbox create`. pi honours no `*_BASE_URL` environment variable — it
@@ -199,6 +286,73 @@ without that file it talks to Anthropic, OpenAI and Cloudflare directly. That
 fails closed (the container holds only dummy keys) but bypasses the proxy, so
 if you see pi reporting 401 from a provider, check that file exists and names
 the container's gateway.
+
+The `cloudflare-ai-gateway` provider needs one extra thing, and it is why
+`path_map` exists. A provider-level `baseUrl` replaces each model's catalog URL
+wholesale, and those URLs end in *different* provider segments depending on the
+model — `/anthropic`, `/openai` or `/compat`. pi offers no per-model override
+(`modelOverrides` covers `name, reasoning, thinkingLevelMap, input, cost,
+contextWindow, maxTokens, headers, compat` — not `baseUrl`), so one base URL
+would necessarily break two families out of three. What saves it is that pi
+appends a distinct suffix per API shape, so the segment is recoverable from the
+path: the generated gateway route maps `/v1/messages` → `/anthropic/v1/messages`,
+`/responses` → `/openai/responses`, `/chat/completions` →
+`/compat/chat/completions`. Verified against pi 0.83.0.
+
+Two known rough edges, both upstream of agentbox:
+
+- A few Workers AI models carry a `maxTokens` in pi's catalog above what the
+  model accepts (`glm-5.2` says 262144, the model caps at 256000), so pi's
+  first request is rejected with `max_completion_tokens is too large`. Fix it
+  per model in `~/.pi/agent/models.json` with `modelOverrides` — `maxTokens`
+  *is* an overridable field.
+- pi's catalog marks these models as reachable via `/compat`, which Cloudflare
+  documents as deprecated in favour of its REST API
+  (`api.cloudflare.com/client/v4/accounts/<id>/ai/...`). That API is not usable
+  here: it identifies the model as `provider/model` in the request *body*, and
+  agentbox never rewrites bodies. If Cloudflare retires `/compat`, the Workers
+  AI models stop working; the Anthropic and OpenAI families are unaffected.
+
+### A 401 through the gateway usually means "unknown model", not "bad credential"
+
+Cloudflare AI Gateway attaches your stored provider key only for models in
+**its** catalog. For a model it does not recognize it forwards the request bare,
+and the provider answers `401 x-api-key header is required` — an error that
+reads like the proxy failed to inject a credential when in fact it did.
+Confirmed 2026-08-04: `claude-fable-5` and an invented `claude-bogus-99` return
+byte-identical 401s, while `claude-opus-5` and `claude-sonnet-5` return 200 over
+the same route with the same injected token.
+
+So before suspecting agentbox, try a known-good model on the same route:
+
+```sh
+incus exec <container> -- su - agent -c 'curl -sS -X POST \
+  http://127.0.0.1:8787/cloudflare/<gw>/anthropic/v1/messages \
+  -H "content-type: application/json" -H "anthropic-version: 2023-06-01" \
+  -d "{\"model\":\"claude-opus-5\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"'
+```
+
+If that returns 200, injection is fine and the other model simply is not
+available through the gateway. Note that pi's catalog can list models
+Cloudflare's does not carry, so a model appearing in `pi --list-models` is not
+evidence the gateway can serve it. Reaching such a model means going to the
+provider directly rather than through Cloudflare — what the reserved
+`/anthropic` and `/openai` prefixes are for, which needs that provider's own
+API key as a secret.
+
+The mapping's left-hand side (the suffix pi appends) follows from the model's
+`api` field and is stable; its right-hand side is the provider segment from pi's
+**remote** catalog, which pi refreshes from `pi.dev`. So a catalog change can
+make a `to` stale. Both failure modes are loud rather than silent: a stale `to`
+gets `400 Invalid provider` from Cloudflare, and a new API shape pi has not been
+mapped for falls through to pass-through and gets the same. If that happens,
+re-derive the mapping from the catalog:
+
+```sh
+incus exec <container> -- su - agent -c \
+  'jq -r ".[\"cloudflare-ai-gateway\"].models | .[] | \"\(.api)  \(.baseUrl)\"" \
+     ~/.pi/agent/models-store.json | sort -u'
+```
 
 Check what an image actually shipped:
 

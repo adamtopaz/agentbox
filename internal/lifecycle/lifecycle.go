@@ -168,13 +168,23 @@ func (m *Manager) Create(name, gateway string) error {
 // default gateway — an image with one baked in would strand every container
 // built from it the moment the choice changed.
 func (m *Manager) wireGateway(name, gateway string) error {
+	script, err := gatewayScript(gateway)
+	if err != nil {
+		return err
+	}
+	return m.Incus.RunInput(script, "exec", name, "--", "sh", "-s")
+}
+
+// gatewayScript builds the in-container wiring script. Split out from
+// wireGateway so what gets written is assertable without an incus.
+func gatewayScript(gateway string) (string, error) {
 	if !configValidGateway(gateway) {
-		return fmt.Errorf("invalid gateway name %q", gateway)
+		return "", fmt.Errorf("invalid gateway name %q", gateway)
 	}
 	base := "http://127.0.0.1:8787/cloudflare/" + gateway
 	// The gateway name is validated above, so it cannot break out of these
 	// here-docs; nothing else is interpolated.
-	script := `set -eu
+	return `set -eu
 GW=` + base + `
 cat > /etc/profile.d/agentbox-gateway.sh <<EOF
 # agentbox: this container's AI Gateway. Written by agentbox create.
@@ -226,30 +236,31 @@ fi
 # and OpenAI directly — failing closed against the dummy keys, but bypassing
 # the proxy entirely.
 #
-# Deliberately NOT overridden: cloudflare-ai-gateway. Its models each carry
-# their own baseUrl from pi's remote catalog, already ending in the provider
-# segment, e.g.
-#   https://gateway.ai.cloudflare.com/v1/{ACCOUNT}/{GATEWAY}/anthropic
-# A provider-level override replaces that whole URL and loses the segment, so
-# pi requests <base>/v1/messages and Cloudflare reads "v1" as the provider name
-# and answers 400 Invalid provider. Those models reach the same upstreams as
-# the anthropic/openai providers above, which are proxied, so use those; the
-# gateway provider is left to fail closed on its dummy key.
+# cloudflare-ai-gateway gets the bare gateway base. A provider-level override
+# replaces each model's catalog baseUrl wholesale, losing the provider segment
+# that URL ended in — so the gateway route carries a path_map that puts the
+# segment back, keyed on the suffix pi appends per API shape:
+#   /v1/messages      (anthropic-messages) -> /anthropic/v1/messages
+#   /responses        (openai-responses)   -> /openai/responses
+#   /chat/completions (openai-completions) -> /compat/chat/completions
+# The suffixes are disjoint, so one base URL covers all three families. Without
+# it a single override can only ever satisfy one of them (Cloudflare reads the
+# leftover "v1" as a provider name and answers 400 Invalid provider).
 if id agent >/dev/null 2>&1; then
   install -d -o agent -g agent -m 0755 /home/agent/.pi /home/agent/.pi/agent
   cat > /home/agent/.pi/agent/models.json <<EOF
 {
   "providers": {
     "anthropic": { "baseUrl": "$GW/anthropic" },
-    "openai": { "baseUrl": "$GW/openai" }
+    "openai": { "baseUrl": "$GW/openai" },
+    "cloudflare-ai-gateway": { "baseUrl": "$GW" }
   }
 }
 EOF
   chown -R agent:agent /home/agent/.pi
   chmod 0644 /home/agent/.pi/agent/models.json
 fi
-`
-	return m.Incus.RunInput(script, "exec", name, "--", "sh", "-s")
+`, nil
 }
 
 // deviceArgs returns the incus invocations that wire both proxy devices for a

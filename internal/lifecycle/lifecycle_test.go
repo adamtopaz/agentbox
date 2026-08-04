@@ -372,3 +372,46 @@ func TestListShowsDrift(t *testing.T) {
 		t.Fatal("untagged instance must not be listed")
 	}
 }
+
+// TestGatewayScriptWiresEveryAgent pins the wiring script's text. Each agent
+// takes its endpoint from a different place, and getting any one wrong means
+// that agent silently bypasses the proxy and talks to the provider directly —
+// which fails closed on the dummy keys, but only by luck.
+//
+// Scope: this checks the script agentbox generates, not the files that script
+// produces once a shell runs it. Whether the here-docs land as valid JSON/TOML
+// is a level below what this test sees.
+func TestGatewayScriptWiresEveryAgent(t *testing.T) {
+	got, err := gatewayScript("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := "http://127.0.0.1:8787/cloudflare/prod"
+	for _, want := range []string{
+		// claude and anything else reading the environment
+		"export ANTHROPIC_BASE_URL=$GW/anthropic",
+		"export OPENAI_BASE_URL=$GW/openai",
+		"GW=" + base,
+		// codex: config file, not environment
+		`base_url = "$GW/openai"`,
+		// pi: models.json, and no *_BASE_URL support at all
+		`"anthropic": { "baseUrl": "$GW/anthropic" }`,
+		`"openai": { "baseUrl": "$GW/openai" }`,
+		// The gateway provider gets the bare base and relies on the route's
+		// path_map to restore the provider segment per API shape.
+		`"cloudflare-ai-gateway": { "baseUrl": "$GW" }`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("gateway script missing %q", want)
+		}
+	}
+	// No credential may cross into the container.
+	for _, forbidden := range []string{"cf-aig-token", "secret:", "{file."} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("gateway script leaks credential material (%q)", forbidden)
+		}
+	}
+	if _, err := gatewayScript("../etc"); err == nil {
+		t.Error("invalid gateway name accepted")
+	}
+}

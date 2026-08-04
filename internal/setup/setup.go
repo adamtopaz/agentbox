@@ -434,8 +434,15 @@ func (r *runner) ensureRoutes() error {
 	// gets one. Everything the operator added is preserved untouched.
 	cur, err := config.Load(routesPath)
 	if err != nil {
-		return fmt.Errorf("%w\n(the previous format is not compatible: every route now needs a \"gateway\" field, %q for routes any container may use. Move the file aside and re-run to regenerate)",
-			err, config.AnyGateway)
+		// Only offer the format-migration hint when the failure actually looks
+		// like the pre-pinning format. Attaching it to every load error tells an
+		// operator with a one-character typo to move their whole route table
+		// aside, which is both wrong and destructive advice.
+		if strings.Contains(err.Error(), "\"gateway\" is required") {
+			return fmt.Errorf("%w\n(the previous format is not compatible: every route now needs a \"gateway\" field, %q for routes any container may use. Move the file aside and re-run to regenerate)",
+				err, config.AnyGateway)
+		}
+		return err
 	}
 	isGenerated := func(name string) bool { return strings.HasPrefix(name, "cloudflare-") }
 	merged := make([]config.Route, 0, len(cur.Routes)+len(generated))
@@ -444,7 +451,18 @@ func (r *runner) ensureRoutes() error {
 			merged = append(merged, rt)
 		}
 	}
-	merged = append(generated[:len(m.Gateways):len(m.Gateways)], merged...)
+	// Select the generated routes by the same predicate used to drop the stale
+	// ones, rather than by counting gateways. Slicing to len(m.Gateways) was
+	// only correct while each gateway produced exactly one route; it now
+	// produces two (provider-native and REST), and a count-based slice would
+	// silently keep the first and drop the rest.
+	gen := make([]config.Route, 0, len(generated))
+	for _, rt := range generated {
+		if isGenerated(rt.Name) {
+			gen = append(gen, rt)
+		}
+	}
+	merged = append(gen, merged...)
 
 	want := config.Config{Routes: merged}
 	if err := want.Validate(); err != nil {

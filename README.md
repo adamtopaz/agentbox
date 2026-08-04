@@ -80,8 +80,8 @@ agentbox proxy block dev   # 403 the container's site (--hard severs connections
 agentbox proxy unblock dev
 ```
 
-Inside a container, everything is pre-wired with dummy keys: `claude` and
-`codex` work out of the box; `git clone https://github.com/...` is rewritten
+Inside a container, everything is pre-wired with dummy keys: `claude`, `codex`
+and `pi` work out of the box; `git clone https://github.com/...` is rewritten
 through the proxy and authenticates with the host-side PAT; and `gh` works
 unmodified via its `http_unix_socket` setting, which makes it dial
 `/run/agentbox.sock` in plain HTTP while still addressing `api.github.com`.

@@ -397,11 +397,40 @@ func writeRoute(b *strings.Builder, r config.Route, credsDir string, missing []s
 		b.WriteString("\t\t}\n")
 		return nil
 	}
-	if u.Path != "" {
-		if !safePathToken(u.Path) {
-			return fmt.Errorf("route %q: upstream path %q not renderable", r.Name, u.Path)
+	if u.Path != "" && !safePathToken(u.Path) {
+		return fmt.Errorf("route %q: upstream path %q not renderable", r.Name, u.Path)
+	}
+	// Exact-path aliases first, each behind its own matcher, then the
+	// pass-through rewrite behind the negation of all of them.
+	//
+	// What actually guarantees only one rewrite takes effect is Caddy's
+	// adapter: it puts every `rewrite` from one block into a single
+	// mutually-exclusive route group (visible as "group":"group0" in
+	// `caddy adapt` output), and Caddy runs only the first matching route of a
+	// group. Verified by execution — with the negation removed the rendered
+	// config behaves identically, so the upstream path is *not* prepended
+	// twice. The negation is therefore belt-and-braces, kept for two reasons:
+	// it makes the exclusivity legible without knowing the adapter's grouping
+	// behaviour, and it does not depend on it. Do not "simplify" it away on the
+	// assumption that it is what protects us, and do not assume it is.
+	mappedPaths := make([]string, 0, len(r.PathMap))
+	for i, m := range r.PathMap {
+		if !safePathToken(m.Path) || !safePathToken(m.To) {
+			return fmt.Errorf("route %q: path mapping %q -> %q not renderable", r.Name, m.Path, m.To)
 		}
-		fmt.Fprintf(b, "\t\t\trewrite * %s{uri}\n", u.Path)
+		matcher := fmt.Sprintf("@map_%s_%d", sanitizeLabel(r.Name), i)
+		fmt.Fprintf(b, "\t\t\t%s path %s\n", matcher, m.Path)
+		fmt.Fprintf(b, "\t\t\trewrite %s %s%s\n", matcher, u.Path, m.To)
+		mappedPaths = append(mappedPaths, m.Path)
+	}
+	if u.Path != "" {
+		if len(mappedPaths) > 0 {
+			matcher := "@unmapped_" + sanitizeLabel(r.Name)
+			fmt.Fprintf(b, "\t\t\t%s not path %s\n", matcher, strings.Join(mappedPaths, " "))
+			fmt.Fprintf(b, "\t\t\trewrite %s %s{uri}\n", matcher, u.Path)
+		} else {
+			fmt.Fprintf(b, "\t\t\trewrite * %s{uri}\n", u.Path)
+		}
 	}
 	// Runtime fail-closed guard. Caddy expands {file.…} of an absent or empty
 	// credential to the empty string and proxies anyway, so a control-plane
