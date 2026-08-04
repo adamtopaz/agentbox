@@ -22,6 +22,8 @@
 		respond @agentbox_dots 404
 		@host_gh_api host api.github.com
 		handle @host_gh_api {
+			@nocred_gh_api_0 vars {file./run/credentials/caddy.service/gh-pat} ""
+			respond @nocred_gh_api_0 "route gh-api unavailable: credential not installed" 503
 			request_header -Authorization
 			request_header -Proxy-Authorization
 			request_header -X-Api-Key
@@ -42,6 +44,8 @@
 		redir /anthropic /anthropic/ 308
 		handle_path /anthropic/* {
 			rewrite * /v1/ACCT/GW/anthropic{uri}
+			@nocred_anthropic_0 vars {file./run/credentials/caddy.service/cf-aig-token} ""
+			respond @nocred_anthropic_0 "route anthropic unavailable: credential not installed" 503
 			request_header -Authorization
 			request_header -Proxy-Authorization
 			request_header -X-Api-Key
@@ -79,6 +83,8 @@
 		}
 		redir /github-git /github-git/ 308
 		handle_path /github-git/* {
+			@nocred_github_git_0 vars {file./run/credentials/caddy.service/gh-pat.basic} ""
+			respond @nocred_github_git_0 "route github-git unavailable: credential not installed" 503
 			request_header -Authorization
 			request_header -Proxy-Authorization
 			request_header -X-Api-Key

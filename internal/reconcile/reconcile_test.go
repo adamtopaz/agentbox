@@ -246,8 +246,8 @@ func TestMissingSecretRoutesFailClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	data, _ := os.ReadFile(p.CaddyfilePath)
-	if !strings.Contains(string(data), "credential not installed") {
-		t.Fatal("route referencing an uninstalled secret must render as 503")
+	if strings.Contains(string(data), "reverse_proxy") {
+		t.Fatal("route referencing an uninstalled secret must render as 503, not proxy")
 	}
 
 	// Once installed, the route proxies normally.
@@ -258,9 +258,6 @@ func TestMissingSecretRoutesFailClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	data, _ = os.ReadFile(p.CaddyfilePath)
-	if strings.Contains(string(data), "credential not installed") {
-		t.Fatal("installed secret should re-enable the route")
-	}
 	if !strings.Contains(string(data), "reverse_proxy") {
 		t.Fatal("expected a reverse_proxy for the credentialed route")
 	}
@@ -277,5 +274,67 @@ func TestMalformedRoutesFailsCleanly(t *testing.T) {
 	}
 	if calls := caddy.Calls(); calls != nil {
 		t.Fatalf("caddy must not be touched when config is malformed, got %v", calls)
+	}
+}
+
+// TestDropinCrossCheck pins the half of the fail-closed check that had no
+// coverage: what the drop-in says caddy will actually load. A mismatch here
+// once silently pinned every credentialed route at 503, and the inverse
+// mistake would let an unloaded credential render as live.
+func TestDropinCrossCheck(t *testing.T) {
+	cases := []struct {
+		name    string
+		dropin  string
+		wantHit bool
+	}{
+		{"encrypted spelling", "[Service]\nLoadCredentialEncrypted=tok:/etc/agentbox/secrets/tok.cred\n", true},
+		{"legacy spelling", "[Service]\nLoadCredential=tok:/etc/agentbox/secrets/tok\n", true},
+		{"indented", "[Service]\n  LoadCredentialEncrypted=tok:/x\n", true},
+		{"names another credential", "[Service]\nLoadCredentialEncrypted=other:/x\n", false},
+		{"no credential lines", "[Service]\nExecStart=/usr/bin/caddy run\n", false},
+		{"commented out", "[Service]\n#LoadCredentialEncrypted=tok:/x\n", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			caddy := fakebin.New(t, "caddy")
+			p := testParams(t, caddy.Bin())
+			p.SecretsManifest = filepath.Join(p.StateBase, "secrets.installed")
+			p.CaddyDropin = filepath.Join(p.StateBase, "dropin.conf")
+			if err := os.WriteFile(p.SecretsManifest, []byte("tok\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p.CaddyDropin, []byte(c.dropin), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Run(p); err != nil {
+				t.Fatal(err)
+			}
+			// The runtime guard emits the 503 text on every credentialed
+			// route, so presence of a reverse_proxy is the discriminator:
+			// a control-plane-disabled route renders the respond alone.
+			data, _ := os.ReadFile(p.CaddyfilePath)
+			proxying := strings.Contains(string(data), "reverse_proxy")
+			if proxying != c.wantHit {
+				t.Fatalf("credential visible in drop-in = %v but route proxying = %v", c.wantHit, proxying)
+			}
+		})
+	}
+}
+
+// TestMissingDropinFailsClosed: no drop-in at all means caddy holds nothing.
+func TestMissingDropinFailsClosed(t *testing.T) {
+	caddy := fakebin.New(t, "caddy")
+	p := testParams(t, caddy.Bin())
+	p.SecretsManifest = filepath.Join(p.StateBase, "secrets.installed")
+	p.CaddyDropin = filepath.Join(p.StateBase, "does-not-exist.conf")
+	if err := os.WriteFile(p.SecretsManifest, []byte("tok\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(p); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(p.CaddyfilePath)
+	if strings.Contains(string(data), "reverse_proxy") {
+		t.Fatal("a missing drop-in must mean nothing is installed, not check-disabled")
 	}
 }

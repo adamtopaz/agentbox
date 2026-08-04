@@ -63,7 +63,10 @@ func Run(o Options) error {
 	if m, err := config.LoadMeta(o.MetaPath); err == nil {
 		accountID, gatewayID = m.AccountID, m.GatewayID
 	} else if errors.Is(err, fs.ErrNotExist) {
-		fmt.Fprintf(out, "warning: %s not found (run `agentbox setup` first); baking empty gateway coordinates into the image\n", o.MetaPath)
+		// The gateway name is baked into the image's base URLs, so an empty
+		// one produces containers that fail against Cloudflare with a 404
+		// that looks like an API fault.
+		return fmt.Errorf("%s not found: run `agentbox setup` first so the image can be wired to a gateway", o.MetaPath)
 	} else {
 		return err
 	}

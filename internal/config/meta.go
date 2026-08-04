@@ -9,6 +9,11 @@ import (
 
 // Meta holds the non-secret Cloudflare AI Gateway coordinates
 // (/etc/agentbox/agentbox.json).
+//
+// GatewayID is the *default* gateway: routing does not depend on it, since
+// `/cloudflare/<gateway>/...` names the gateway in the path. It is what the
+// image wires agents to out of the box, so an agent that is never told
+// otherwise bills to this one.
 type Meta struct {
 	AccountID string `json:"account_id"`
 	GatewayID string `json:"gateway_id"`
@@ -42,17 +47,36 @@ func LoadMeta(path string) (Meta, error) {
 	return m, nil
 }
 
+// GatewayBase is the Cloudflare AI Gateway root for an account. Everything
+// after it is `<gateway-name>/<provider>/<provider path>`.
+func GatewayBase(accountID string) string {
+	return "https://gateway.ai.cloudflare.com/v1/" + accountID
+}
+
+// GatewayPrefix is the container-visible prefix for Cloudflare AI Gateway
+// traffic. `/cloudflare/<gateway>/...` maps straight onto
+// `https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/...`, so any
+// number of gateways are reachable through one route with no config change —
+// the gateway name is just the next path segment.
+const GatewayPrefix = "/cloudflare"
+
 // DefaultRoutes is the day-one route table (spec §4), parameterized by the
 // gateway coordinates.
 func DefaultRoutes(m Meta) []Route {
-	gw := "https://gateway.ai.cloudflare.com/v1/" + m.AccountID + "/" + m.GatewayID
 	aig := []Header{{Header: "cf-aig-authorization", Value: "Bearer {secret:cf-aig-token}"}}
 	ghToken := []Header{{Header: "Authorization", Value: "Bearer {secret:gh-pat}"}}
 	return []Route{
 		// Path-prefix routes: agents point their base URL at 127.0.0.1:8787.
-		{Name: "anthropic", Prefix: "/anthropic", Upstream: gw + "/anthropic", Inject: aig},
-		{Name: "openai", Prefix: "/openai", Upstream: gw + "/openai", Inject: aig},
-		{Name: "cf-gateway", Prefix: "/cf-gateway", Upstream: gw, Inject: aig},
+		//
+		// One route covers every gateway on the account. The prefix is
+		// stripped and the account base prepended, so
+		//   /cloudflare/<gw>/anthropic/v1/messages
+		//   /cloudflare/<gw>/openai/chat/completions
+		// reach the provider-native endpoints of whichever gateway is named.
+		//
+		// /anthropic and /openai are deliberately left unused, reserved for
+		// talking to those APIs directly rather than through Cloudflare.
+		{Name: "cloudflare", Prefix: GatewayPrefix, Upstream: GatewayBase(m.AccountID), Inject: aig},
 		{Name: "github-api", Prefix: "/github-api", Upstream: "https://api.github.com", Inject: ghToken},
 		{Name: "github-git", Prefix: "/github-git", Upstream: "https://github.com",
 			Inject: []Header{{Header: "Authorization", Value: "{basic:x-access-token:gh-pat}"}}},

@@ -231,6 +231,7 @@ func writeTemp(target, content string) (string, error) {
 // counts as installed only if it appears in both.
 func readSecretsManifest(path, dropinPath string) (map[string]bool, error) {
 	if path == "" {
+		slog.Warn("secrets manifest path is empty; the fail-closed credential check is DISABLED")
 		return nil, nil
 	}
 	installed, err := readNameList(path)
@@ -243,6 +244,7 @@ func readSecretsManifest(path, dropinPath string) (map[string]bool, error) {
 		return nil, err
 	}
 	if dropinPath == "" {
+		slog.Warn("caddy drop-in path is empty; credentials are not cross-checked against what caddy will load")
 		return installed, nil
 	}
 	loaded, err := readLoadCredentialNames(dropinPath)
@@ -280,8 +282,21 @@ func readNameList(path string) (map[string]bool, error) {
 	return out, sc.Err()
 }
 
-// readLoadCredentialNames extracts the credential IDs from the caddy.service
-// drop-in: `LoadCredential=<name>:<path>`.
+// credentialDirectives are the systemd settings that actually hand a
+// credential to the service. Both spellings are accepted so the check keeps
+// working across the plaintext-to-encrypted transition — and, more to the
+// point, so it cannot silently match nothing if the drop-in changes form.
+var credentialDirectives = []string{"LoadCredentialEncrypted=", "LoadCredential="}
+
+// CredentialNamesInDropin extracts the credential IDs a systemd drop-in makes
+// available to its service, e.g. `LoadCredentialEncrypted=<name>:<path>`.
+// Exported so the setup package can assert that what it writes is what this
+// package reads — these two must never drift apart, because a mismatch means
+// every credentialed route silently renders 503 forever.
+func CredentialNamesInDropin(path string) (map[string]bool, error) {
+	return readLoadCredentialNames(path)
+}
+
 func readLoadCredentialNames(path string) (map[string]bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -292,12 +307,15 @@ func readLoadCredentialNames(path string) (map[string]bool, error) {
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
-		spec, ok := strings.CutPrefix(line, "LoadCredential=")
-		if !ok {
-			continue
-		}
-		if name, _, ok := strings.Cut(spec, ":"); ok && name != "" {
-			out[name] = true
+		for _, directive := range credentialDirectives {
+			spec, ok := strings.CutPrefix(line, directive)
+			if !ok {
+				continue
+			}
+			if name, _, ok := strings.Cut(spec, ":"); ok && name != "" {
+				out[name] = true
+			}
+			break
 		}
 	}
 	return out, sc.Err()

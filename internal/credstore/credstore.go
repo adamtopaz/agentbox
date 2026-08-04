@@ -60,8 +60,21 @@ func (s Store) Put(name string, value []byte) error {
 	if !ValidName(name) {
 		return fmt.Errorf("invalid credential name %q", name)
 	}
+	// Normalise and validate here rather than in each caller: add-secret and
+	// the plaintext migration both land on this path, and having the rules in
+	// only one of them is how they drift.
+	value = bytes.TrimSpace(value)
 	if len(value) == 0 {
 		return fmt.Errorf("refusing to store an empty value for %q", name)
+	}
+	// The value ends up verbatim in an HTTP header. Go rewrites embedded
+	// newlines to spaces when writing headers, so a value containing them
+	// would be silently corrupted and fail upstream with nothing pointing at
+	// the cause.
+	for _, b := range value {
+		if b < 0x20 || b > 0x7e {
+			return fmt.Errorf("value for %q contains a non-printable or non-ASCII byte (0x%02x)", name, b)
+		}
 	}
 	tmp, err := os.CreateTemp(s.Dir, ".cred-*")
 	if err != nil {
@@ -74,7 +87,21 @@ func (s Store) Put(name string, value []byte) error {
 	// No --with-key: systemd's default binds to the TPM when one is present
 	// and falls back to the host key otherwise, so this upgrades itself on
 	// hardware that has a TPM without any change here.
-	cmd := exec.Command(s.bin(), "encrypt", "--name="+name, "-", tmpName)
+	//
+	// --tpm2-pcrs= (empty) is not optional. systemd-creds otherwise defaults
+	// to sealing against PCR 7, which measures Secure Boot state: a dbx
+	// update from fwupd, a firmware Secure Boot toggle, or key re-enrolment
+	// would change it and make every credential permanently undecryptable.
+	// Decryption failure is fatal to unit activation, so caddy would simply
+	// stop starting, and since no plaintext copy is kept the only recovery
+	// would be re-issuing every token. Binding to no PCRs still keeps the
+	// ciphertext useless off this host, which is the property we want.
+	// --tpm2-public-key= (empty) too: systemd auto-discovers
+	// tpm2-pcr-public-key.pem from /etc, /run or /usr/lib and would then bind
+	// to signed PCR 11, quietly reintroducing the brittleness --tpm2-pcrs=
+	// exists to avoid.
+	cmd := exec.Command(s.bin(), "encrypt",
+		"--name="+name, "--tpm2-pcrs=", "--tpm2-public-key=", "-", tmpName)
 	cmd.Stdin = bytes.NewReader(value)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -83,6 +110,16 @@ func (s Store) Put(name string, value []byte) error {
 	}
 	if err := os.Chmod(tmpName, 0o600); err != nil {
 		return err
+	}
+	// Verify before installing. Callers delete the operator's only plaintext
+	// copy on the strength of this succeeding, so an encrypt that "worked"
+	// but does not round-trip must not be allowed to look like success.
+	got, err := s.decryptFile(tmpName, name)
+	if err != nil {
+		return fmt.Errorf("stored credential %q does not decrypt; refusing to install it: %w", name, err)
+	}
+	if !bytes.Equal(got, value) {
+		return fmt.Errorf("stored credential %q did not round-trip intact; refusing to install it", name)
 	}
 	return os.Rename(tmpName, s.Path(name))
 }
@@ -94,7 +131,14 @@ func (s Store) Get(name string) ([]byte, error) {
 	if !ValidName(name) {
 		return nil, fmt.Errorf("invalid credential name %q", name)
 	}
-	cmd := exec.Command(s.bin(), "decrypt", "--name="+name, s.Path(name), "-")
+	return s.decryptFile(s.Path(name), name)
+}
+
+// decryptFile decrypts an arbitrary ciphertext path under the given
+// credential name. The name is bound into the ciphertext by systemd, so a
+// mismatch fails rather than silently returning the value.
+func (s Store) decryptFile(path, name string) ([]byte, error) {
+	cmd := exec.Command(s.bin(), "decrypt", "--name="+name, path, "-")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

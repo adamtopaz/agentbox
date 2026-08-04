@@ -70,7 +70,7 @@ abx() {
 say "test fixtures (dummy secret material only)"
 printf 'e2e-dummy-secret' > "$W/creds/e2e-token"
 printf '# names only\ne2e-token\n' > "$W/secrets.installed"
-printf '[Service]\nLoadCredential=e2e-token:%s/creds/e2e-token\n' "$W" > "$W/dropin.conf"
+printf '[Service]\nLoadCredentialEncrypted=e2e-token:%s/creds/e2e-token\n' "$W" > "$W/dropin.conf"
 
 "$W/agentbox" debug-echo --listen 127.0.0.1:0 > "$W/echo.out" 2>&1 &
 ECHO_PID=$!

@@ -234,6 +234,40 @@ func safePathToken(s string) bool {
 	return s != "" && !strings.Contains(s, "..")
 }
 
+// sanitizeLabel makes a route name usable inside a Caddyfile matcher token.
+func sanitizeLabel(name string) string {
+	return strings.NewReplacer("-", "_", ".", "_").Replace(name)
+}
+
+// routeSecretFiles returns the credential file paths a route's injections
+// depend on, sorted and de-duplicated.
+func routeSecretFiles(r config.Route, credsDir string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, h := range r.Inject {
+		parts, err := config.ParseValue(h.Value)
+		if err != nil {
+			continue // Validate reports this
+		}
+		for _, p := range parts {
+			name := p.Secret
+			if p.BasicSecret != "" {
+				name = p.BasicSecret + ".basic"
+			}
+			if name == "" {
+				continue
+			}
+			path := path.Join(credsDir, name)
+			if !seen[path] {
+				seen[path] = true
+				out = append(out, path)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // missingSecrets returns the sorted names of secrets a route needs that are
 // not installed. An empty result means the route is fully credentialed (or
 // checking is disabled).
@@ -272,7 +306,7 @@ func writeRoute(b *strings.Builder, r config.Route, credsDir string, missing []s
 	dial := u.Scheme + "://" + u.Host
 
 	if r.IsHostRoute() {
-		matcher := "@host_" + strings.ReplaceAll(strings.ReplaceAll(r.Name, "-", "_"), ".", "_")
+		matcher := "@host_" + sanitizeLabel(r.Name)
 		fmt.Fprintf(b, "\t\t%s host %s\n", matcher, r.Host)
 		fmt.Fprintf(b, "\t\thandle %s {\n", matcher)
 	} else {
@@ -294,6 +328,18 @@ func writeRoute(b *strings.Builder, r config.Route, credsDir string, missing []s
 			return fmt.Errorf("route %q: upstream path %q not renderable", r.Name, u.Path)
 		}
 		fmt.Fprintf(b, "\t\t\trewrite * %s{uri}\n", u.Path)
+	}
+	// Runtime fail-closed guard. Caddy expands {file.…} of an absent or empty
+	// credential to the empty string and proxies anyway, so a control-plane
+	// check alone leaves a window: the drop-in and manifest describe what
+	// caddy *will* load at next start, not what the running process holds.
+	// Comparing the placeholder per request closes that window in the data
+	// plane itself, where it cannot drift from the config that produced it.
+	for i, secretFile := range routeSecretFiles(r, credsDir) {
+		matcher := fmt.Sprintf("@nocred_%s_%d", sanitizeLabel(r.Name), i)
+		fmt.Fprintf(b, "\t\t\t%s vars {file.%s} \"\"\n", matcher, secretFile)
+		fmt.Fprintf(b, "\t\t\trespond %s \"route %s unavailable: credential not installed\" 503\n",
+			matcher, r.Name)
 	}
 	// Strip first, in its own handler, so the injection below cannot be
 	// undone by it — see the headerStrips comment.

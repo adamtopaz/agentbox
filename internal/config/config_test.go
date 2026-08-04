@@ -140,8 +140,27 @@ func TestMeta(t *testing.T) {
 			prefixes++
 		}
 	}
-	if prefixes != 5 || hosts != 4 {
-		t.Fatalf("day-one table = %d prefix + %d host routes, want 5 + 4", prefixes, hosts)
+	if prefixes != 3 || hosts != 4 {
+		t.Fatalf("day-one table = %d prefix + %d host routes, want 3 + 4", prefixes, hosts)
+	}
+	// One route serves every Cloudflare gateway: the gateway name is the next
+	// path segment, so /cloudflare/<gw>/anthropic/v1/messages reaches
+	// https://gateway.ai.cloudflare.com/v1/<acct>/<gw>/anthropic/v1/messages.
+	var cf *Route
+	for i, r := range routes {
+		if r.Name == "cloudflare" {
+			cf = &routes[i]
+		}
+		// /anthropic and /openai stay free for talking to those APIs directly.
+		if r.Prefix == "/anthropic" || r.Prefix == "/openai" {
+			t.Errorf("%q must stay reserved for direct (non-Cloudflare) API access", r.Prefix)
+		}
+	}
+	if cf == nil {
+		t.Fatal("no /cloudflare route")
+	}
+	if cf.Prefix != "/cloudflare" || cf.Upstream != "https://gateway.ai.cloudflare.com/v1/ACCT" {
+		t.Fatalf("cloudflare route = %+v", *cf)
 	}
 	// gh follows redirects to the asset host with a signed URL; sending the
 	// PAT there would leak it outside the API surface it was scoped for.

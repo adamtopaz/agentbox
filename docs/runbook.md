@@ -49,6 +49,15 @@ reachable by the machine. No scheme changes that. Membership in group
 Because the ciphertext is bound to this host, a `.cred` file restored onto a
 different machine will not decrypt — re-add the secret there.
 
+Two caveats worth knowing. Migrating a previously-plaintext secret *unlinks*
+the cleartext file rather than shredding it, so the old bytes may persist in
+free blocks until the volume is re-provisioned — against a stolen-disk threat
+the guarantee only fully holds behind full-disk encryption. And credentials
+written before this feature landed were sealed with systemd's default PCR
+policy; on a host with a TPM, re-add them (`agentbox add-secret <name>`) so
+they are re-sealed without one, or a firmware or Secure Boot change can make
+them permanently undecryptable.
+
 ## Add a route
 
 Edit `/etc/agentbox/routes.json`. A route selects on **either** a path prefix
@@ -58,12 +67,10 @@ Host header (path untouched; this is how `gh` and anything else that dials
 
 ```json
 {
-  "name": "groq",
-  "prefix": "/groq",
-  "upstream": "https://gateway.ai.cloudflare.com/v1/<ACCT>/<GW>/groq",
-  "inject": [
-    { "header": "cf-aig-authorization", "value": "Bearer {secret:cf-aig-token}" }
-  ]
+  "name": "anthropic-direct",
+  "prefix": "/anthropic",
+  "upstream": "https://api.anthropic.com",
+  "inject": [{ "header": "x-api-key", "value": "{secret:anthropic-key}" }]
 },
 {
   "name": "gitlab-api",
@@ -82,6 +89,40 @@ Then `agentbox proxy reload`. If the route references a new secret, add it with
 `sudo agentbox add-secret <name>` and re-run `sudo agentbox setup` first (the
 drop-in must know the name). Validation fails closed: a broken routes.json never replaces the
 live config.
+
+## Cloudflare AI Gateway: using more than one
+
+One route covers them all. `/cloudflare/<gateway-name>/...` expands to
+`https://gateway.ai.cloudflare.com/v1/<account>/<gateway-name>/...`, so any
+gateway on the account is reachable by naming it in the path — no new route,
+no `setup` re-run, no image rebuild:
+
+```
+http://127.0.0.1:8787/cloudflare/prod/anthropic/v1/messages
+http://127.0.0.1:8787/cloudflare/experiments/openai/chat/completions
+```
+
+All of them authenticate with the same `cf-aig-token`. Note that Cloudflare's
+`AI Gateway Read`/`Run`/`Edit` permissions **cannot be restricted to a single
+gateway** — the token is account-wide by construction, and Cloudflare's own
+guidance for isolation is separate accounts or a Worker-side binding. Budgets
+and logging are per-gateway in the dashboard, which is the usual reason to run
+several, but the *credential* does not narrow with them. If a gateway has
+provider keys stored via Bring Your Own Keys, this token can spend against
+those too.
+
+`gateway_id` in `/etc/agentbox/agentbox.json` is only the *default* — the one
+the image wires `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL` and Codex to. To point
+an agent elsewhere, override its base URL in the container; to change the
+default for new containers, edit `agentbox.json` and rebuild the image.
+
+This is deliberately **not** a security boundary. A container can reach any
+gateway on the account by changing its path, and the token could not be
+narrowed even if it could not. Compared with the earlier one-gateway-per-route
+design, the proxy no longer pins which gateway a container may use. If you
+need that back, the cheap option is a `path_regexp` allowlist on the segment
+after `/cloudflare` (e.g. `^/(prod|experiments)(/|$)`); the thorough option is
+separate Cloudflare accounts.
 
 ## Revoke / contain a container
 

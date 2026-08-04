@@ -10,6 +10,7 @@ import (
 
 	"agentbox/internal/credstore"
 	"agentbox/internal/fakebin"
+	"agentbox/internal/reconcile"
 )
 
 // run executes setup in prefix mode. PATH is emptied so LookPath("docker")
@@ -35,7 +36,7 @@ func TestFreshRunCreatesEverything(t *testing.T) {
 
 	checks := map[string]string{
 		"etc/agentbox/agentbox.json":                       `"account_id": "acct123"`,
-		"etc/agentbox/routes.json":                         `"prefix": "/anthropic"`,
+		"etc/agentbox/routes.json":                         `"prefix": "/cloudflare"`,
 		"etc/tmpfiles.d/agentbox.conf":                     "d /run/agentbox/containers 2775 caddy agentbox",
 		"etc/systemd/system/caddy.service.d/agentbox.conf": "--config /var/lib/agentbox/Caddyfile",
 		"usr/local/bin/agentbox":                           "",
@@ -171,6 +172,21 @@ func TestSecretsWireUpCredentialsAndCompanions(t *testing.T) {
 	for _, leak := range []string{"dummy-aig", "dummy-pat", want} {
 		if strings.Contains(string(manifest), leak) {
 			t.Errorf("manifest leaks secret material %q", leak)
+		}
+	}
+
+	// The drop-in setup writes must be parseable by the reconcile cross-check
+	// that gates fail-closed rendering. If these two drift, every credentialed
+	// route renders 503 forever with no error anywhere — so assert the
+	// contract directly rather than testing each side against its own fixture.
+	seen, err := reconcile.CredentialNamesInDropin(
+		filepath.Join(prefix, "etc/systemd/system/caddy.service.d/agentbox.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"cf-aig-token", "gh-pat", "gh-pat.basic"} {
+		if !seen[name] {
+			t.Errorf("reconcile cannot see credential %q in the drop-in setup wrote", name)
 		}
 	}
 

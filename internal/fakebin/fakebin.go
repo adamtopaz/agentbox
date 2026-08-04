@@ -127,7 +127,8 @@ func SystemdCreds(t *testing.T) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "systemd-creds")
 	// Sets its own PATH: callers null out PATH to keep LookPath deterministic.
-	// Format is a header line naming the credential, then the value, so the
+	// Format is a header line naming the credential, then base64 of the
+	// value, so tests can assert no plaintext is ever written to disk and the
 	// name binding can be checked exactly rather than by pattern.
 	script := `#!/bin/sh
 PATH=/usr/bin:/bin
@@ -142,14 +143,14 @@ for a in "$@"; do
 done
 set -- $args
 case "$op" in
-  encrypt) { printf 'ENC(%s)\n' "$name"; cat; } > "$2" ;;
+  encrypt) { printf 'ENC(%s)\n' "$name"; base64; } > "$2" ;;
   decrypt)
     read -r hdr < "$1"
     if [ "$hdr" != "ENC($name)" ]; then
       echo "credential name mismatch: file has $hdr, asked for $name" >&2
       exit 1
     fi
-    tail -n +2 "$1"
+    tail -n +2 "$1" | base64 -d
     ;;
   *) echo "unknown op $op" >&2; exit 2 ;;
 esac

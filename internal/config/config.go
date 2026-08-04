@@ -181,6 +181,11 @@ func checkValueCharset(v string) error {
 	return nil
 }
 
+// ValidSecretName reports whether a name can be referenced from a
+// {secret:NAME} template, which is the constraint a stored source secret has
+// to satisfy to be usable at all.
+func ValidSecretName(s string) bool { return secretRE.MatchString(s) }
+
 // ValuePart is one piece of a parsed inject value: exactly one of Literal,
 // Secret, or the Basic pair is set.
 type ValuePart struct {

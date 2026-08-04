@@ -14,6 +14,12 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 PROXY="http://127.0.0.1:8787"
+# Cloudflare AI Gateway is reached as /cloudflare/<gateway-name>/<provider>/...
+# so any gateway on the account is addressable; this is just the default one.
+# Fail loudly rather than baking a plausible-but-wrong gateway name: agents
+# would then get a Cloudflare 404 that looks like an API problem.
+: "${AGENTBOX_GATEWAY_ID:?not set — run \`agentbox setup\` before build-image}"
+GW="${PROXY}/cloudflare/${AGENTBOX_GATEWAY_ID}"
 # Same host-side proxy, reached as a unix socket (incus proxy device) for
 # clients that address real hostnames instead of a base URL.
 GH_SOCKET="/run/agentbox.sock"
@@ -70,9 +76,9 @@ echo "==> proxy wiring: environment"
 # Login shells (agentbox shell) read profile.d; PAM-less exec paths read
 # /etc/environment. Both are generated from the same list below.
 ENV_VARS=(
-    "ANTHROPIC_BASE_URL=${PROXY}/anthropic"
+    "ANTHROPIC_BASE_URL=${GW}/anthropic"
     "ANTHROPIC_API_KEY=agentbox-dummy"
-    "OPENAI_BASE_URL=${PROXY}/openai"
+    "OPENAI_BASE_URL=${GW}/openai"
     "OPENAI_API_KEY=agentbox-dummy"
     "CLOUDFLARE_ACCOUNT_ID=${AGENTBOX_ACCOUNT_ID:-}"
     "CLOUDFLARE_GATEWAY_ID=${AGENTBOX_GATEWAY_ID:-}"
@@ -128,7 +134,7 @@ model_provider = "agentbox"
 
 [model_providers.agentbox]
 name = "agentbox proxy"
-base_url = "${PROXY}/openai"
+base_url = "${GW}/openai"
 wire_api = "responses"
 env_key = "OPENAI_API_KEY"
 EOF

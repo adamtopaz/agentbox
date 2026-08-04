@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 import (
@@ -6,7 +8,7 @@ import (
 )
 
 // Terminal echo control, stdlib only (golang.org/x/term is not a dependency
-// we want for one prompt).
+// worth taking for one prompt).
 const (
 	tcGets = syscall.TCGETS
 	tcSets = syscall.TCSETS

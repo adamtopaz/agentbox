@@ -5,7 +5,8 @@ Incus containers. **No real credential ever exists inside a container** — not
 even a pseudo-token. Agents talk to `http://127.0.0.1:8787` inside their
 container; on the host, Caddy strips every auth header they send and injects
 the real one, per route, before forwarding upstream (Cloudflare AI Gateway for
-inference, GitHub for git).
+inference, GitHub for git). Any AI Gateway on the account is reachable as
+`/cloudflare/<gateway-name>/...`.
 
 ## How it works
 

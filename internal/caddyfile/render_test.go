@@ -229,7 +229,8 @@ func TestMissingSecretRendersUnavailable(t *testing.T) {
 	if !strings.Contains(got, `respond "route github-git unavailable: credential not installed" 503`) {
 		t.Error("route with a missing secret must fail closed with 503")
 	}
-	if strings.Contains(got, "gh-pat.basic}") {
+	// The disabled route must render the respond ALONE — no proxy behind it.
+	if strings.Contains(routeBlock(t, got, "/github-git"), "reverse_proxy") {
 		t.Error("missing-credential route still proxies with an empty {file.*} placeholder")
 	}
 	// The credentialed route is unaffected.

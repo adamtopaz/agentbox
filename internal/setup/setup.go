@@ -11,6 +11,7 @@ package setup
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -46,7 +47,12 @@ type Options struct {
 }
 
 type runner struct {
-	o        Options
+	o Options
+	// unusable holds credentials that are stored but do not decrypt. They are
+	// kept out of both the drop-in and the manifest: listing one would make
+	// systemd fail to activate caddy at all (decryption failure is fatal to
+	// unit activation), turning a degraded proxy into a dead one.
+	unusable map[string]bool
 	out      io.Writer
 	in       *bufio.Reader
 	warnings []string
@@ -72,6 +78,7 @@ func Run(o Options) error {
 		{"routes.json", r.ensureRoutes},
 		{"encrypt any plaintext secrets", r.migratePlaintextSecrets},
 		{"{basic:...} companion secrets", r.ensureBasicCompanions},
+		{"verify stored credentials", r.verifyStoredCredentials},
 		{"secrets manifest", r.ensureSecretsManifest},
 		{"tmpfiles.d", r.ensureTmpfiles},
 		{"caddy.service drop-in", r.ensureCaddyDropin},
@@ -420,9 +427,13 @@ func (r *runner) ensureBasicCompanions() error {
 		// handles a secret value, as root, in memory — never on disk.
 		val, err := store.Get(name)
 		if err != nil {
-			return err
+			// Do not abort: setup is the documented recovery command, and the
+			// remaining steps still produce a coherent config in which this
+			// secret's routes fail closed with 503.
+			r.warn("secret %q is stored but cannot be decrypted (%v); its routes will serve 503. Re-add it with: sudo agentbox add-secret %s", name, err, name)
+			continue
 		}
-		token := strings.TrimRight(string(val), "\r\n")
+		token := strings.TrimSpace(string(val))
 		if token == "" {
 			r.warn("secret %q is empty; its routes will proxy without a usable credential", name)
 		}
@@ -463,15 +474,14 @@ func (r *runner) migratePlaintextSecrets() error {
 		if err != nil {
 			return err
 		}
-		// {file.*} strips exactly one trailing newline; be stricter here so a
-		// pasted-in blank line cannot produce a malformed header later.
-		trimmed := strings.TrimRight(string(val), " \t\r\n")
-		if trimmed == "" {
+		// Trimming and charset validation live in credstore.Put, the single
+		// choke point both this and add-secret go through.
+		if len(bytes.TrimSpace(val)) == 0 {
 			r.warn("plaintext secret %q is empty; leaving it alone", name)
 			continue
 		}
-		if err := store.Put(name, []byte(trimmed)); err != nil {
-			return err
+		if err := store.Put(name, val); err != nil {
+			return fmt.Errorf("migrating %q (plaintext left in place): %w", name, err)
 		}
 		if err := os.Remove(filepath.Join(dir, name)); err != nil {
 			return err
@@ -485,14 +495,45 @@ func (r *runner) credStore() credstore.Store {
 	return credstore.Store{Dir: r.prefixed(paths.Secrets), Bin: r.o.CredsBin}
 }
 
+// verifyStoredCredentials decrypt-probes every stored credential once, so a
+// corrupt or unsealable one is excluded from the config rather than taking
+// caddy down on the next restart. Values are discarded immediately.
+func (r *runner) verifyStoredCredentials() error {
+	r.unusable = map[string]bool{}
+	store := r.credStore()
+	names, err := store.List()
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		if _, err := store.Get(name); err != nil {
+			r.unusable[name] = true
+			r.warn("credential %q is stored but does not decrypt (%v); excluding it so caddy can still start. Its routes serve 503 — re-add it with: sudo agentbox add-secret %s",
+				name, err, strings.TrimSuffix(name, ".basic"))
+		}
+	}
+	return nil
+}
+
+// usable reports whether a stored credential decrypted during this run.
+func (r *runner) usable(name string) bool {
+	return r.credStore().Has(name) && !r.unusable[name]
+}
+
 // ensureSecretsManifest records which secret names are installed, so the
 // non-root CLI (which cannot read /etc/agentbox/secrets, mode 0700 root) can
 // still render routes with missing credentials as 503 instead of proxying
 // unauthenticated. Names only — never values.
 func (r *runner) ensureSecretsManifest() error {
-	names, err := r.credStore().List()
+	all, err := r.credStore().List()
 	if err != nil {
 		return err
+	}
+	var names []string
+	for _, n := range all {
+		if !r.unusable[n] {
+			names = append(names, n)
+		}
 	}
 	sort.Strings(names)
 	content := "# Managed by agentbox setup — names of installed secrets, never values.\n"
@@ -535,6 +576,9 @@ func (r *runner) ensureCaddyDropin() error {
 		if !store.Has(name) {
 			r.warn("secret %q referenced by routes.json is not installed; its routes serve 503 until you run: sudo agentbox add-secret %s", name, name)
 			continue
+		}
+		if r.unusable[name] {
+			continue // already reported by verifyStoredCredentials
 		}
 		// Unprefixed path: this line goes into a real unit file. The Has()
 		// check above is what the test prefix root applies to.
