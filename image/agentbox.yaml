@@ -1,0 +1,215 @@
+# Incus instance configuration for the disposable agentbox image builder.
+# `agentbox image build` passes this file to:
+#
+#   incus init images:debian/13/cloud agentbox-build
+#
+# Cloud-init provisions the builder on first boot. The build orchestrator then
+# verifies the result, removes cloud-init and machine-specific state, stops the
+# instance, and publishes it as an Incus image.
+description: Disposable agentbox image builder
+profiles:
+  - default
+config:
+  user.agentbox-build: "true"
+  cloud-init.user-data: |
+    #cloud-config
+    package_update: true
+
+    users:
+      - name: agent
+        gecos: Agentbox coding agent
+        shell: /bin/bash
+        groups:
+          - sudo
+        sudo:
+          - "ALL=(ALL) NOPASSWD:ALL"
+        lock_passwd: true
+
+    packages:
+      - bash
+      - build-essential
+      - ca-certificates
+      - curl
+      - fd-find
+      - gh
+      - git
+      - gnupg
+      - jq
+      - locales
+      - openssh-client
+      - pkg-config
+      - python3
+      - python3-pip
+      - python3-venv
+      - ripgrep
+      - sudo
+      - unzip
+      - wget
+      - xz-utils
+
+    write_files:
+      - path: /etc/sudoers.d/agent
+        owner: root:root
+        permissions: "0440"
+        content: |
+          agent ALL=(ALL) NOPASSWD:ALL
+
+      - path: /etc/profile.d/agentbox.sh
+        owner: root:root
+        permissions: "0644"
+        content: |
+          # Non-secret defaults. Scope-specific URLs are written at create time.
+          export ANTHROPIC_API_KEY=agentbox-dummy
+          export OPENAI_API_KEY=agentbox-dummy
+          export GH_TOKEN=agentbox-dummy
+          export DISABLE_AUTOUPDATER=1
+          export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+          export GIT_TERMINAL_PROMPT=0
+
+      - path: /etc/environment
+        owner: root:root
+        permissions: "0644"
+        content: |
+          ANTHROPIC_API_KEY=agentbox-dummy
+          OPENAI_API_KEY=agentbox-dummy
+          GH_TOKEN=agentbox-dummy
+          DISABLE_AUTOUPDATER=1
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+          GIT_TERMINAL_PROMPT=0
+
+      - path: /etc/gitconfig
+        owner: root:root
+        permissions: "0644"
+        content: |
+          [url "http://127.0.0.1:8787/github-git/"]
+              insteadOf = https://github.com/
+              insteadOf = git@github.com:
+
+      - path: /home/agent/.config/gh/config.yml
+        owner: agent:agent
+        permissions: "0644"
+        defer: true
+        content: |
+          http_unix_socket: /run/agentbox.sock
+          git_protocol: https
+          prompt: enabled
+
+      - path: /root/.config/gh/config.yml
+        owner: root:root
+        permissions: "0644"
+        content: |
+          http_unix_socket: /run/agentbox.sock
+          git_protocol: https
+          prompt: enabled
+
+      - path: /home/agent/.claude.json
+        owner: agent:agent
+        permissions: "0644"
+        defer: true
+        content: |
+          {
+            "hasCompletedOnboarding": true,
+            "customApiKeyResponses": {
+              "approved": ["agentbox-dummy"],
+              "rejected": []
+            }
+          }
+
+      - path: /etc/agentbox-image
+        owner: root:root
+        permissions: "0644"
+        content: |
+          agentbox-base declarative Incus/cloud-init image
+          nodejs=24.19.0
+          npm=11.17.0
+          claude-code=2.1.220
+          codex=0.145.0
+          pi-coding-agent=0.82.1
+
+    runcmd:
+      - |
+        set -eu
+        sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+        locale-gen
+        update-locale LANG=en_US.UTF-8
+
+        # Debian 13 ships Node.js 20, but pi >=0.75 requires Node.js >=22.19.
+        # Install an exact Node.js 24 LTS release from the upstream binary
+        # distribution. Each supported architecture has a reviewed checksum;
+        # unsupported architectures fail instead of falling back unverified.
+        NODE_VERSION=24.19.0
+        case "$(dpkg --print-architecture)" in
+          amd64)
+            NODE_ARCH=x64
+            NODE_SHA256=14b342e71204f811bde6153be8e04b62aef63c236fef92b55f9c83154b409647
+            ;;
+          arm64)
+            NODE_ARCH=arm64
+            NODE_SHA256=01443c1e1a29e531ccad5a46fefa6df490d2189c49f7955904aecdbb0fe86fdc
+            ;;
+          ppc64el)
+            NODE_ARCH=ppc64le
+            NODE_SHA256=c510c6ce12f07010f771e6edb22a3fe23f4f2e6f40b1ffd4941aed0646a0d8b3
+            ;;
+          s390x)
+            NODE_ARCH=s390x
+            NODE_SHA256=a4792e65962ffa0af42627aacf1122a60c3c88dbf4e4184f06820d66f9da8ba4
+            ;;
+          *)
+            echo "no reviewed Node.js binary for architecture $(dpkg --print-architecture)" >&2
+            exit 1
+            ;;
+        esac
+        NODE_ARCHIVE="node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz"
+        NODE_PATH="/tmp/${NODE_ARCHIVE}"
+        curl --fail --show-error --location --proto '=https' --tlsv1.2 \
+          --output "$NODE_PATH" \
+          "https://nodejs.org/dist/v${NODE_VERSION}/${NODE_ARCHIVE}"
+        printf '%s  %s\n' "$NODE_SHA256" "$NODE_PATH" | sha256sum --check -
+        tar --extract --xz --file "$NODE_PATH" --directory /usr/local \
+          --strip-components=1 --no-same-owner
+        rm -f "$NODE_PATH"
+        test "$(node --version)" = "v${NODE_VERSION}"
+        test "$(npm --version)" = "11.17.0"
+
+        # Debian names the binary fdfind to avoid a package-name collision;
+        # pi expects the upstream command name and otherwise downloads its own
+        # mutable copy on first launch.
+        ln -sfn /usr/bin/fdfind /usr/local/bin/fd
+        fd --version
+
+        # Deliberately pinned. Update these versions in one reviewed change.
+        npm install --global \
+          @anthropic-ai/claude-code@2.1.220 \
+          @openai/codex@0.145.0 \
+          @earendil-works/pi-coding-agent@0.82.1
+
+        install -d -o agent -g agent -m 0755 \
+          /home/agent/work \
+          /home/agent/.config/gh \
+          /home/agent/.codex \
+          /home/agent/.pi/agent
+        chown -R agent:agent /home/agent
+        chmod 0755 \
+          /home/agent \
+          /home/agent/work \
+          /home/agent/.config \
+          /home/agent/.config/gh \
+          /home/agent/.codex \
+          /home/agent/.pi \
+          /home/agent/.pi/agent
+        visudo -c
+
+        for command in claude codex fd pi; do
+          command -v "$command" >/dev/null 2>&1 || {
+            echo "missing expected agent binary: $command" >&2
+            exit 1
+          }
+        done
+
+        npm list --global --depth=0 | grep -F '@anthropic-ai/claude-code@2.1.220'
+        npm list --global --depth=0 | grep -F '@openai/codex@0.145.0'
+        npm list --global --depth=0 | grep -F '@earendil-works/pi-coding-agent@0.82.1'
+        claude --version | grep -F '2.1.220'
+        codex --version | grep -F '0.145.0'
+        pi --version | grep -F '0.82.1'

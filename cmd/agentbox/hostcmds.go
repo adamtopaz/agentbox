@@ -1,83 +1,47 @@
 package main
 
 import (
+	"errors"
 	"flag"
-	"fmt"
 	"os"
-	"strings"
 
-	"agentbox/image"
-	"agentbox/internal/buildimage"
-	"agentbox/internal/lifecycle"
-	"agentbox/internal/setup"
+	"agentbox/internal/hostsetup"
+	"agentbox/internal/imagebuild"
+	"agentbox/internal/incus"
 )
 
-func cmdSetup(args []string) int {
+func cmdSetup(args []string) error {
 	fs := flag.NewFlagSet("setup", flag.ContinueOnError)
-	account := fs.String("account-id", "", "Cloudflare account ID (prompted if absent)")
-	gateways := fs.String("gateways", "", "comma-separated AI Gateway names (prompted if absent)")
-	adminUser := fs.String("admin-user", "", "user to add to the agentbox group (default $SUDO_USER)")
-	noStart := fs.Bool("no-start", false, "prepare everything but do not (re)start services")
-	prefix := fs.String("prefix", "", "root all paths here and skip system mutations (testing)")
-	caddyBin := fs.String("caddy-bin", "", "caddy binary (default caddy)")
-	if _, ok := parseArgs(fs, args); !ok {
-		return 2
+	admin := fs.String("admin-user", "", "user to add to agentbox and incus-admin groups (default $SUDO_USER)")
+	daemon := fs.String("daemon-binary", "", "agentboxd binary (default: sibling of agentbox)")
+	noStart := fs.Bool("no-start", false, "install without restarting agentboxd")
+	prefix := fs.String("prefix", "", "root filesystem writes under this test directory")
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
-	err := setup.Run(setup.Options{
-		Prefix:    *prefix,
-		AccountID: *account,
-		Gateways:  splitList(*gateways),
-		AdminUser: *adminUser,
-		NoStart:   *noStart,
-		CaddyBin:  *caddyBin,
-		Out:       os.Stdout,
+	if fs.NArg() != 0 {
+		return errors.New("usage: agentbox setup [--admin-user USER] [--daemon-binary PATH] [--no-start]")
+	}
+	return hostsetup.Run(hostsetup.Options{AdminUser: *admin, DaemonBinary: *daemon, NoStart: *noStart, Prefix: *prefix, Out: os.Stdout})
+}
+
+func cmdImage(args []string) error {
+	if len(args) == 0 || args[0] != "build" {
+		return errors.New("usage: agentbox image build [--alias NAME] [--source IMAGE] [--keep-builder]")
+	}
+	fs := flag.NewFlagSet("image build", flag.ContinueOnError)
+	alias := fs.String("alias", incus.DefaultImage, "Incus image alias")
+	source := fs.String("source", imagebuild.DefaultBase, "cloud-init-enabled Incus base image")
+	incusBin := fs.String("incus-bin", "incus", "Incus CLI")
+	keep := fs.Bool("keep-builder", false, "keep the disposable builder instance")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("usage: agentbox image build [--alias NAME] [--source IMAGE] [--keep-builder]")
+	}
+	return imagebuild.Run(imagebuild.Options{
+		Alias: *alias, Source: *source, Keep: *keep,
+		Incus: incus.Client{Bin: *incusBin, Out: os.Stdout, Err: os.Stderr}, Out: os.Stdout,
 	})
-	if err != nil {
-		return fail(err)
-	}
-	return 0
-}
-
-// splitList parses a comma-separated flag into a trimmed, non-empty list.
-func splitList(v string) []string {
-	var out []string
-	for _, p := range strings.Split(v, ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-func cmdSetupFirewall(args []string) int {
-	if len(args) != 0 {
-		fmt.Fprintln(os.Stderr, "usage: agentbox setup-firewall")
-		return 2
-	}
-	if err := setup.ApplyFirewallRules(os.Stdout); err != nil {
-		return fail(err)
-	}
-	return 0
-}
-
-func cmdBuildImage(args []string) int {
-	fs := flag.NewFlagSet("build-image", flag.ContinueOnError)
-	provision := fs.String("provision", "", "provision script overriding the embedded image/provision.sh")
-	keep := fs.Bool("keep-build", false, "keep the build container after publishing")
-	alias := fs.String("alias", lifecycle.Image, "image alias to publish")
-	if _, ok := parseArgs(fs, args); !ok {
-		return 2
-	}
-	err := buildimage.Run(buildimage.Options{
-		Incus:         lifecycle.Incus{},
-		Alias:         *alias,
-		ProvisionPath: *provision,
-		Provision:     image.Provision,
-		KeepBuild:     *keep,
-		Out:           os.Stdout,
-	})
-	if err != nil {
-		return fail(err)
-	}
-	return 0
 }

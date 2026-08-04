@@ -1,9 +1,8 @@
-// Package image embeds the container provisioning script. go:embed cannot
-// reach across package directories, so the asset directory is itself a tiny
-// package.
+// Package image embeds the declarative Incus/cloud-init builder configuration
+// so an installed agentbox CLI can build the image without locating sources.
 package image
 
 import _ "embed"
 
-//go:embed provision.sh
-var Provision []byte
+//go:embed agentbox.yaml
+var Definition []byte

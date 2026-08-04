@@ -1,174 +1,108 @@
-// Command agentbox manages credential-isolating Incus sandboxes for coding
-// agents. Caddy is the data plane (one unix-socket site per container,
-// header stripping + credential injection); this CLI renders Caddy's config
-// and orchestrates incus. There is no daemon: every mutating command runs one
-// reconcile cycle.
+// Command agentbox is the operator-facing client for agentboxd and the Incus
+// lifecycle adapter. All live route and key changes go through the daemon's
+// typed control service.
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
+	"os/signal"
+	"syscall"
 
-	"agentbox/internal/caddyctl"
-	"agentbox/internal/lifecycle"
+	"agentbox/internal/control"
 	"agentbox/internal/paths"
-	"agentbox/internal/reconcile"
-	"agentbox/internal/state"
 )
 
-const usage = `agentbox — credential-isolating sandboxes for coding agents
+const usage = `agentbox — credential-isolating coding-agent containers
 
-usage: agentbox <command> [flags] [args]
+usage: agentbox [--socket PATH] <command> ...
 
 host:
-  setup                  one-time host setup (root); re-run after adding secrets
-  add-secret <name>      store a credential, encrypted at rest (root); the
-                         value is read without echo and never written to disk
-                         in plaintext. Run setup afterwards to load it.
-  build-image            (re)build the agentbox-base container image
+  setup                         install agentboxd and its systemd unit
+  image build                   provision and publish the declarative Incus image
+  status                        show daemon health
+
+generic control plane:
+  route list
+  route put <route.json>
+  route replace <routes.json>
+  route delete <name>
+  key list
+  key set <name>                read value hidden or from stdin
+  key delete <name>
+
+optional profiles:
+  profile apply github
+  profile apply cloudflare --account-id ID --gateways prod,test
 
 containers:
-  create --gateway <gw> <name>
-                         new wired container (proxy at 127.0.0.1:8787 inside).
-                         --gateway is required and pins the container: its
-                         site carries only that gateway's route
-  shell <name>           login shell as user 'agent' inside the container
-  list                   containers with incus/socket/blocked status
-  destroy <name>         delete container + its proxy config
-
-proxy:
-  proxy status           same view as list, plus creation times
-  proxy routes           route table (names, prefixes, upstreams)
-  proxy reload           force one reconcile cycle (render -> validate -> reload)
-  proxy block [--hard] <name>
-                         403 the container's site; --hard also severs existing
-                         connections by removing its incus proxy device
-  proxy unblock <name>   restore routes (and the proxy device if missing)
-
-Proxy access logs: journalctl -u caddy (metadata only by construction).
+  container create --scope SCOPE [--configure cloudflare|none] <name>
+  container list
+  container shell <name>
+  container destroy <name>
+  container block [--hard] <name>
+  container unblock <name>
 `
 
+var version = "dev"
+
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprint(os.Stderr, usage)
-		os.Exit(2)
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
 	}
-	var code int
-	switch os.Args[1] {
+}
+
+func run() error {
+	global := flag.NewFlagSet("agentbox", flag.ContinueOnError)
+	global.SetOutput(os.Stderr)
+	socket := global.String("socket", envOr("AGENTBOX_SOCKET", paths.ControlSocket), "agentboxd control socket")
+	showVersion := global.Bool("version", false, "print version")
+	global.Usage = func() { fmt.Fprint(global.Output(), usage) }
+	if err := global.Parse(os.Args[1:]); err != nil {
+		return err
+	}
+	if *showVersion {
+		fmt.Println("agentbox", version)
+		return nil
+	}
+	args := global.Args()
+	if len(args) == 0 || args[0] == "help" {
+		global.Usage()
+		if len(args) == 0 {
+			return flag.ErrHelp
+		}
+		return nil
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	client := control.NewClient(*socket)
+	switch args[0] {
+	case "status":
+		return cmdStatus(ctx, client, args[1:])
+	case "route":
+		return cmdRoute(ctx, client, args[1:])
+	case "key":
+		return cmdKey(ctx, client, args[1:])
+	case "profile":
+		return cmdProfile(ctx, client, args[1:])
+	case "container":
+		return cmdContainer(ctx, client, args[1:])
 	case "setup":
-		code = cmdSetup(os.Args[2:])
-	case "add-secret":
-		code = cmdAddSecret(os.Args[2:])
-	case "setup-firewall": // hidden: used by agentbox-firewall.service
-		code = cmdSetupFirewall(os.Args[2:])
-	case "build-image":
-		code = cmdBuildImage(os.Args[2:])
-	case "create":
-		code = cmdCreate(os.Args[2:])
-	case "shell":
-		code = cmdShell(os.Args[2:])
-	case "list":
-		code = cmdList(os.Args[2:])
-	case "destroy":
-		code = cmdDestroy(os.Args[2:])
-	case "proxy":
-		code = cmdProxy(os.Args[2:])
-	case "debug-echo": // hidden: e2e test upstream
-		code = cmdDebugEcho(os.Args[2:])
-	case "help", "-h", "--help":
-		fmt.Print(usage)
+		return cmdSetup(args[1:])
+	case "image":
+		return cmdImage(args[1:])
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", os.Args[1], usage)
-		code = 2
-	}
-	os.Exit(code)
-}
-
-func fail(err error) int {
-	fmt.Fprintln(os.Stderr, "error:", err)
-	return 1
-}
-
-// commonFlags are shared by every command that touches the proxy config.
-type commonFlags struct {
-	routes    string
-	stateBase string
-	runDir    string
-	caddyfile string
-	credsDir  string
-	manifest  string
-	dropin    string
-	caddyBin  string
-	admin     string
-}
-
-func (c *commonFlags) register(fs *flag.FlagSet) {
-	fs.StringVar(&c.routes, "routes", paths.Routes, "routes.json path")
-	fs.StringVar(&c.stateBase, "state-dir", paths.StateBase, "state base directory")
-	fs.StringVar(&c.runDir, "run-dir", paths.RunDir, "runtime dir (sockets under <run-dir>/containers)")
-	fs.StringVar(&c.caddyfile, "caddyfile", "", "rendered Caddyfile path (default <state-dir>/Caddyfile)")
-	fs.StringVar(&c.credsDir, "credentials-dir", paths.CredentialsDir, "credentials dir rendered into {file.*} placeholders")
-	fs.StringVar(&c.manifest, "secrets-manifest", paths.SecretsManifest, "list of installed secret names (routes missing one render as 503)")
-	fs.StringVar(&c.dropin, "caddy-dropin", paths.CaddyDropin, "caddy.service drop-in, cross-checked for LoadCredential lines")
-	fs.StringVar(&c.caddyBin, "caddy-bin", "caddy", "caddy binary")
-	fs.StringVar(&c.admin, "caddy-admin", caddyctl.DefaultAdminAddr, "caddy admin endpoint")
-}
-
-func (c *commonFlags) caddyfilePath() string {
-	if c.caddyfile != "" {
-		return c.caddyfile
-	}
-	return filepath.Join(c.stateBase, "Caddyfile")
-}
-
-func (c *commonFlags) socketDir() string {
-	return filepath.Join(c.runDir, "containers")
-}
-
-func (c *commonFlags) params() reconcile.Params {
-	return reconcile.Params{
-		RoutesPath:      c.routes,
-		StateBase:       c.stateBase,
-		CaddyfilePath:   c.caddyfilePath(),
-		SocketDir:       c.socketDir(),
-		CredentialsDir:  c.credsDir,
-		SecretsManifest: c.manifest,
-		CaddyDropin:     c.dropin,
-		Caddy:           caddyctl.Client{Bin: c.caddyBin, AdminAddr: c.admin},
+		return fmt.Errorf("unknown command %q\n\n%s", args[0], usage)
 	}
 }
 
-func (c *commonFlags) reconcileOnce() error {
-	_, err := reconcile.Run(c.params())
-	return err
-}
-
-func (c *commonFlags) manager() (*lifecycle.Manager, error) {
-	states, err := state.Open(c.stateBase)
-	if err != nil {
-		return nil, err
+func envOr(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
 	}
-	// The manager holds the lock across each whole command, so its reconcile
-	// hook must be the variant that does not take it again.
-	return &lifecycle.Manager{
-		Incus:     lifecycle.Incus{},
-		States:    states,
-		SocketDir: c.socketDir(),
-		Lock:      func() (func(), error) { return reconcile.Lock(c.stateBase) },
-		Reconcile: func() error {
-			_, err := reconcile.RunLocked(c.params())
-			return err
-		},
-	}, nil
-}
-
-// parseArgs runs the FlagSet and returns the positional args, exiting with
-// usage code 2 on error (flag package already printed the message).
-func parseArgs(fs *flag.FlagSet, args []string) ([]string, bool) {
-	if err := fs.Parse(args); err != nil {
-		return nil, false
-	}
-	return fs.Args(), true
+	return fallback
 }
