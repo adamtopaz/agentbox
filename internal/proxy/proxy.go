@@ -5,15 +5,11 @@ package proxy
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -29,8 +25,7 @@ import (
 type SnapshotSource interface{ Snapshot() *engine.Snapshot }
 
 const (
-	defaultMaxConnections          = 128
-	maxTransformedRequestBodyBytes = 64 << 20
+	defaultMaxConnections = 128
 )
 
 type Server struct {
@@ -84,14 +79,6 @@ func (s *Server) Handler(containerName string) http.Handler {
 			http.Redirect(w, r, location, status)
 			return
 		}
-		if route.RequestJSON != nil {
-			if transformErr := transformJSONRequest(r, *route.RequestJSON, maxTransformedRequestBodyBytes); transformErr != nil {
-				status = transformErr.status
-				http.Error(w, transformErr.message, status)
-				return
-			}
-		}
-
 		headers := make(http.Header, len(route.Headers))
 		for _, h := range route.Headers {
 			value, err := h.Template.Render(r.Context(), containerName, s.Materials)
@@ -112,9 +99,6 @@ func (s *Server) Handler(containerName string) http.Handler {
 				pr.Out.URL.Host = route.Target.Host
 				pr.Out.URL.Path = joinURLPath(route.Target.Path, routedPath)
 				pr.Out.URL.RawPath = ""
-				if route.DropQuery {
-					pr.Out.URL.RawQuery = ""
-				}
 				pr.Out.Host = route.Target.Host
 				sanitizeRequestHeaders(pr.Out.Header)
 				for name, values := range headers {
@@ -140,207 +124,6 @@ func (s *Server) Handler(containerName string) http.Handler {
 			status = rw.status
 		}
 	})
-}
-
-type requestTransformError struct {
-	status  int
-	message string
-}
-
-func transformJSONRequest(r *http.Request, transform domain.JSONTransform, maxBytes int64) *requestTransformError {
-	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	if err != nil || (mediaType != "application/json" && !strings.HasSuffix(mediaType, "+json")) {
-		return &requestTransformError{status: http.StatusUnsupportedMediaType, message: "route requires a JSON request body"}
-	}
-	if encoding := strings.TrimSpace(r.Header.Get("Content-Encoding")); encoding != "" && !strings.EqualFold(encoding, "identity") {
-		return &requestTransformError{status: http.StatusUnsupportedMediaType, message: "route cannot transform an encoded request body"}
-	}
-	if r.Body == nil || r.Body == http.NoBody {
-		return &requestTransformError{status: http.StatusBadRequest, message: "route requires a JSON request body"}
-	}
-
-	original := r.Body
-	data, err := io.ReadAll(io.LimitReader(original, maxBytes+1))
-	_ = original.Close()
-	if err != nil {
-		return &requestTransformError{status: http.StatusBadRequest, message: "could not read JSON request body"}
-	}
-	if int64(len(data)) > maxBytes {
-		return &requestTransformError{status: http.StatusRequestEntityTooLarge, message: "JSON request body exceeds route transform limit"}
-	}
-
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	var object map[string]json.RawMessage
-	if err := decoder.Decode(&object); err != nil || object == nil {
-		return &requestTransformError{status: http.StatusBadRequest, message: "route requires a JSON object request body"}
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		return &requestTransformError{status: http.StatusBadRequest, message: "route requires one JSON object request body"}
-	}
-
-	for _, operation := range transform.JoinStringArrays {
-		raw, ok := object[operation.Field]
-		if !ok {
-			if operation.Optional {
-				continue
-			}
-			return &requestTransformError{status: http.StatusBadRequest, message: fmt.Sprintf("JSON request field %q is required", operation.Field)}
-		}
-		var elements []json.RawMessage
-		if err := json.Unmarshal(raw, &elements); err != nil || elements == nil {
-			return &requestTransformError{status: http.StatusBadRequest, message: fmt.Sprintf("JSON request field %q must be an array", operation.Field)}
-		}
-		parts := make([]string, 0, len(elements))
-		for _, element := range elements {
-			var item map[string]json.RawMessage
-			if err := json.Unmarshal(element, &item); err != nil || item == nil {
-				return &requestTransformError{status: http.StatusBadRequest, message: fmt.Sprintf("JSON request field %q must contain objects", operation.Field)}
-			}
-			rawValue, ok := item[operation.ElementField]
-			if !ok {
-				return &requestTransformError{status: http.StatusBadRequest, message: fmt.Sprintf("objects in JSON request field %q require string field %q", operation.Field, operation.ElementField)}
-			}
-			var value string
-			if err := json.Unmarshal(rawValue, &value); err != nil {
-				return &requestTransformError{status: http.StatusBadRequest, message: fmt.Sprintf("objects in JSON request field %q require string field %q", operation.Field, operation.ElementField)}
-			}
-			parts = append(parts, value)
-		}
-		joined, err := json.Marshal(strings.Join(parts, operation.Separator))
-		if err != nil {
-			return &requestTransformError{status: http.StatusBadRequest, message: "could not transform JSON request body"}
-		}
-		object[operation.Field] = joined
-	}
-
-	for _, operation := range transform.HoistArrayObjectStrings {
-		raw, ok := object[operation.SourceField]
-		if !ok {
-			return &requestTransformError{status: http.StatusBadRequest, message: fmt.Sprintf("JSON request field %q is required", operation.SourceField)}
-		}
-		var elements []json.RawMessage
-		if err := json.Unmarshal(raw, &elements); err != nil || elements == nil {
-			return &requestTransformError{status: http.StatusBadRequest, message: fmt.Sprintf("JSON request field %q must be an array", operation.SourceField)}
-		}
-		remaining := make([]json.RawMessage, 0, len(elements))
-		var hoisted []string
-		for _, element := range elements {
-			var item map[string]json.RawMessage
-			if err := json.Unmarshal(element, &item); err != nil || item == nil {
-				return &requestTransformError{status: http.StatusBadRequest, message: fmt.Sprintf("JSON request field %q must contain objects", operation.SourceField)}
-			}
-			rawMatch, ok := item[operation.MatchField]
-			if !ok {
-				return &requestTransformError{status: http.StatusBadRequest, message: fmt.Sprintf("objects in JSON request field %q require string field %q", operation.SourceField, operation.MatchField)}
-			}
-			var match string
-			if err := json.Unmarshal(rawMatch, &match); err != nil {
-				return &requestTransformError{status: http.StatusBadRequest, message: fmt.Sprintf("objects in JSON request field %q require string field %q", operation.SourceField, operation.MatchField)}
-			}
-			if match != operation.MatchValue {
-				remaining = append(remaining, element)
-				continue
-			}
-			rawValue, ok := item[operation.ValueField]
-			if !ok {
-				return &requestTransformError{status: http.StatusBadRequest, message: fmt.Sprintf("matching objects in JSON request field %q require field %q", operation.SourceField, operation.ValueField)}
-			}
-			parts, err := jsonStringOrObjectArray(rawValue, operation.ElementField)
-			if err != nil {
-				return &requestTransformError{status: http.StatusBadRequest, message: fmt.Sprintf("field %q in matching objects in JSON request field %q must be a string or an array of objects with string field %q", operation.ValueField, operation.SourceField, operation.ElementField)}
-			}
-			hoisted = append(hoisted, parts...)
-		}
-		encodedRemaining, err := json.Marshal(remaining)
-		if err != nil {
-			return &requestTransformError{status: http.StatusBadRequest, message: "could not transform JSON request body"}
-		}
-		object[operation.SourceField] = encodedRemaining
-		if len(hoisted) != 0 {
-			var target string
-			if rawTarget, exists := object[operation.TargetField]; exists {
-				if err := json.Unmarshal(rawTarget, &target); err != nil {
-					return &requestTransformError{status: http.StatusBadRequest, message: fmt.Sprintf("JSON request field %q must be a string", operation.TargetField)}
-				}
-			}
-			if target != "" {
-				target += operation.Separator
-			}
-			target += strings.Join(hoisted, operation.Separator)
-			encodedTarget, err := json.Marshal(target)
-			if err != nil {
-				return &requestTransformError{status: http.StatusBadRequest, message: "could not transform JSON request body"}
-			}
-			object[operation.TargetField] = encodedTarget
-		}
-	}
-
-	for _, operation := range transform.StringPrefixes {
-		raw, ok := object[operation.Field]
-		if !ok {
-			return &requestTransformError{status: http.StatusBadRequest, message: fmt.Sprintf("JSON request field %q is required", operation.Field)}
-		}
-		var value string
-		if err := json.Unmarshal(raw, &value); err != nil {
-			return &requestTransformError{status: http.StatusBadRequest, message: fmt.Sprintf("JSON request field %q must be a string", operation.Field)}
-		}
-		if !strings.HasPrefix(value, operation.Prefix) {
-			value = operation.Prefix + value
-		}
-		encoded, err := json.Marshal(value)
-		if err != nil {
-			return &requestTransformError{status: http.StatusBadRequest, message: "could not transform JSON request body"}
-		}
-		object[operation.Field] = encoded
-	}
-	for _, field := range transform.RemoveFields {
-		delete(object, field)
-	}
-
-	rewritten, err := json.Marshal(object)
-	if err != nil {
-		return &requestTransformError{status: http.StatusBadRequest, message: "could not transform JSON request body"}
-	}
-	if int64(len(rewritten)) > maxBytes {
-		return &requestTransformError{status: http.StatusRequestEntityTooLarge, message: "transformed JSON request body exceeds route transform limit"}
-	}
-	r.Body = io.NopCloser(bytes.NewReader(rewritten))
-	r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(rewritten)), nil }
-	r.ContentLength = int64(len(rewritten))
-	r.TransferEncoding = nil
-	r.Trailer = nil
-	r.Header.Set("Content-Length", fmt.Sprint(len(rewritten)))
-	r.Header.Del("Content-Encoding")
-	return nil
-}
-
-func jsonStringOrObjectArray(raw json.RawMessage, elementField string) ([]string, error) {
-	var direct string
-	if err := json.Unmarshal(raw, &direct); err == nil {
-		return []string{direct}, nil
-	}
-	var elements []json.RawMessage
-	if err := json.Unmarshal(raw, &elements); err != nil || elements == nil {
-		return nil, errors.New("not a string or array")
-	}
-	parts := make([]string, 0, len(elements))
-	for _, element := range elements {
-		var item map[string]json.RawMessage
-		if err := json.Unmarshal(element, &item); err != nil || item == nil {
-			return nil, errors.New("array element is not an object")
-		}
-		rawValue, ok := item[elementField]
-		if !ok {
-			return nil, errors.New("array element field is missing")
-		}
-		var value string
-		if err := json.Unmarshal(rawValue, &value); err != nil {
-			return nil, errors.New("array element field is not a string")
-		}
-		parts = append(parts, value)
-	}
-	return parts, nil
 }
 
 func (s *Server) logger() *slog.Logger {
@@ -379,14 +162,9 @@ func sanitizeRequestHeaders(h http.Header) {
 		"Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key",
 		"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto",
 		"X-Forwarded-Port", "X-Real-Ip", "Cf-Access-Client-Id", "Cf-Access-Client-Secret",
+		"Cf-Aig-Authorization",
 	} {
 		h.Del(name)
-	}
-	for name := range h {
-		lower := strings.ToLower(name)
-		if strings.HasPrefix(lower, "cf-aig-") {
-			h.Del(name)
-		}
 	}
 	// A nil value tells ReverseProxy not to synthesize X-Forwarded-For.
 	h["X-Forwarded-For"] = nil

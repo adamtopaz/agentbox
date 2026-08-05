@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	StateVersion   = 1
+	StateVersion   = 2
 	UniversalScope = "*"
 )
 
@@ -25,73 +25,24 @@ var (
 	keyRE       = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{0,63}$`)
 	hostRE      = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$`)
 	headerRE    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]*$`)
-	jsonFieldRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]{0,63}$`)
 	basicUserRE = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 )
 
 // Route describes one reverse-proxy rule. Scope is an arbitrary isolation
 // label; a listener sees routes in its own scope plus routes in "*".
 type Route struct {
-	Name        string         `json:"name"`
-	Scope       string         `json:"scope"`
-	Match       Match          `json:"match"`
-	Upstream    string         `json:"upstream"`
-	StripPrefix bool           `json:"strip_prefix,omitempty"`
-	DropQuery   bool           `json:"drop_query,omitempty"`
-	PathMap     []PathRewrite  `json:"path_map,omitempty"`
-	RequestJSON *JSONTransform `json:"request_json,omitempty"`
-	SetHeaders  []HeaderValue  `json:"set_headers,omitempty"`
+	Name        string        `json:"name"`
+	Scope       string        `json:"scope"`
+	Match       Match         `json:"match"`
+	Upstream    string        `json:"upstream"`
+	StripPrefix bool          `json:"strip_prefix,omitempty"`
+	SetHeaders  []HeaderValue `json:"set_headers,omitempty"`
 }
 
 // Match selects either an exact Host or a path prefix. Exactly one is set.
 type Match struct {
 	Host       string `json:"host,omitempty"`
 	PathPrefix string `json:"path_prefix,omitempty"`
-}
-
-// PathRewrite maps one exact post-prefix path to a literal target path.
-type PathRewrite struct {
-	Path string `json:"path"`
-	To   string `json:"to"`
-}
-
-// JSONTransform applies bounded, transport-level rewrites to top-level JSON
-// string fields before a request is sent upstream. Prefixes are idempotent.
-// Provider profiles compose this generic primitive instead of teaching the
-// proxy about provider-specific model names.
-type JSONTransform struct {
-	JoinStringArrays        []JSONArrayStringJoin        `json:"join_string_arrays,omitempty"`
-	HoistArrayObjectStrings []JSONArrayObjectStringHoist `json:"hoist_array_object_strings,omitempty"`
-	StringPrefixes          []JSONStringPrefix           `json:"string_prefixes,omitempty"`
-	RemoveFields            []string                     `json:"remove_fields,omitempty"`
-}
-
-// JSONArrayStringJoin replaces a top-level array with a string formed from
-// one string field in each object element, preserving element order.
-type JSONArrayStringJoin struct {
-	Field        string `json:"field"`
-	ElementField string `json:"element_field"`
-	Separator    string `json:"separator,omitempty"`
-	Optional     bool   `json:"optional,omitempty"`
-}
-
-// JSONArrayObjectStringHoist removes objects matching one string field from a
-// top-level array and appends text from those objects to a top-level string.
-// ValueField may itself be a string or an array of objects whose ElementField
-// values are strings.
-type JSONArrayObjectStringHoist struct {
-	SourceField  string `json:"source_field"`
-	MatchField   string `json:"match_field"`
-	MatchValue   string `json:"match_value"`
-	ValueField   string `json:"value_field"`
-	ElementField string `json:"element_field"`
-	TargetField  string `json:"target_field"`
-	Separator    string `json:"separator,omitempty"`
-}
-
-type JSONStringPrefix struct {
-	Field  string `json:"field"`
-	Prefix string `json:"prefix"`
 }
 
 // HeaderValue sets a request header after agent-supplied credentials have
@@ -285,9 +236,6 @@ func ValidateRoute(r Route) error {
 		if r.StripPrefix {
 			return errors.New("strip_prefix is only valid for path-prefix routes")
 		}
-		if len(r.PathMap) != 0 {
-			return errors.New("path_map is only valid for path-prefix routes")
-		}
 		if !hostRE.MatchString(strings.ToLower(r.Match.Host)) || strings.Contains(r.Match.Host, ":") {
 			return fmt.Errorf("invalid host %q", r.Match.Host)
 		}
@@ -303,116 +251,6 @@ func ValidateRoute(r Route) error {
 	if u.Path != "" {
 		if err := validatePath(u.Path, "upstream path"); err != nil {
 			return err
-		}
-	}
-
-	mapped := map[string]bool{}
-	for _, m := range r.PathMap {
-		if err := validatePath(m.Path, "path_map path"); err != nil {
-			return err
-		}
-		if err := validatePath(m.To, "path_map target"); err != nil {
-			return err
-		}
-		if mapped[m.Path] {
-			return fmt.Errorf("duplicate path_map path %q", m.Path)
-		}
-		mapped[m.Path] = true
-	}
-	for _, m := range r.PathMap {
-		if mapped[m.To] {
-			return fmt.Errorf("path_map target %q is also a source path", m.To)
-		}
-	}
-
-	if r.RequestJSON != nil {
-		operations := len(r.RequestJSON.JoinStringArrays) + len(r.RequestJSON.HoistArrayObjectStrings) + len(r.RequestJSON.StringPrefixes) + len(r.RequestJSON.RemoveFields)
-		if operations == 0 {
-			return errors.New("request_json must contain at least one operation")
-		}
-		if operations > 16 {
-			return errors.New("request_json exceeds 16 operations")
-		}
-		fields := map[string]bool{}
-		for _, join := range r.RequestJSON.JoinStringArrays {
-			if !jsonFieldRE.MatchString(join.Field) {
-				return fmt.Errorf("invalid request_json field %q", join.Field)
-			}
-			if fields[join.Field] {
-				return fmt.Errorf("request_json field %q is transformed more than once", join.Field)
-			}
-			fields[join.Field] = true
-			if !jsonFieldRE.MatchString(join.ElementField) {
-				return fmt.Errorf("invalid request_json element field %q", join.ElementField)
-			}
-			if err := validateJSONSeparator(join.Separator, join.Field); err != nil {
-				return err
-			}
-		}
-		for _, hoist := range r.RequestJSON.HoistArrayObjectStrings {
-			if !jsonFieldRE.MatchString(hoist.SourceField) {
-				return fmt.Errorf("invalid request_json source field %q", hoist.SourceField)
-			}
-			if fields[hoist.SourceField] {
-				return fmt.Errorf("request_json field %q is transformed more than once", hoist.SourceField)
-			}
-			fields[hoist.SourceField] = true
-			for _, candidate := range []struct{ label, field string }{
-				{label: "match", field: hoist.MatchField},
-				{label: "value", field: hoist.ValueField},
-				{label: "element", field: hoist.ElementField},
-				{label: "target", field: hoist.TargetField},
-			} {
-				label, field := candidate.label, candidate.field
-				if !jsonFieldRE.MatchString(field) {
-					return fmt.Errorf("invalid request_json %s field %q", label, field)
-				}
-			}
-			if hoist.TargetField == hoist.SourceField {
-				return fmt.Errorf("request_json source and target field %q must differ", hoist.SourceField)
-			}
-			if hoist.MatchValue == "" || len(hoist.MatchValue) > 128 {
-				return fmt.Errorf("request_json match value for field %q must contain 1 to 128 bytes", hoist.SourceField)
-			}
-			for _, b := range []byte(hoist.MatchValue) {
-				if b < 0x20 || b > 0x7e {
-					return fmt.Errorf("request_json match value for field %q contains a non-printable byte", hoist.SourceField)
-				}
-			}
-			if err := validateJSONSeparator(hoist.Separator, hoist.SourceField); err != nil {
-				return err
-			}
-		}
-		for _, prefix := range r.RequestJSON.StringPrefixes {
-			if !jsonFieldRE.MatchString(prefix.Field) {
-				return fmt.Errorf("invalid request_json field %q", prefix.Field)
-			}
-			if fields[prefix.Field] {
-				return fmt.Errorf("request_json field %q is transformed more than once", prefix.Field)
-			}
-			fields[prefix.Field] = true
-			if prefix.Prefix == "" || len(prefix.Prefix) > 128 {
-				return fmt.Errorf("request_json prefix for field %q must contain 1 to 128 bytes", prefix.Field)
-			}
-			for _, b := range []byte(prefix.Prefix) {
-				if b < 0x21 || b > 0x7e {
-					return fmt.Errorf("request_json prefix for field %q contains whitespace or a non-printable byte", prefix.Field)
-				}
-			}
-		}
-		for _, field := range r.RequestJSON.RemoveFields {
-			if !jsonFieldRE.MatchString(field) {
-				return fmt.Errorf("invalid request_json remove field %q", field)
-			}
-			if fields[field] {
-				return fmt.Errorf("request_json field %q is transformed more than once", field)
-			}
-			fields[field] = true
-			for _, hoist := range r.RequestJSON.HoistArrayObjectStrings {
-				if field == hoist.TargetField {
-					return fmt.Errorf("request_json field %q cannot be both a hoist target and removed", field)
-				}
-			}
 		}
 	}
 
@@ -464,18 +302,6 @@ func validatePath(p, label string) error {
 	return nil
 }
 
-func validateJSONSeparator(separator, field string) error {
-	if len(separator) > 128 {
-		return fmt.Errorf("request_json separator for field %q exceeds 128 bytes", field)
-	}
-	for _, b := range []byte(separator) {
-		if b < 0x20 && b != '\n' && b != '\r' && b != '\t' {
-			return fmt.Errorf("request_json separator for field %q contains a disallowed control byte", field)
-		}
-	}
-	return nil
-}
-
 func (m Match) selector() string {
 	if m.Host != "" {
 		return "host:" + strings.ToLower(m.Host)
@@ -489,19 +315,6 @@ func NormalizeState(s State) State {
 	for i := range s.Routes {
 		s.Routes[i].Match.Host = strings.ToLower(s.Routes[i].Match.Host)
 		s.Routes[i].Upstream = strings.TrimSuffix(s.Routes[i].Upstream, "/")
-		sort.Slice(s.Routes[i].PathMap, func(a, b int) bool { return s.Routes[i].PathMap[a].Path < s.Routes[i].PathMap[b].Path })
-		if s.Routes[i].RequestJSON != nil {
-			sort.Slice(s.Routes[i].RequestJSON.JoinStringArrays, func(a, b int) bool {
-				return s.Routes[i].RequestJSON.JoinStringArrays[a].Field < s.Routes[i].RequestJSON.JoinStringArrays[b].Field
-			})
-			sort.Slice(s.Routes[i].RequestJSON.StringPrefixes, func(a, b int) bool {
-				return s.Routes[i].RequestJSON.StringPrefixes[a].Field < s.Routes[i].RequestJSON.StringPrefixes[b].Field
-			})
-			sort.Slice(s.Routes[i].RequestJSON.HoistArrayObjectStrings, func(a, b int) bool {
-				return s.Routes[i].RequestJSON.HoistArrayObjectStrings[a].SourceField < s.Routes[i].RequestJSON.HoistArrayObjectStrings[b].SourceField
-			})
-			sort.Strings(s.Routes[i].RequestJSON.RemoveFields)
-		}
 		sort.Slice(s.Routes[i].SetHeaders, func(a, b int) bool {
 			return strings.ToLower(s.Routes[i].SetHeaders[a].Name) < strings.ToLower(s.Routes[i].SetHeaders[b].Name)
 		})
@@ -526,15 +339,6 @@ func CloneState(s State) State {
 	out.Routes = make([]Route, len(s.Routes))
 	for i, r := range s.Routes {
 		out.Routes[i] = r
-		out.Routes[i].PathMap = append([]PathRewrite(nil), r.PathMap...)
-		if r.RequestJSON != nil {
-			transform := *r.RequestJSON
-			transform.JoinStringArrays = append([]JSONArrayStringJoin(nil), r.RequestJSON.JoinStringArrays...)
-			transform.HoistArrayObjectStrings = append([]JSONArrayObjectStringHoist(nil), r.RequestJSON.HoistArrayObjectStrings...)
-			transform.StringPrefixes = append([]JSONStringPrefix(nil), r.RequestJSON.StringPrefixes...)
-			transform.RemoveFields = append([]string(nil), r.RequestJSON.RemoveFields...)
-			out.Routes[i].RequestJSON = &transform
-		}
 		out.Routes[i].SetHeaders = append([]HeaderValue(nil), r.SetHeaders...)
 	}
 	out.CredentialSources = make([]CredentialSource, len(s.CredentialSources))

@@ -126,14 +126,19 @@ agentbox container create --scope prod work
 agentbox container shell work
 ```
 
-OpenAI traffic uses Cloudflare's provider-native gateway endpoint. Anthropic
-traffic uses Cloudflare's unified Messages endpoint so newly released models
-available through Unified Billing do not depend on provider-native rollout
-timing. Agentbox prefixes the outgoing JSON `model` field with `anthropic/`
-on the host, folds any system-role message emitted by Claude Code into the
-top-level system prompt expected by the unified API, and removes Claude Code's
-unsupported `context_management` extension. Pi, Claude Code, and the container
-continue using their normal unprefixed model names and dummy API keys.
+AI inference uses Cloudflare AI Gateway's provider-native paths: `/anthropic`
+for Anthropic and `/openai` for OpenAI. Agentbox creates one transparent route
+per gateway. It removes container-supplied authentication headers, injects
+`cf-aig-authorization`, and otherwise leaves the provider
+request alone. In particular, methods, provider path suffixes, queries, bodies,
+model names, system blocks, messages, and provider feature headers are not
+translated or normalized.
+
+This deliberately favors provider compatibility over Cloudflare's unified REST
+model catalog. In current testing, Anthropic's Opus, Sonnet, and Haiku models
+work through the provider-native endpoint, while Fable 5 is not available there
+under the tested Cloudflare Unified Billing configuration. Agentbox does not
+rewrite Fable requests into Cloudflare REST requests as a workaround.
 
 Container creation registers the identity with the daemon, waits for its Unix
 listener, launches the Incus instance, attaches TCP `127.0.0.1:8787` and Unix
@@ -172,26 +177,6 @@ explicit; use `"*"` only when every registered container should reach it.
   "match": { "path_prefix": "/example" },
   "upstream": "https://api.example.com/v1",
   "strip_prefix": true,
-  "drop_query": true,
-  "path_map": [
-    { "path": "/messages", "to": "/chat/messages" }
-  ],
-  "request_json": {
-    "join_string_arrays": [
-      { "field": "system", "element_field": "text", "separator": "\n\n", "optional": true }
-    ],
-    "hoist_array_object_strings": [
-      {
-        "source_field": "messages", "match_field": "role", "match_value": "system",
-        "value_field": "content", "element_field": "text", "target_field": "system",
-        "separator": "\n\n"
-      }
-    ],
-    "string_prefixes": [
-      { "field": "model", "prefix": "provider/" }
-    ],
-    "remove_fields": ["unsupported_extension"]
-  },
   "set_headers": [
     { "name": "Authorization", "value": "Bearer {secret:example-token}" }
   ]
@@ -208,22 +193,17 @@ Header values support durable `{secret:key-name}` references, renewable
 `{basic:username:key-name}` or `{basic:username:credential:name}`. Credential
 names are resolved against the grant for the request's container listener. A
 missing key, grant, or valid lease returns 503 before any upstream request.
-`request_json.string_prefixes` is a generic, idempotent rewrite for top-level
-JSON string fields. `join_string_arrays` converts an array of objects into one
-string by joining a selected string field in element order; an optional join
-skips an absent top-level field. `hoist_array_object_strings` removes matching
-objects from a top-level array and appends their string or text-block-array
-content to a top-level string. `drop_query` removes the inbound query from the
-upstream request. `remove_fields` idempotently removes selected top-level
-fields. Transformed requests must be unencoded JSON objects and are bounded at
-64 MiB; invalid or oversized bodies fail before material is resolved or an
-upstream request is made.
+Routes intentionally have no body, query, or provider-path transformation
+features. For a path route, `strip_prefix` removes only Agentbox's local routing
+namespace; the remaining provider-visible path suffix and raw query are joined
+to the configured upstream without rewriting. The request body is streamed
+unchanged and is never parsed by Agentbox.
 Routes that inject a secret or credential must use HTTPS; literal loopback IP
 HTTP upstreams are permitted for host-local services. `localhost` is not
 accepted because resolving a name is weaker than verifying a loopback address.
-Incoming authorization, cookies, forwarding headers,
-Cloudflare Access headers, and the complete `cf-aig-*` family are removed;
-configured headers are applied afterward. Queries are forwarded but never
+Incoming authorization, cookies, forwarding headers, Cloudflare Access
+credentials, and `cf-aig-authorization` are removed; configured headers are
+applied afterward. Other provider and gateway headers are preserved. Queries are forwarded but never
 logged. Ambiguous escaped paths, dot segments, repeated separators, backslashes,
 and semicolons are rejected.
 

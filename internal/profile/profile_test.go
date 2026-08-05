@@ -17,27 +17,25 @@ func TestProfilesAreOrdinaryValidRoutes(t *testing.T) {
 	if err := domain.ValidateState(state); err != nil {
 		t.Fatal(err)
 	}
-	if len(routes) != 10 {
+	if len(routes) != 8 {
 		t.Fatalf("got %d routes", len(routes))
 	}
-	var unified *domain.Route
+	byName := map[string]*domain.Route{}
 	for i := range cloudflare {
-		if cloudflare[i].Name == "cloudflare-u-prod" {
-			unified = &cloudflare[i]
-			break
-		}
+		byName[cloudflare[i].Name] = &cloudflare[i]
 	}
-	if unified == nil {
-		t.Fatal("prod unified Anthropic route is missing")
+	prod := byName["cloudflare-prod"]
+	if prod == nil {
+		t.Fatalf("prod provider-native route is missing: %+v", byName)
 	}
-	if unified.Match.PathPrefix != "/cloudflare/prod/anthropic" || unified.Upstream != "https://api.cloudflare.com/client/v4/accounts/0123456789abcdef0123456789abcdef/ai/v1" {
-		t.Fatalf("unexpected unified route: %+v", unified)
+	wantUpstream := "https://gateway.ai.cloudflare.com/v1/0123456789abcdef0123456789abcdef/prod"
+	if prod.Match.PathPrefix != "/cloudflare/prod" || prod.Upstream != wantUpstream || !prod.StripPrefix {
+		t.Fatalf("unexpected provider-native route: %+v", prod)
 	}
-	if !unified.DropQuery {
-		t.Fatal("unified route preserves unsupported query parameters")
-	}
-	if unified.RequestJSON == nil || len(unified.RequestJSON.JoinStringArrays) != 1 || unified.RequestJSON.JoinStringArrays[0] != (domain.JSONArrayStringJoin{Field: "system", ElementField: "text", Separator: "\n\n", Optional: true}) || len(unified.RequestJSON.HoistArrayObjectStrings) != 1 || unified.RequestJSON.HoistArrayObjectStrings[0] != (domain.JSONArrayObjectStringHoist{SourceField: "messages", MatchField: "role", MatchValue: "system", ValueField: "content", ElementField: "text", TargetField: "system", Separator: "\n\n"}) || len(unified.RequestJSON.StringPrefixes) != 1 || unified.RequestJSON.StringPrefixes[0] != (domain.JSONStringPrefix{Field: "model", Prefix: "anthropic/"}) || len(unified.RequestJSON.RemoveFields) != 1 || unified.RequestJSON.RemoveFields[0] != "context_management" {
-		t.Fatalf("unexpected unified request transform: %+v", unified.RequestJSON)
+	if len(prod.SetHeaders) != 1 || prod.SetHeaders[0] != (domain.HeaderValue{
+		Name: "cf-aig-authorization", Value: "Bearer {secret:cf-aig-token-prod}",
+	}) {
+		t.Fatalf("unexpected gateway authentication: %+v", prod.SetHeaders)
 	}
 	credentials, err := domain.ReferencedCredentials(GitHubRoutes())
 	if err != nil || len(credentials) != 1 || credentials[0] != "github" {

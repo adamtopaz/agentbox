@@ -7,13 +7,12 @@ import (
 	"agentbox/internal/domain"
 )
 
-func TestScopePrecedenceAndPathMap(t *testing.T) {
+func TestScopePrecedenceAndPathPreservation(t *testing.T) {
 	s := domain.NewState()
 	s.Containers = []domain.Container{{Name: "dev", Scope: "prod", CreatedAt: time.Now()}}
 	s.Routes = []domain.Route{
 		{Name: "all-api", Scope: "*", Match: domain.Match{PathPrefix: "/api"}, Upstream: "https://all.example", StripPrefix: true},
-		{Name: "prod-api", Scope: "prod", Match: domain.Match{PathPrefix: "/api"}, Upstream: "https://prod.example", StripPrefix: true,
-			PathMap: []domain.PathRewrite{{Path: "/messages", To: "/v1/messages"}}},
+		{Name: "prod-api", Scope: "prod", Match: domain.Match{PathPrefix: "/api"}, Upstream: "https://prod.example", StripPrefix: true},
 		{Name: "deep", Scope: "prod", Match: domain.Match{PathPrefix: "/api/special"}, Upstream: "https://special.example", StripPrefix: true},
 	}
 	snapshot, err := Compile(s)
@@ -21,7 +20,7 @@ func TestScopePrecedenceAndPathMap(t *testing.T) {
 		t.Fatal(err)
 	}
 	route, path, ok := snapshot.Match("prod", "", "/api/messages")
-	if !ok || route.Name != "prod-api" || path != "/v1/messages" {
+	if !ok || route.Name != "prod-api" || path != "/messages" {
 		t.Fatalf("route=%v path=%q ok=%v", route.Name, path, ok)
 	}
 	route, _, _ = snapshot.Match("prod", "", "/api/special/x")
@@ -60,14 +59,13 @@ func TestRootPrefixMatchesEveryAbsolutePath(t *testing.T) {
 	s.Routes = []domain.Route{{
 		Name: "root", Scope: "*", Match: domain.Match{PathPrefix: "/"},
 		Upstream: "https://example.com", StripPrefix: true,
-		PathMap: []domain.PathRewrite{{Path: "/messages", To: "/v1/messages"}},
 	}}
 	snapshot, err := Compile(s)
 	if err != nil {
 		t.Fatal(err)
 	}
 	route, path, ok := snapshot.Match("dev", "", "/messages")
-	if !ok || route.Name != "root" || path != "/v1/messages" {
+	if !ok || route.Name != "root" || path != "/messages" {
 		t.Fatalf("route=%v path=%q ok=%v", route, path, ok)
 	}
 }

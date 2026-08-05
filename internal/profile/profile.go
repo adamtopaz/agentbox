@@ -57,46 +57,13 @@ func CloudflareRoutes(accountID string, gateways []string) ([]domain.Route, erro
 			return nil, fmt.Errorf("duplicate gateway %q", gateway)
 		}
 		seen[gateway] = true
-		basePath := "/cloudflare/" + gateway
-		secret := "{secret:cf-aig-token-" + gateway + "}"
 		routes = append(routes, domain.Route{
 			Name: "cloudflare-" + gateway, Scope: gateway,
-			Match: domain.Match{PathPrefix: basePath}, StripPrefix: true,
+			Match: domain.Match{PathPrefix: "/cloudflare/" + gateway}, StripPrefix: true,
 			Upstream: "https://gateway.ai.cloudflare.com/v1/" + accountID + "/" + gateway,
-			PathMap: []domain.PathRewrite{
-				{Path: "/v1/messages", To: "/anthropic/v1/messages"},
-				{Path: "/responses", To: "/openai/responses"},
-				{Path: "/chat/completions", To: "/compat/chat/completions"},
-			},
-			SetHeaders: []domain.HeaderValue{{Name: "cf-aig-authorization", Value: "Bearer " + secret}},
-		}, domain.Route{
-			// The longer selector wins for Anthropic clients. Cloudflare's unified
-			// REST endpoint carries new models before the provider-native endpoint;
-			// it requires provider-prefixed model IDs.
-			Name: "cloudflare-u-" + gateway, Scope: gateway,
-			Match: domain.Match{PathPrefix: basePath + "/anthropic"}, StripPrefix: true,
-			DropQuery: true,
-			Upstream:  "https://api.cloudflare.com/client/v4/accounts/" + accountID + "/ai/v1",
-			PathMap:   []domain.PathRewrite{{Path: "/v1/messages", To: "/messages"}},
-			RequestJSON: &domain.JSONTransform{
-				JoinStringArrays: []domain.JSONArrayStringJoin{
-					{Field: "system", ElementField: "text", Separator: "\n\n", Optional: true},
-				},
-				HoistArrayObjectStrings: []domain.JSONArrayObjectStringHoist{
-					{
-						SourceField: "messages", MatchField: "role", MatchValue: "system",
-						ValueField: "content", ElementField: "text", TargetField: "system", Separator: "\n\n",
-					},
-				},
-				StringPrefixes: []domain.JSONStringPrefix{
-					{Field: "model", Prefix: "anthropic/"},
-				},
-				RemoveFields: []string{"context_management"},
-			},
-			SetHeaders: []domain.HeaderValue{
-				{Name: "Authorization", Value: "Bearer " + secret},
-				{Name: "cf-aig-gateway-id", Value: gateway},
-			},
+			SetHeaders: []domain.HeaderValue{{
+				Name: "cf-aig-authorization", Value: "Bearer {secret:cf-aig-token-" + gateway + "}",
+			}},
 		})
 	}
 	if len(routes) == 0 {

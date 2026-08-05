@@ -18,9 +18,8 @@ type Header struct {
 }
 type Route struct {
 	domain.Route
-	Target   *url.URL
-	Headers  []Header
-	rewrites map[string]string
+	Target  *url.URL
+	Headers []Header
 }
 
 type Snapshot struct {
@@ -41,10 +40,7 @@ func Compile(state domain.State) (*Snapshot, error) {
 		if err != nil {
 			return nil, err
 		}
-		r := Route{Route: source, Target: target, rewrites: map[string]string{}}
-		for _, m := range source.PathMap {
-			r.rewrites[m.Path] = m.To
-		}
+		r := Route{Route: source, Target: target}
 		for _, h := range source.SetHeaders {
 			t, err := domain.ParseTemplate(h.Value)
 			if err != nil {
@@ -112,9 +108,6 @@ func (s *Snapshot) Match(scope, host, requestPath string) (*Route, string, bool)
 			if path == "" {
 				path = "/"
 			}
-		}
-		if mapped, ok := r.rewrites[path]; ok {
-			path = mapped
 		}
 		return r, path, true
 	}

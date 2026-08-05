@@ -39,52 +39,6 @@ func TestValidateState(t *testing.T) {
 		{"unsafe path", func(s *State) { s.Routes[0].Match.PathPrefix = "/api/../x" }},
 		{"bad upstream", func(s *State) { s.Routes[0].Upstream = "file:///tmp/x" }},
 		{"bad template", func(s *State) { s.Routes[0].SetHeaders[0].Value = "{env:TOKEN}" }},
-		{"empty JSON transform", func(s *State) { s.Routes[0].RequestJSON = &JSONTransform{} }},
-		{"invalid JSON field", func(s *State) {
-			s.Routes[0].RequestJSON = &JSONTransform{StringPrefixes: []JSONStringPrefix{{Field: "model/path", Prefix: "vendor/"}}}
-		}},
-		{"duplicate JSON field", func(s *State) {
-			s.Routes[0].RequestJSON = &JSONTransform{StringPrefixes: []JSONStringPrefix{{Field: "model", Prefix: "a/"}, {Field: "model", Prefix: "b/"}}}
-		}},
-		{"duplicate JSON field across operations", func(s *State) {
-			s.Routes[0].RequestJSON = &JSONTransform{
-				JoinStringArrays: []JSONArrayStringJoin{{Field: "model", ElementField: "text"}},
-				StringPrefixes:   []JSONStringPrefix{{Field: "model", Prefix: "a/"}},
-			}
-		}},
-		{"invalid JSON element field", func(s *State) {
-			s.Routes[0].RequestJSON = &JSONTransform{JoinStringArrays: []JSONArrayStringJoin{{Field: "system", ElementField: "text/path"}}}
-		}},
-		{"invalid JSON hoist source field", func(s *State) {
-			s.Routes[0].RequestJSON = &JSONTransform{HoistArrayObjectStrings: []JSONArrayObjectStringHoist{{SourceField: "messages/path", MatchField: "role", MatchValue: "system", ValueField: "content", ElementField: "text", TargetField: "system"}}}
-		}},
-		{"duplicate JSON field with hoist", func(s *State) {
-			s.Routes[0].RequestJSON = &JSONTransform{
-				JoinStringArrays:        []JSONArrayStringJoin{{Field: "messages", ElementField: "text"}},
-				HoistArrayObjectStrings: []JSONArrayObjectStringHoist{{SourceField: "messages", MatchField: "role", MatchValue: "system", ValueField: "content", ElementField: "text", TargetField: "system"}},
-			}
-		}},
-		{"same JSON hoist source and target", func(s *State) {
-			s.Routes[0].RequestJSON = &JSONTransform{HoistArrayObjectStrings: []JSONArrayObjectStringHoist{{SourceField: "messages", MatchField: "role", MatchValue: "system", ValueField: "content", ElementField: "text", TargetField: "messages"}}}
-		}},
-		{"empty JSON hoist match value", func(s *State) {
-			s.Routes[0].RequestJSON = &JSONTransform{HoistArrayObjectStrings: []JSONArrayObjectStringHoist{{SourceField: "messages", MatchField: "role", ValueField: "content", ElementField: "text", TargetField: "system"}}}
-		}},
-		{"invalid JSON remove field", func(s *State) {
-			s.Routes[0].RequestJSON = &JSONTransform{RemoveFields: []string{"context/management"}}
-		}},
-		{"duplicate JSON remove field", func(s *State) {
-			s.Routes[0].RequestJSON = &JSONTransform{RemoveFields: []string{"context_management", "context_management"}}
-		}},
-		{"remove JSON hoist target", func(s *State) {
-			s.Routes[0].RequestJSON = &JSONTransform{
-				HoistArrayObjectStrings: []JSONArrayObjectStringHoist{{SourceField: "messages", MatchField: "role", MatchValue: "system", ValueField: "content", ElementField: "text", TargetField: "system"}},
-				RemoveFields:            []string{"system"},
-			}
-		}},
-		{"unsafe JSON prefix", func(s *State) {
-			s.Routes[0].RequestJSON = &JSONTransform{StringPrefixes: []JSONStringPrefix{{Field: "model", Prefix: "vendor prefix/"}}}
-		}},
 		{"universal container", func(s *State) { s.Containers[0].Scope = UniversalScope }},
 	}
 	for _, tt := range tests {
@@ -165,28 +119,13 @@ func TestCredentialStateReferences(t *testing.T) {
 func TestCloneStateIsDeep(t *testing.T) {
 	s := NewState()
 	s.Routes = []Route{validRoute()}
-	s.Routes[0].RequestJSON = &JSONTransform{
-		JoinStringArrays: []JSONArrayStringJoin{{Field: "system", ElementField: "text", Separator: "\n\n"}},
-		HoistArrayObjectStrings: []JSONArrayObjectStringHoist{{
-			SourceField: "messages", MatchField: "role", MatchValue: "system", ValueField: "content", ElementField: "text", TargetField: "system", Separator: "\n\n",
-		}},
-		StringPrefixes: []JSONStringPrefix{{Field: "model", Prefix: "provider/"}},
-		RemoveFields:   []string{"context_management"},
-	}
 	clone := CloneState(s)
 	clone.Routes[0].SetHeaders[0].Value = "changed"
-	clone.Routes[0].RequestJSON.JoinStringArrays[0].Separator = "changed"
-	clone.Routes[0].RequestJSON.HoistArrayObjectStrings[0].MatchValue = "changed"
-	clone.Routes[0].RequestJSON.StringPrefixes[0].Prefix = "changed/"
-	clone.Routes[0].RequestJSON.RemoveFields[0] = "changed"
 	clone.CredentialSources = []CredentialSource{{Name: "source", Provider: "provider", Parameters: map[string]string{"a": "b"}, Secrets: map[string]string{}}}
 	original := CloneState(clone)
 	clone.CredentialSources[0].Parameters["a"] = "changed"
 	if s.Routes[0].SetHeaders[0].Value == "changed" {
 		t.Fatal("nested route data was shared")
-	}
-	if s.Routes[0].RequestJSON.JoinStringArrays[0].Separator == "changed" || s.Routes[0].RequestJSON.HoistArrayObjectStrings[0].MatchValue == "changed" || s.Routes[0].RequestJSON.StringPrefixes[0].Prefix == "changed/" || s.Routes[0].RequestJSON.RemoveFields[0] == "changed" {
-		t.Fatal("request JSON transform was shared")
 	}
 	if original.CredentialSources[0].Parameters["a"] == "changed" {
 		t.Fatal("credential source maps were shared")

@@ -49,6 +49,7 @@ class Handler(BaseHTTPRequestHandler):
             "headers": dict(self.headers.items()),
         }
         if body is not None:
+            response["body_text"] = body.decode()
             response["body"] = json.loads(body)
         payload = json.dumps(response).encode()
         self.send_response(200)
@@ -144,50 +145,34 @@ assert d["path"] == "/base/messages", d
 assert d["query"] == "value=QUERYSECRET", d
 assert h.get("authorization") == "Bearer real-one", h
 assert "cookie" not in h, h
-assert "cf-aig-collect-log" not in h, h
+assert h.get("cf-aig-collect-log") == "false", h
 assert "container-fake" not in json.dumps(h), h
 PY
 
-cat > "$WORK/json-transform-route.json" <<EOF
+cat > "$WORK/transparent-route.json" <<EOF
 {
-  "name": "json-transform",
+  "name": "transparent",
   "scope": "test",
-  "match": {"path_prefix": "/transform"},
+  "match": {"path_prefix": "/transparent"},
   "upstream": "http://127.0.0.1:${PORT}",
-  "strip_prefix": true,
-  "drop_query": true,
-  "request_json": {
-    "join_string_arrays": [
-      {"field": "system", "element_field": "text", "separator": "\n\n"}
-    ],
-    "hoist_array_object_strings": [
-      {
-        "source_field": "messages", "match_field": "role", "match_value": "system",
-        "value_field": "content", "element_field": "text", "target_field": "system",
-        "separator": "\n\n"
-      }
-    ],
-    "string_prefixes": [
-      {"field": "model", "prefix": "anthropic/"}
-    ],
-    "remove_fields": ["context_management"]
-  }
+  "strip_prefix": true
 }
 EOF
-abx route put "$WORK/json-transform-route.json"
-RESPONSE=$(proxy -H 'content-type: application/json' \
-    --data '{"model":"claude-fable-5","system":[{"text":"first"},{"text":"second"}],"messages":[{"role":"user","content":[{"text":"hello"}]},{"role":"system","content":[{"text":"third"}]}],"context_management":{"edits":[]}}' \
-    'http://agentbox/transform/messages?beta=true')
-python3 - "$RESPONSE" <<'PY'
+abx route put "$WORK/transparent-route.json"
+PAYLOAD='{"model": "claude-opus-5", "system": [{"text":"rules","cache_control":{"type":"ephemeral"}}], "messages":[{"role":"system","content":"more rules"},{"role":"user","content":"say ok"}], "context_management":{"edits":[]}}'
+RESPONSE=$(proxy -H 'content-type: application/json; charset=utf-8' \
+    -H 'anthropic-beta: context-management-2025-06-27' \
+    --data-binary "$PAYLOAD" \
+    'http://agentbox/transparent/anthropic/v1/messages?beta=true')
+python3 - "$RESPONSE" "$PAYLOAD" <<'PY'
 import json, sys
 d = json.loads(sys.argv[1])
-assert d["path"] == "/messages", d
-assert d["query"] == "", d
-assert d["body"]["model"] == "anthropic/claude-fable-5", d
-assert d["body"]["system"] == "first\n\nsecond\n\nthird", d
-assert len(d["body"]["messages"]) == 1, d
-assert d["body"]["messages"][0]["role"] == "user", d
-assert "context_management" not in d["body"], d
+assert d["path"] == "/anthropic/v1/messages", d
+assert d["query"] == "beta=true", d
+assert d["body_text"] == sys.argv[2], d
+h = {k.lower(): v for k, v in d["headers"].items()}
+assert h.get("content-type") == "application/json; charset=utf-8", h
+assert h.get("anthropic-beta") == "context-management-2025-06-27", h
 PY
 
 # Key rotation is live and does not restart or rewrite routes.

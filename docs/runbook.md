@@ -175,16 +175,15 @@ DNS names are deliberately not trusted as proof of a local transport.
 
 Matching order is exact-host routes, then longest path prefix. For otherwise
 equivalent selectors, a route in the container's concrete scope wins over the
-universal `"*"` route. `path_map` entries match exact post-strip paths and do
-not cascade. `request_json.string_prefixes` applies idempotent prefixes to
-selected top-level JSON string fields. `join_string_arrays` joins a selected
-string field from each object in a top-level array.
-`hoist_array_object_strings` removes matching objects from a top-level array
-and appends their string or text-block-array content to a top-level string.
-`remove_fields` idempotently removes selected top-level fields, and `drop_query`
-prevents the inbound query from reaching the upstream. JSON transforms accept
-only unencoded objects, buffer at most 64 MiB, and fail closed before resolving
-route material.
+universal `"*"` route. Agentbox routes do not transform request bodies, raw
+queries, or provider-visible path suffixes. `strip_prefix` removes only the
+local Agentbox routing namespace before joining the suffix to the upstream base
+path. Bodies remain streaming and are never parsed by the proxy.
+
+State version 2 removed the former path-map, query-drop, and JSON-transform
+features. On first load, version-1 routes without transformations are preserved.
+Any route that used one of those features is omitted rather than silently
+changing its meaning; reapply the relevant provider profile after upgrading.
 
 Provider helpers are optional route generators:
 
@@ -224,19 +223,20 @@ containers intentionally share one source. GitHub operations are attributed to
 the App installation. Commands that require a human-user-only API endpoint may
 not work; validate the exact `gh` operations and App permissions used by agents.
 
-The Cloudflare profile creates a provider-native route plus a longer
-Anthropic-specific route for each named scope. OpenAI continues through the
-provider-native endpoint. The Anthropic route uses Cloudflare's unified
-`/ai/v1/messages` endpoint, injects the gateway token as host-side
-`Authorization`, supplies `cf-aig-gateway-id`, maps `/v1/messages` to
-`/messages`, drops Claude Code's unsupported `beta` query, joins Anthropic
-system text blocks into the string expected by the unified endpoint, folds
-Claude Code's system-role messages into that top-level string, removes its
-unsupported `context_management` extension, and prefixes the JSON `model` field
-with `anthropic/`. This keeps normal pi and Claude Code model names working
-while supporting models that are available through Unified Billing before the
-provider-native endpoint. The container receives only loopback URLs and dummy
-keys.
+The Cloudflare profile creates one provider-native route for each named scope.
+The container uses `/cloudflare/<scope>/anthropic/...` and
+`/cloudflare/<scope>/openai/...`; after removing that local namespace, Agentbox
+forwards the exact suffix to Cloudflare AI Gateway's corresponding provider
+endpoint. It strips dummy/provider credentials and incoming
+`cf-aig-authorization`, then injects only the host-side value. It does not alter
+model names, JSON structure, system blocks, messages, feature headers, or query
+parameters. The container receives only loopback URLs and dummy keys.
+
+Provider-native routing means the provider endpoint, rather than Cloudflare's
+unified REST schema, decides model availability. Opus, Sonnet, and Haiku worked
+in the current Anthropic tests. Fable 5 returned a provider-key requirement
+under the tested Unified Billing configuration, so it is intentionally not
+shimmed through the REST API.
 
 ## Containers
 
