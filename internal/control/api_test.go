@@ -44,20 +44,6 @@ func TestUnixSocketRoundTrip(t *testing.T) {
 	if err := client.SetKey(ctx, "api-token", []byte("not-in-state")); err != nil {
 		t.Fatal(err)
 	}
-	route := domain.Route{
-		Name: "api", Scope: "dev", Match: domain.Match{PathPrefix: "/api"}, Upstream: "https://example.com",
-		SetHeaders: []domain.HeaderValue{{Name: "Authorization", Value: "Bearer {secret:api-token}"}},
-	}
-	if err := client.PutRoute(ctx, route); err != nil {
-		t.Fatal(err)
-	}
-	created, err := client.AddContainer(ctx, domain.Container{Name: "work", Scope: "dev"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if created.CreatedAt.IsZero() {
-		t.Fatal("server did not return its canonical creation timestamp")
-	}
 	source := domain.CredentialSource{
 		Name: "github-test", Provider: "github-app",
 		Parameters: map[string]string{"client-id": "Iv1.example", "installation-id": "123"},
@@ -66,19 +52,30 @@ func TestUnixSocketRoundTrip(t *testing.T) {
 	if err := client.PutCredentialSource(ctx, source); err != nil {
 		t.Fatal(err)
 	}
-	grant := domain.CredentialGrant{Container: "work", Credential: "github", Source: "github-test"}
-	if err := client.PutCredentialGrant(ctx, grant); err != nil {
+	route := domain.Route{
+		Name: "api", Match: domain.Match{PathPrefix: "/api"}, Upstream: "https://example.com",
+		SetHeaders: []domain.HeaderValue{{Name: "Authorization", Value: "Bearer {secret:api-token}"}},
+	}
+	current := domain.Profile{Name: "dev", Routes: []domain.Route{route}, Credentials: map[string]string{"github": "github-test"}, Environment: map[string]string{"AGENTBOX_PROFILE": "dev"}}
+	if err := client.PutProfile(ctx, current); err != nil {
 		t.Fatal(err)
+	}
+	created, err := client.AddContainer(ctx, domain.Container{Name: "work", Profile: "dev"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.CreatedAt.IsZero() {
+		t.Fatal("server did not return its canonical creation timestamp")
 	}
 
 	health, err := client.Health(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if health.Routes != 1 || health.Keys != 1 || health.Containers != 1 || health.CredentialSources != 1 || health.CredentialGrants != 1 {
+	if health.Profiles != 1 || health.Routes != 1 || health.Keys != 1 || health.Containers != 1 || health.CredentialSources != 1 || health.CredentialBindings != 1 {
 		t.Fatalf("unexpected health: %+v", health)
 	}
-	routes, err := client.Routes(ctx)
+	routes, err := client.Routes(ctx, "dev")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,9 +86,9 @@ func TestUnixSocketRoundTrip(t *testing.T) {
 	if err != nil || len(sources) != 1 || sources[0].Name != "github-test" {
 		t.Fatalf("sources=%+v err=%v", sources, err)
 	}
-	grants, err := client.CredentialGrants(ctx)
-	if err != nil || len(grants) != 1 || grants[0] != grant {
-		t.Fatalf("grants=%+v err=%v", grants, err)
+	profiles, err := client.Profiles(ctx)
+	if err != nil || len(profiles) != 1 || profiles[0].Credentials["github"] != "github-test" {
+		t.Fatalf("profiles=%+v err=%v", profiles, err)
 	}
 }
 

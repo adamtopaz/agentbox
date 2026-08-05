@@ -14,7 +14,7 @@ keys, and container registrations change while the daemon is running.
 ```text
 operator
   agentbox CLI ── HTTP/Unix socket ──> typed application service
-                                           ├── state.json (routes/containers/sources/grants)
+                                           ├── state.json (profiles/routes/containers/sources)
                                            ├── AES-256-GCM key envelopes
                                            ├── expiring credential broker
                                            └── immutable runtime snapshots
@@ -24,13 +24,15 @@ container ── Incus proxy device ──> per-container Unix socket
 ```
 
 HTTP is only the current adapter for the control socket. Validation,
-persistence, route/key/credential operations, and commits live in a
-transport-independent application service. Provider profiles are ordinary
-compositions of the same generic route model.
+persistence, profile/route/key/credential operations, and commits live in a
+transport-independent application service. Provider integrations are ordinary
+compositions of the same generic profile, route, key-reference, and credential
+binding model.
 
 The per-container socket is its identity. A container has no bearer token with
-which to claim another identity, and its listener sees only routes in its
-concrete scope plus routes in the universal `"*"` scope.
+which to claim another identity. Each container names exactly one reusable
+profile, and its listener sees only the routes and credential bindings in that
+profile.
 
 ## Requirements
 
@@ -73,8 +75,16 @@ Rebuilding the same alias uses `incus publish --reuse`.
 
 ## Configure and use
 
-GitHub is an optional profile built from ordinary routes and a renewable
-credential. Give the GitHub App only the repository permissions agents need,
+Create a named profile first. Provider helpers then assign ordinary routes,
+public client settings, encrypted-key references, and renewable credential
+bindings to that profile atomically:
+
+```sh
+agentbox profile create production
+```
+
+GitHub support is built from ordinary routes and a renewable credential. Give
+the GitHub App only the repository permissions agents need,
 install it on the intended repositories, and download one App private key.
 The Client ID, installation ID, repository selection, and permission subset
 are non-secret configuration; only the PEM is stored as an encrypted key.
@@ -89,10 +99,9 @@ agentbox credential source github-app github-main \
   --repository-ids 111111,222222 \
   --permissions contents=write,pull_requests=write,issues=write
 
-agentbox profile apply github
+agentbox profile set github production --source github-main
 
-agentbox container create --scope prod --configure none work
-agentbox credential grant set work github github-main
+agentbox container create --profile production work
 agentbox container shell work
 ```
 
@@ -103,8 +112,9 @@ App permissions, though an explicit least-privilege subset is preferable.
 
 On the first request, the host signs a short-lived App JWT, exchanges it for a
 one-hour installation token, caches that token only in daemon memory, and
-refreshes it before expiry. A grant binds the logical credential `github` to a
-source for exactly one container listener. The App private key, JWT, and
+refreshes it before expiry. The profile binds the logical credential `github`
+to the selected source; every container using that profile receives the same
+policy without receiving the credential itself. The App private key, JWT, and
 installation token never enter the container. The image configures `git`
 with canonical `https://github.com/...` remotes while a GitHub-only HTTPS
 transport helper routes clone, fetch, and push through `/github-git/`. This
@@ -118,18 +128,18 @@ the profile explicitly names the entry containing its API token:
 
 ```sh
 agentbox key set cloudflare-production
-agentbox profile apply cloudflare \
+agentbox profile set cloudflare production \
   --account-id 0123456789abcdef0123456789abcdef \
-  --gateways prod \
+  --gateway ff-prod \
   --private-key cloudflare-production
 
-agentbox container create --scope prod work
+agentbox container create --profile production work
 agentbox container shell work
 ```
 
 AI inference uses Cloudflare AI Gateway's provider-native paths: `/anthropic`
 for Anthropic and `/openai` for OpenAI. Agentbox creates one transparent route
-per gateway. It removes container-supplied authentication headers, injects
+inside the named profile. It removes container-supplied authentication headers, injects
 `cf-aig-authorization`, and otherwise leaves the provider
 request alone. In particular, methods, provider path suffixes, queries, bodies,
 model names, system blocks, messages, and provider feature headers are not
@@ -151,14 +161,23 @@ all Agentbox per-instance limits, use `--no-resource-limits`; limits inherited
 from the Incus profile still apply. The opt-out cannot be combined with the
 individual resource flags.
 
+Create as many independent policies as needed. For example, `development` and
+`production` can reference different Cloudflare gateway tokens and different
+GitHub App sources; container creation needs only the chosen profile name.
+Changing a profile updates routing and renewable credential access immediately
+for all of its existing containers. Standard client URLs are based on the
+stable profile name and are installed at container creation, so changing an
+assigned gateway, key, or GitHub source does not require recreating containers.
+
 Useful live operations:
 
 ```sh
 agentbox status
-agentbox route list
+agentbox profile list
+agentbox profile show production
+agentbox route list production
 agentbox key list
 agentbox credential source list
-agentbox credential grant list
 agentbox container list
 agentbox container block work
 agentbox container block --hard work
@@ -168,13 +187,13 @@ agentbox container destroy work
 
 ## Generic routes
 
-A route matches either an exact host or a clean path prefix. `scope` is always
-explicit; use `"*"` only when every registered container should reach it.
+A route matches either an exact host or a clean path prefix. Routes are owned
+by the profile in which they are stored; low-level route operations are
+available for integrations that do not yet have a convenience helper.
 
 ```json
 {
   "name": "example-api",
-  "scope": "prod",
   "match": { "path_prefix": "/example" },
   "upstream": "https://api.example.com/v1",
   "strip_prefix": true,
@@ -186,16 +205,16 @@ explicit; use `"*"` only when every registered container should reach it.
 
 ```sh
 agentbox key set example-token
-agentbox route put route.json
+agentbox route put production route.json
 ```
 
 Header values support durable `{secret:key-name}` references, renewable
 `{credential:name}` references, and Basic forms such as
 `{basic:username:key-name}` or `{basic:username:credential:name}`. Credential
-names are resolved against the grant for the request's container listener.
+names are resolved against the binding in the request container's profile.
 Credential and profile commands likewise take explicit references to key-store
-entries; key names carry no provider-specific meaning. A
-missing key, grant, or valid lease returns 503 before any upstream request.
+entries; key names carry no provider-specific meaning. A missing key, profile
+binding, or valid lease returns 503 before any upstream request.
 Routes intentionally have no body, query, or provider-path transformation
 features. For a path route, `strip_prefix` removes only Agentbox's local routing
 namespace; the remaining provider-visible path suffix and raw query are joined
@@ -232,7 +251,7 @@ or offline storage; it is not a defense against a compromised running host,
 and full-disk encryption remains valuable.
 
 Container egress is intentionally not restricted. A compromised agent can use
-the routes assigned to its scope and spend against them, but it cannot recover
+the routes assigned to its profile and spend against them, but it cannot recover
 a reusable upstream credential from agentbox. Apply upstream budgets and
 revocation controls as a second boundary.
 

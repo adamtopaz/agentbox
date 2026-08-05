@@ -66,7 +66,7 @@ func Run(options Options) error {
 	if options.NoStart {
 		fmt.Fprintln(r.out, "next: systemctl daemon-reload && systemctl enable --now agentboxd")
 	} else {
-		fmt.Fprintln(r.out, "next: agentbox profile apply github")
+		fmt.Fprintln(r.out, "next: agentbox profile create <name>")
 	}
 	return nil
 }

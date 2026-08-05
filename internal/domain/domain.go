@@ -15,24 +15,22 @@ import (
 )
 
 const (
-	StateVersion   = 2
-	UniversalScope = "*"
+	StateVersion = 3
 )
 
 var (
 	nameRE      = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
-	scopeRE     = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,49}$`)
+	profileRE   = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,49}$`)
 	keyRE       = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{0,63}$`)
 	hostRE      = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$`)
 	headerRE    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]*$`)
 	basicUserRE = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 )
 
-// Route describes one reverse-proxy rule. Scope is an arbitrary isolation
-// label; a listener sees routes in its own scope plus routes in "*".
+// Route describes one reverse-proxy rule. It is profile-neutral; ownership
+// comes from the Profile containing it.
 type Route struct {
 	Name        string        `json:"name"`
-	Scope       string        `json:"scope"`
 	Match       Match         `json:"match"`
 	Upstream    string        `json:"upstream"`
 	StripPrefix bool          `json:"strip_prefix,omitempty"`
@@ -53,9 +51,19 @@ type HeaderValue struct {
 	Value string `json:"value"`
 }
 
+// Profile is a reusable container policy. Routes remain the generic data-plane
+// primitive, Credentials bind logical renewable credentials to sources, and
+// Environment contains only public container-side configuration.
+type Profile struct {
+	Name        string            `json:"name"`
+	Routes      []Route           `json:"routes"`
+	Credentials map[string]string `json:"credentials"`
+	Environment map[string]string `json:"environment"`
+}
+
 type Container struct {
 	Name      string    `json:"name"`
-	Scope     string    `json:"scope"`
+	Profile   string    `json:"profile"`
 	Blocked   bool      `json:"blocked,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 }
@@ -70,9 +78,8 @@ type CredentialSource struct {
 	Secrets    map[string]string `json:"secrets"`
 }
 
-// CredentialGrant binds a logical route credential to one container. The
-// per-container proxy listener is the principal: request data can never select
-// a different grant.
+// CredentialGrant is the version-1/version-2 persistence shape retained only
+// for migration into profile credential bindings.
 type CredentialGrant struct {
 	Container  string `json:"container"`
 	Credential string `json:"credential"`
@@ -81,10 +88,9 @@ type CredentialGrant struct {
 
 type State struct {
 	Version           int                `json:"version"`
-	Routes            []Route            `json:"routes"`
+	Profiles          []Profile          `json:"profiles"`
 	Containers        []Container        `json:"containers"`
 	CredentialSources []CredentialSource `json:"credential_sources"`
-	CredentialGrants  []CredentialGrant  `json:"credential_grants"`
 }
 
 type KeyInfo struct {
@@ -93,44 +99,17 @@ type KeyInfo struct {
 }
 
 func NewState() State {
-	return State{Version: StateVersion, Routes: []Route{}, Containers: []Container{},
-		CredentialSources: []CredentialSource{}, CredentialGrants: []CredentialGrant{}}
+	return State{Version: StateVersion, Profiles: []Profile{}, Containers: []Container{},
+		CredentialSources: []CredentialSource{}}
 }
 
-func ValidName(s string) bool    { return nameRE.MatchString(s) }
-func ValidScope(s string) bool   { return s == UniversalScope || scopeRE.MatchString(s) }
-func ValidKeyName(s string) bool { return keyRE.MatchString(s) }
+func ValidName(s string) bool        { return nameRE.MatchString(s) }
+func ValidProfileName(s string) bool { return profileRE.MatchString(s) }
+func ValidKeyName(s string) bool     { return keyRE.MatchString(s) }
 
 func ValidateState(s State) error {
 	if s.Version != StateVersion {
 		return fmt.Errorf("unsupported state version %d (want %d)", s.Version, StateVersion)
-	}
-	routeNames := map[string]bool{}
-	selectors := map[string]bool{}
-	for i := range s.Routes {
-		if err := ValidateRoute(s.Routes[i]); err != nil {
-			return fmt.Errorf("route %d: %w", i, err)
-		}
-		r := s.Routes[i]
-		if routeNames[r.Name] {
-			return fmt.Errorf("duplicate route name %q", r.Name)
-		}
-		routeNames[r.Name] = true
-		selector := r.Scope + "\x00" + r.Match.selector()
-		if selectors[selector] {
-			return fmt.Errorf("duplicate selector %q in scope %q", r.Match.selector(), r.Scope)
-		}
-		selectors[selector] = true
-	}
-	containers := map[string]bool{}
-	for i, c := range s.Containers {
-		if err := ValidateContainer(c); err != nil {
-			return fmt.Errorf("container %d: %w", i, err)
-		}
-		if containers[c.Name] {
-			return fmt.Errorf("duplicate container name %q", c.Name)
-		}
-		containers[c.Name] = true
 	}
 	sources := map[string]bool{}
 	for i, source := range s.CredentialSources {
@@ -142,24 +121,86 @@ func ValidateState(s State) error {
 		}
 		sources[source.Name] = true
 	}
-	grants := map[string]bool{}
-	for i, grant := range s.CredentialGrants {
-		if err := ValidateCredentialGrant(grant); err != nil {
-			return fmt.Errorf("credential grant %d: %w", i, err)
+	profiles := map[string]bool{}
+	for i, profile := range s.Profiles {
+		if err := ValidateProfile(profile); err != nil {
+			return fmt.Errorf("profile %d: %w", i, err)
 		}
-		if !containers[grant.Container] {
-			return fmt.Errorf("credential grant %d: unknown container %q", i, grant.Container)
+		if profiles[profile.Name] {
+			return fmt.Errorf("duplicate profile name %q", profile.Name)
 		}
-		if !sources[grant.Source] {
-			return fmt.Errorf("credential grant %d: unknown source %q", i, grant.Source)
+		profiles[profile.Name] = true
+		for credential, source := range profile.Credentials {
+			if !sources[source] {
+				return fmt.Errorf("profile %q credential %q: unknown source %q", profile.Name, credential, source)
+			}
 		}
-		key := grant.Container + "\x00" + grant.Credential
-		if grants[key] {
-			return fmt.Errorf("duplicate credential %q for container %q", grant.Credential, grant.Container)
+	}
+	containers := map[string]bool{}
+	for i, c := range s.Containers {
+		if err := ValidateContainer(c); err != nil {
+			return fmt.Errorf("container %d: %w", i, err)
 		}
-		grants[key] = true
+		if containers[c.Name] {
+			return fmt.Errorf("duplicate container name %q", c.Name)
+		}
+		if !profiles[c.Profile] {
+			return fmt.Errorf("container %d: unknown profile %q", i, c.Profile)
+		}
+		containers[c.Name] = true
 	}
 	return nil
+}
+
+func ValidateProfile(profile Profile) error {
+	if !ValidProfileName(profile.Name) {
+		return fmt.Errorf("invalid name %q (want a lowercase slug, max 50 characters)", profile.Name)
+	}
+	routeNames := map[string]bool{}
+	selectors := map[string]bool{}
+	for i, route := range profile.Routes {
+		if err := ValidateRoute(route); err != nil {
+			return fmt.Errorf("route %d: %w", i, err)
+		}
+		if routeNames[route.Name] {
+			return fmt.Errorf("duplicate route name %q", route.Name)
+		}
+		routeNames[route.Name] = true
+		selector := route.Match.selector()
+		if selectors[selector] {
+			return fmt.Errorf("duplicate selector %q", selector)
+		}
+		selectors[selector] = true
+	}
+	for credential, source := range profile.Credentials {
+		if !ValidName(credential) {
+			return fmt.Errorf("invalid credential %q", credential)
+		}
+		if !ValidName(source) {
+			return fmt.Errorf("invalid source %q for credential %q", source, credential)
+		}
+	}
+	for name, value := range profile.Environment {
+		if !validEnvironmentName(name) {
+			return fmt.Errorf("invalid environment name %q", name)
+		}
+		if value == "" || len(value) > 64<<10 || strings.ContainsAny(value, "\x00\r\n") {
+			return fmt.Errorf("environment %q must be a non-empty single-line value no larger than 65536 bytes", name)
+		}
+	}
+	return nil
+}
+
+func validEnvironmentName(name string) bool {
+	if name == "" || !((name[0] >= 'A' && name[0] <= 'Z') || name[0] == '_') {
+		return false
+	}
+	for i := 1; i < len(name); i++ {
+		if !((name[i] >= 'A' && name[i] <= 'Z') || (name[i] >= '0' && name[i] <= '9') || name[i] == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 func ValidateCredentialSource(source CredentialSource) error {
@@ -213,8 +254,8 @@ func ValidateContainer(c Container) error {
 	if !ValidName(c.Name) {
 		return fmt.Errorf("invalid name %q (want a lowercase slug, max 63 characters)", c.Name)
 	}
-	if c.Scope == UniversalScope || !ValidScope(c.Scope) {
-		return fmt.Errorf("invalid scope %q (containers require one concrete scope)", c.Scope)
+	if !ValidProfileName(c.Profile) {
+		return fmt.Errorf("invalid profile %q", c.Profile)
 	}
 	if c.CreatedAt.IsZero() {
 		return errors.New("created_at is required")
@@ -225,9 +266,6 @@ func ValidateContainer(c Container) error {
 func ValidateRoute(r Route) error {
 	if !ValidName(r.Name) {
 		return fmt.Errorf("invalid name %q (want a lowercase slug, max 63 characters)", r.Name)
-	}
-	if !ValidScope(r.Scope) {
-		return fmt.Errorf("invalid scope %q", r.Scope)
 	}
 	if (r.Match.Host == "") == (r.Match.PathPrefix == "") {
 		return errors.New("match must set exactly one of host or path_prefix")
@@ -312,22 +350,20 @@ func (m Match) selector() string {
 // NormalizeState returns a deterministic copy for persistence and API output.
 func NormalizeState(s State) State {
 	s = CloneState(s)
-	for i := range s.Routes {
-		s.Routes[i].Match.Host = strings.ToLower(s.Routes[i].Match.Host)
-		s.Routes[i].Upstream = strings.TrimSuffix(s.Routes[i].Upstream, "/")
-		sort.Slice(s.Routes[i].SetHeaders, func(a, b int) bool {
-			return strings.ToLower(s.Routes[i].SetHeaders[a].Name) < strings.ToLower(s.Routes[i].SetHeaders[b].Name)
-		})
+	for i := range s.Profiles {
+		for j := range s.Profiles[i].Routes {
+			route := &s.Profiles[i].Routes[j]
+			route.Match.Host = strings.ToLower(route.Match.Host)
+			route.Upstream = strings.TrimSuffix(route.Upstream, "/")
+			sort.Slice(route.SetHeaders, func(a, b int) bool {
+				return strings.ToLower(route.SetHeaders[a].Name) < strings.ToLower(route.SetHeaders[b].Name)
+			})
+		}
+		sort.Slice(s.Profiles[i].Routes, func(a, b int) bool { return s.Profiles[i].Routes[a].Name < s.Profiles[i].Routes[b].Name })
 	}
-	sort.Slice(s.Routes, func(i, j int) bool { return s.Routes[i].Name < s.Routes[j].Name })
+	sort.Slice(s.Profiles, func(i, j int) bool { return s.Profiles[i].Name < s.Profiles[j].Name })
 	sort.Slice(s.Containers, func(i, j int) bool { return s.Containers[i].Name < s.Containers[j].Name })
 	sort.Slice(s.CredentialSources, func(i, j int) bool { return s.CredentialSources[i].Name < s.CredentialSources[j].Name })
-	sort.Slice(s.CredentialGrants, func(i, j int) bool {
-		if s.CredentialGrants[i].Container != s.CredentialGrants[j].Container {
-			return s.CredentialGrants[i].Container < s.CredentialGrants[j].Container
-		}
-		return s.CredentialGrants[i].Credential < s.CredentialGrants[j].Credential
-	})
 	return s
 }
 
@@ -336,10 +372,16 @@ func NormalizeState(s State) State {
 func CloneState(s State) State {
 	out := State{Version: s.Version}
 	out.Containers = append([]Container(nil), s.Containers...)
-	out.Routes = make([]Route, len(s.Routes))
-	for i, r := range s.Routes {
-		out.Routes[i] = r
-		out.Routes[i].SetHeaders = append([]HeaderValue(nil), r.SetHeaders...)
+	out.Profiles = make([]Profile, len(s.Profiles))
+	for i, profile := range s.Profiles {
+		out.Profiles[i] = profile
+		out.Profiles[i].Credentials = cloneMap(profile.Credentials)
+		out.Profiles[i].Environment = cloneMap(profile.Environment)
+		out.Profiles[i].Routes = make([]Route, len(profile.Routes))
+		for j, route := range profile.Routes {
+			out.Profiles[i].Routes[j] = route
+			out.Profiles[i].Routes[j].SetHeaders = append([]HeaderValue(nil), route.SetHeaders...)
+		}
 	}
 	out.CredentialSources = make([]CredentialSource, len(s.CredentialSources))
 	for i, source := range s.CredentialSources {
@@ -347,9 +389,8 @@ func CloneState(s State) State {
 		out.CredentialSources[i].Parameters = cloneMap(source.Parameters)
 		out.CredentialSources[i].Secrets = cloneMap(source.Secrets)
 	}
-	out.CredentialGrants = append([]CredentialGrant(nil), s.CredentialGrants...)
-	if out.Routes == nil {
-		out.Routes = []Route{}
+	if out.Profiles == nil {
+		out.Profiles = []Profile{}
 	}
 	if out.Containers == nil {
 		out.Containers = []Container{}
@@ -357,10 +398,20 @@ func CloneState(s State) State {
 	if out.CredentialSources == nil {
 		out.CredentialSources = []CredentialSource{}
 	}
-	if out.CredentialGrants == nil {
-		out.CredentialGrants = []CredentialGrant{}
-	}
 	return out
+}
+
+// AllRoutes returns a detached flat view of the routes contained by profiles.
+func AllRoutes(state State) []Route {
+	var routes []Route
+	for _, profile := range state.Profiles {
+		for _, route := range profile.Routes {
+			copy := route
+			copy.SetHeaders = append([]HeaderValue(nil), route.SetHeaders...)
+			routes = append(routes, copy)
+		}
+	}
+	return routes
 }
 
 func cloneMap(source map[string]string) map[string]string {

@@ -26,19 +26,19 @@ const maxBody = 1 << 20
 
 type Service interface {
 	Health(context.Context) app.Health
-	Routes(context.Context) []domain.Route
-	PutRoute(context.Context, domain.Route) error
-	ReplaceRoutes(context.Context, []domain.Route) error
-	DeleteRoute(context.Context, string) error
+	Profiles(context.Context) []domain.Profile
+	PutProfile(context.Context, domain.Profile) error
+	DeleteProfile(context.Context, string) error
+	Routes(context.Context, string) ([]domain.Route, error)
+	PutRoute(context.Context, string, domain.Route) error
+	ReplaceRoutes(context.Context, string, []domain.Route) error
+	DeleteRoute(context.Context, string, string) error
 	Keys(context.Context) []domain.KeyInfo
 	SetKey(context.Context, string, []byte) error
 	DeleteKey(context.Context, string) error
 	CredentialSources(context.Context) []domain.CredentialSource
 	PutCredentialSource(context.Context, domain.CredentialSource) error
 	DeleteCredentialSource(context.Context, string) error
-	CredentialGrants(context.Context) []domain.CredentialGrant
-	PutCredentialGrant(context.Context, domain.CredentialGrant) error
-	DeleteCredentialGrant(context.Context, string, string) error
 	Containers(context.Context) []domain.Container
 	AddContainer(context.Context, domain.Container) (domain.Container, error)
 	SetContainerBlocked(context.Context, string, bool) error
@@ -55,12 +55,15 @@ func (a API) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, a.Service.Health(r.Context()))
 	})
-	mux.HandleFunc("GET /v1/routes", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, a.Service.Routes(r.Context()))
+	mux.HandleFunc("GET /v1/profiles", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, a.Service.Profiles(r.Context()))
 	})
-	mux.HandleFunc("PUT /v1/routes", a.replaceRoutes)
-	mux.HandleFunc("PUT /v1/routes/{name}", a.putRoute)
-	mux.HandleFunc("DELETE /v1/routes/{name}", a.deleteRoute)
+	mux.HandleFunc("PUT /v1/profiles/{name}", a.putProfile)
+	mux.HandleFunc("DELETE /v1/profiles/{name}", a.deleteProfile)
+	mux.HandleFunc("GET /v1/profiles/{profile}/routes", a.getRoutes)
+	mux.HandleFunc("PUT /v1/profiles/{profile}/routes", a.replaceRoutes)
+	mux.HandleFunc("PUT /v1/profiles/{profile}/routes/{name}", a.putRoute)
+	mux.HandleFunc("DELETE /v1/profiles/{profile}/routes/{name}", a.deleteRoute)
 	mux.HandleFunc("GET /v1/keys", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, a.Service.Keys(r.Context())) })
 	mux.HandleFunc("PUT /v1/keys/{name}", a.putKey)
 	mux.HandleFunc("DELETE /v1/keys/{name}", a.deleteKey)
@@ -69,11 +72,6 @@ func (a API) Handler() http.Handler {
 	})
 	mux.HandleFunc("PUT /v1/credential-sources/{name}", a.putCredentialSource)
 	mux.HandleFunc("DELETE /v1/credential-sources/{name}", a.deleteCredentialSource)
-	mux.HandleFunc("GET /v1/credential-grants", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, a.Service.CredentialGrants(r.Context()))
-	})
-	mux.HandleFunc("PUT /v1/credential-grants/{container}/{credential}", a.putCredentialGrant)
-	mux.HandleFunc("DELETE /v1/credential-grants/{container}/{credential}", a.deleteCredentialGrant)
 	mux.HandleFunc("GET /v1/containers", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, a.Service.Containers(r.Context()))
 	})
@@ -83,12 +81,45 @@ func (a API) Handler() http.Handler {
 	return a.logRequests(mux)
 }
 
+func (a API) putProfile(w http.ResponseWriter, r *http.Request) {
+	var profile domain.Profile
+	if !decodeJSON(w, r, &profile) {
+		return
+	}
+	if profile.Name != r.PathValue("name") {
+		writeErrorStatus(w, http.StatusBadRequest, "profile name must match URL")
+		return
+	}
+	if err := a.Service.PutProfile(r.Context(), profile); err != nil {
+		writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a API) deleteProfile(w http.ResponseWriter, r *http.Request) {
+	if err := a.Service.DeleteProfile(r.Context(), r.PathValue("name")); err != nil {
+		writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a API) getRoutes(w http.ResponseWriter, r *http.Request) {
+	routes, err := a.Service.Routes(r.Context(), r.PathValue("profile"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, routes)
+}
+
 func (a API) replaceRoutes(w http.ResponseWriter, r *http.Request) {
 	var routes []domain.Route
 	if !decodeJSON(w, r, &routes) {
 		return
 	}
-	if err := a.Service.ReplaceRoutes(r.Context(), routes); err != nil {
+	if err := a.Service.ReplaceRoutes(r.Context(), r.PathValue("profile"), routes); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -104,7 +135,7 @@ func (a API) putRoute(w http.ResponseWriter, r *http.Request) {
 		writeErrorStatus(w, http.StatusBadRequest, "route name must match URL")
 		return
 	}
-	if err := a.Service.PutRoute(r.Context(), route); err != nil {
+	if err := a.Service.PutRoute(r.Context(), r.PathValue("profile"), route); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -112,7 +143,7 @@ func (a API) putRoute(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a API) deleteRoute(w http.ResponseWriter, r *http.Request) {
-	if err := a.Service.DeleteRoute(r.Context(), r.PathValue("name")); err != nil {
+	if err := a.Service.DeleteRoute(r.Context(), r.PathValue("profile"), r.PathValue("name")); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -160,30 +191,6 @@ func (a API) putCredentialSource(w http.ResponseWriter, r *http.Request) {
 
 func (a API) deleteCredentialSource(w http.ResponseWriter, r *http.Request) {
 	if err := a.Service.DeleteCredentialSource(r.Context(), r.PathValue("name")); err != nil {
-		writeError(w, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (a API) putCredentialGrant(w http.ResponseWriter, r *http.Request) {
-	var grant domain.CredentialGrant
-	if !decodeJSON(w, r, &grant) {
-		return
-	}
-	if grant.Container != r.PathValue("container") || grant.Credential != r.PathValue("credential") {
-		writeErrorStatus(w, http.StatusBadRequest, "credential grant container and credential must match URL")
-		return
-	}
-	if err := a.Service.PutCredentialGrant(r.Context(), grant); err != nil {
-		writeError(w, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (a API) deleteCredentialGrant(w http.ResponseWriter, r *http.Request) {
-	if err := a.Service.DeleteCredentialGrant(r.Context(), r.PathValue("container"), r.PathValue("credential")); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -385,19 +392,30 @@ func (c *Client) Health(ctx context.Context) (app.Health, error) {
 	err := c.json(ctx, http.MethodGet, "/v1/health", nil, &out)
 	return out, err
 }
-func (c *Client) Routes(ctx context.Context) ([]domain.Route, error) {
-	var out []domain.Route
-	err := c.json(ctx, http.MethodGet, "/v1/routes", nil, &out)
+func (c *Client) Profiles(ctx context.Context) ([]domain.Profile, error) {
+	var out []domain.Profile
+	err := c.json(ctx, http.MethodGet, "/v1/profiles", nil, &out)
 	return out, err
 }
-func (c *Client) ReplaceRoutes(ctx context.Context, routes []domain.Route) error {
-	return c.json(ctx, http.MethodPut, "/v1/routes", routes, nil)
+func (c *Client) PutProfile(ctx context.Context, profile domain.Profile) error {
+	return c.json(ctx, http.MethodPut, "/v1/profiles/"+profile.Name, profile, nil)
 }
-func (c *Client) PutRoute(ctx context.Context, route domain.Route) error {
-	return c.json(ctx, http.MethodPut, "/v1/routes/"+route.Name, route, nil)
+func (c *Client) DeleteProfile(ctx context.Context, name string) error {
+	return c.json(ctx, http.MethodDelete, "/v1/profiles/"+name, nil, nil)
 }
-func (c *Client) DeleteRoute(ctx context.Context, name string) error {
-	return c.json(ctx, http.MethodDelete, "/v1/routes/"+name, nil, nil)
+func (c *Client) Routes(ctx context.Context, profile string) ([]domain.Route, error) {
+	var out []domain.Route
+	err := c.json(ctx, http.MethodGet, "/v1/profiles/"+profile+"/routes", nil, &out)
+	return out, err
+}
+func (c *Client) ReplaceRoutes(ctx context.Context, profile string, routes []domain.Route) error {
+	return c.json(ctx, http.MethodPut, "/v1/profiles/"+profile+"/routes", routes, nil)
+}
+func (c *Client) PutRoute(ctx context.Context, profile string, route domain.Route) error {
+	return c.json(ctx, http.MethodPut, "/v1/profiles/"+profile+"/routes/"+route.Name, route, nil)
+}
+func (c *Client) DeleteRoute(ctx context.Context, profile, name string) error {
+	return c.json(ctx, http.MethodDelete, "/v1/profiles/"+profile+"/routes/"+name, nil, nil)
 }
 func (c *Client) Keys(ctx context.Context) ([]domain.KeyInfo, error) {
 	var out []domain.KeyInfo
@@ -426,17 +444,6 @@ func (c *Client) PutCredentialSource(ctx context.Context, source domain.Credenti
 }
 func (c *Client) DeleteCredentialSource(ctx context.Context, name string) error {
 	return c.json(ctx, http.MethodDelete, "/v1/credential-sources/"+name, nil, nil)
-}
-func (c *Client) CredentialGrants(ctx context.Context) ([]domain.CredentialGrant, error) {
-	var out []domain.CredentialGrant
-	err := c.json(ctx, http.MethodGet, "/v1/credential-grants", nil, &out)
-	return out, err
-}
-func (c *Client) PutCredentialGrant(ctx context.Context, grant domain.CredentialGrant) error {
-	return c.json(ctx, http.MethodPut, "/v1/credential-grants/"+grant.Container+"/"+grant.Credential, grant, nil)
-}
-func (c *Client) DeleteCredentialGrant(ctx context.Context, container, name string) error {
-	return c.json(ctx, http.MethodDelete, "/v1/credential-grants/"+container+"/"+name, nil, nil)
 }
 func (c *Client) Containers(ctx context.Context) ([]domain.Container, error) {
 	var out []domain.Container

@@ -19,14 +19,14 @@ func (m mapResolver) Resolve(_ context.Context, _ string, ref MaterialReference)
 }
 
 func validRoute() Route {
-	return Route{Name: "example", Scope: "prod", Match: Match{PathPrefix: "/api"}, Upstream: "https://example.com/base",
+	return Route{Name: "example", Match: Match{PathPrefix: "/api"}, Upstream: "https://example.com/base",
 		StripPrefix: true, SetHeaders: []HeaderValue{{Name: "Authorization", Value: "Bearer {secret:token}"}}}
 }
 
 func TestValidateState(t *testing.T) {
 	s := NewState()
-	s.Routes = []Route{validRoute()}
-	s.Containers = []Container{{Name: "dev", Scope: "prod", CreatedAt: time.Now()}}
+	s.Profiles = []Profile{{Name: "prod", Routes: []Route{validRoute()}, Credentials: map[string]string{}, Environment: map[string]string{"AGENTBOX_PROFILE": "prod"}}}
+	s.Containers = []Container{{Name: "dev", Profile: "prod", CreatedAt: time.Now()}}
 	if err := ValidateState(s); err != nil {
 		t.Fatal(err)
 	}
@@ -34,12 +34,13 @@ func TestValidateState(t *testing.T) {
 		name   string
 		mutate func(*State)
 	}{
-		{"missing scope", func(s *State) { s.Routes[0].Scope = "" }},
-		{"both selectors", func(s *State) { s.Routes[0].Match.Host = "api.example.com" }},
-		{"unsafe path", func(s *State) { s.Routes[0].Match.PathPrefix = "/api/../x" }},
-		{"bad upstream", func(s *State) { s.Routes[0].Upstream = "file:///tmp/x" }},
-		{"bad template", func(s *State) { s.Routes[0].SetHeaders[0].Value = "{env:TOKEN}" }},
-		{"universal container", func(s *State) { s.Containers[0].Scope = UniversalScope }},
+		{"invalid profile name", func(s *State) { s.Profiles[0].Name = "*" }},
+		{"both selectors", func(s *State) { s.Profiles[0].Routes[0].Match.Host = "api.example.com" }},
+		{"unsafe path", func(s *State) { s.Profiles[0].Routes[0].Match.PathPrefix = "/api/../x" }},
+		{"bad upstream", func(s *State) { s.Profiles[0].Routes[0].Upstream = "file:///tmp/x" }},
+		{"bad template", func(s *State) { s.Profiles[0].Routes[0].SetHeaders[0].Value = "{env:TOKEN}" }},
+		{"universal container", func(s *State) { s.Containers[0].Profile = "*" }},
+		{"unknown profile", func(s *State) { s.Containers[0].Profile = "missing" }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -97,16 +98,16 @@ func TestCredentialTemplate(t *testing.T) {
 
 func TestCredentialStateReferences(t *testing.T) {
 	state := NewState()
-	state.Containers = []Container{{Name: "dev", Scope: "prod", CreatedAt: time.Now()}}
 	state.CredentialSources = []CredentialSource{{Name: "github-prod", Provider: "github-app", Parameters: map[string]string{"installation-id": "1"}, Secrets: map[string]string{"private-key": "app.pem"}}}
-	state.CredentialGrants = []CredentialGrant{{Container: "dev", Credential: "github", Source: "github-prod"}}
+	state.Profiles = []Profile{{Name: "prod", Routes: []Route{}, Credentials: map[string]string{"github": "github-prod"}, Environment: map[string]string{}}}
+	state.Containers = []Container{{Name: "dev", Profile: "prod", CreatedAt: time.Now()}}
 	if err := ValidateState(state); err != nil {
 		t.Fatal(err)
 	}
 	for _, mutate := range []func(*State){
-		func(s *State) { s.CredentialGrants[0].Container = "missing" },
-		func(s *State) { s.CredentialGrants[0].Source = "missing" },
-		func(s *State) { s.CredentialGrants = append(s.CredentialGrants, s.CredentialGrants[0]) },
+		func(s *State) { s.Profiles[0].Credentials["github"] = "missing" },
+		func(s *State) { s.Profiles[0].Credentials["Bad"] = "github-prod" },
+		func(s *State) { s.Profiles = append(s.Profiles, s.Profiles[0]) },
 	} {
 		candidate := CloneState(state)
 		mutate(&candidate)
@@ -118,13 +119,13 @@ func TestCredentialStateReferences(t *testing.T) {
 
 func TestCloneStateIsDeep(t *testing.T) {
 	s := NewState()
-	s.Routes = []Route{validRoute()}
+	s.Profiles = []Profile{{Name: "prod", Routes: []Route{validRoute()}, Credentials: map[string]string{}, Environment: map[string]string{}}}
 	clone := CloneState(s)
-	clone.Routes[0].SetHeaders[0].Value = "changed"
+	clone.Profiles[0].Routes[0].SetHeaders[0].Value = "changed"
 	clone.CredentialSources = []CredentialSource{{Name: "source", Provider: "provider", Parameters: map[string]string{"a": "b"}, Secrets: map[string]string{}}}
 	original := CloneState(clone)
 	clone.CredentialSources[0].Parameters["a"] = "changed"
-	if s.Routes[0].SetHeaders[0].Value == "changed" {
+	if s.Profiles[0].Routes[0].SetHeaders[0].Value == "changed" {
 		t.Fatal("nested route data was shared")
 	}
 	if original.CredentialSources[0].Parameters["a"] == "changed" {

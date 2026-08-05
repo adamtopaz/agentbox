@@ -40,12 +40,13 @@ type Service struct {
 }
 
 type Health struct {
-	Status            string `json:"status"`
-	Routes            int    `json:"routes"`
-	Keys              int    `json:"keys"`
-	Containers        int    `json:"containers"`
-	CredentialSources int    `json:"credential_sources"`
-	CredentialGrants  int    `json:"credential_grants"`
+	Status             string `json:"status"`
+	Profiles           int    `json:"profiles"`
+	Routes             int    `json:"routes"`
+	Keys               int    `json:"keys"`
+	Containers         int    `json:"containers"`
+	CredentialSources  int    `json:"credential_sources"`
+	CredentialBindings int    `json:"credential_bindings"`
 }
 
 func Open(stateStore state.Store, keys *secret.Store) (*Service, error) {
@@ -117,42 +118,106 @@ func (s *Service) Resolve(ctx context.Context, principal string, ref domain.Mate
 func (s *Service) Health(context.Context) Health {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return Health{Status: "ok", Routes: len(s.state.Routes), Keys: len(s.keys.List()), Containers: len(s.state.Containers),
-		CredentialSources: len(s.state.CredentialSources), CredentialGrants: len(s.state.CredentialGrants)}
+	bindings := 0
+	for _, profile := range s.state.Profiles {
+		bindings += len(profile.Credentials)
+	}
+	return Health{Status: "ok", Profiles: len(s.state.Profiles), Routes: len(domain.AllRoutes(s.state)), Keys: len(s.keys.List()), Containers: len(s.state.Containers),
+		CredentialSources: len(s.state.CredentialSources), CredentialBindings: bindings}
 }
 
-func (s *Service) Routes(context.Context) []domain.Route {
+func (s *Service) Routes(_ context.Context, profileName string) ([]domain.Route, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return domain.CloneState(s.state).Routes
+	for _, profile := range s.state.Profiles {
+		if profile.Name == profileName {
+			return domain.AllRoutes(domain.State{Profiles: []domain.Profile{profile}}), nil
+		}
+	}
+	return nil, fmt.Errorf("%w: profile %q", ErrNotFound, profileName)
 }
 
-func (s *Service) PutRoute(_ context.Context, route domain.Route) error {
+func (s *Service) PutRoute(_ context.Context, profileName string, route domain.Route) error {
 	return s.change(func(next *domain.State) error {
-		for i := range next.Routes {
-			if next.Routes[i].Name == route.Name {
-				next.Routes[i] = route
+		for p := range next.Profiles {
+			if next.Profiles[p].Name != profileName {
+				continue
+			}
+			for i := range next.Profiles[p].Routes {
+				if next.Profiles[p].Routes[i].Name == route.Name {
+					next.Profiles[p].Routes[i] = route
+					return nil
+				}
+			}
+			next.Profiles[p].Routes = append(next.Profiles[p].Routes, route)
+			return nil
+		}
+		return fmt.Errorf("%w: profile %q", ErrNotFound, profileName)
+	})
+}
+
+func (s *Service) ReplaceRoutes(_ context.Context, profileName string, routes []domain.Route) error {
+	return s.change(func(next *domain.State) error {
+		for i := range next.Profiles {
+			if next.Profiles[i].Name == profileName {
+				next.Profiles[i].Routes = append([]domain.Route(nil), routes...)
 				return nil
 			}
 		}
-		next.Routes = append(next.Routes, route)
+		return fmt.Errorf("%w: profile %q", ErrNotFound, profileName)
+	})
+}
+
+func (s *Service) DeleteRoute(_ context.Context, profile, name string) error {
+	return s.change(func(next *domain.State) error {
+		for p := range next.Profiles {
+			if next.Profiles[p].Name != profile {
+				continue
+			}
+			for i, route := range next.Profiles[p].Routes {
+				if route.Name == name {
+					next.Profiles[p].Routes = append(next.Profiles[p].Routes[:i], next.Profiles[p].Routes[i+1:]...)
+					return nil
+				}
+			}
+		}
+		return fmt.Errorf("%w: route %q in profile %q", ErrNotFound, name, profile)
+	})
+}
+
+func (s *Service) Profiles(context.Context) []domain.Profile {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return domain.CloneState(s.state).Profiles
+}
+
+func (s *Service) PutProfile(_ context.Context, profile domain.Profile) error {
+	return s.change(func(next *domain.State) error {
+		for i := range next.Profiles {
+			if next.Profiles[i].Name == profile.Name {
+				next.Profiles[i] = profile
+				return nil
+			}
+		}
+		next.Profiles = append(next.Profiles, profile)
 		return nil
 	})
 }
 
-func (s *Service) ReplaceRoutes(_ context.Context, routes []domain.Route) error {
-	return s.change(func(next *domain.State) error { next.Routes = append([]domain.Route(nil), routes...); return nil })
-}
-
-func (s *Service) DeleteRoute(_ context.Context, name string) error {
+func (s *Service) DeleteProfile(_ context.Context, name string) error {
 	return s.change(func(next *domain.State) error {
-		for i, route := range next.Routes {
-			if route.Name == name {
-				next.Routes = append(next.Routes[:i], next.Routes[i+1:]...)
+		for _, container := range next.Containers {
+			if container.Profile == name {
+				return fmt.Errorf("%w: profile %q is used by container %q", ErrConflict, name, container.Name)
+			}
+		}
+		for i, profile := range next.Profiles {
+			if profile.Name == name {
+				next.Profiles = append(next.Profiles[:i], next.Profiles[i+1:]...)
 				return nil
 			}
 		}
-		return fmt.Errorf("%w: route %q", ErrNotFound, name)
+		return fmt.Errorf("%w: profile %q", ErrNotFound, name)
 	})
 }
 
@@ -168,7 +233,7 @@ func (s *Service) SetKey(_ context.Context, name string, value []byte) error {
 func (s *Service) DeleteKey(_ context.Context, name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, route := range s.state.Routes {
+	for _, route := range domain.AllRoutes(s.state) {
 		refs, err := domain.ReferencedKeys([]domain.Route{route})
 		if err != nil {
 			return err
@@ -213,9 +278,11 @@ func (s *Service) PutCredentialSource(_ context.Context, source domain.Credentia
 
 func (s *Service) DeleteCredentialSource(_ context.Context, name string) error {
 	return s.change(func(next *domain.State) error {
-		for _, grant := range next.CredentialGrants {
-			if grant.Source == name {
-				return fmt.Errorf("%w: credential source %q is referenced by grant %q for container %q", ErrConflict, name, grant.Credential, grant.Container)
+		for _, profile := range next.Profiles {
+			for credential, source := range profile.Credentials {
+				if source == name {
+					return fmt.Errorf("%w: credential source %q is bound as %q by profile %q", ErrConflict, name, credential, profile.Name)
+				}
 			}
 		}
 		for i, source := range next.CredentialSources {
@@ -225,37 +292,6 @@ func (s *Service) DeleteCredentialSource(_ context.Context, name string) error {
 			}
 		}
 		return fmt.Errorf("%w: credential source %q", ErrNotFound, name)
-	})
-}
-
-func (s *Service) CredentialGrants(context.Context) []domain.CredentialGrant {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return domain.CloneState(s.state).CredentialGrants
-}
-
-func (s *Service) PutCredentialGrant(_ context.Context, grant domain.CredentialGrant) error {
-	return s.change(func(next *domain.State) error {
-		for i := range next.CredentialGrants {
-			if next.CredentialGrants[i].Container == grant.Container && next.CredentialGrants[i].Credential == grant.Credential {
-				next.CredentialGrants[i] = grant
-				return nil
-			}
-		}
-		next.CredentialGrants = append(next.CredentialGrants, grant)
-		return nil
-	})
-}
-
-func (s *Service) DeleteCredentialGrant(_ context.Context, container, name string) error {
-	return s.change(func(next *domain.State) error {
-		for i, grant := range next.CredentialGrants {
-			if grant.Container == container && grant.Credential == name {
-				next.CredentialGrants = append(next.CredentialGrants[:i], next.CredentialGrants[i+1:]...)
-				return nil
-			}
-		}
-		return fmt.Errorf("%w: credential %q for container %q", ErrNotFound, name, container)
 	})
 }
 
@@ -298,13 +334,6 @@ func (s *Service) DeleteContainer(_ context.Context, name string) error {
 		for i, container := range next.Containers {
 			if container.Name == name {
 				next.Containers = append(next.Containers[:i], next.Containers[i+1:]...)
-				grants := next.CredentialGrants[:0]
-				for _, grant := range next.CredentialGrants {
-					if grant.Container != name {
-						grants = append(grants, grant)
-					}
-				}
-				next.CredentialGrants = grants
 				return nil
 			}
 		}

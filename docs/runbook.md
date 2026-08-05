@@ -54,15 +54,15 @@ prevents daemon startup instead of silently dropping keys.
 ## Renewable credentials
 
 A credential source describes how to issue request material without exposing
-provider details to routes. A credential grant binds one logical name to a
-source for one container:
+provider details to routes. A profile binds logical credential names to
+sources, and every container using that profile inherits the binding:
 
 ```text
 route template {credential:github}
              ↓
-container work + logical name github
+container work → profile production + logical name github
              ↓
-grant to source github-main
+profile binding to source github-main
              ↓
 github-app provider → expiring lease
 ```
@@ -72,8 +72,7 @@ List the live, non-secret configuration:
 ```sh
 agentbox credential source list
 agentbox credential source list --json
-agentbox credential grant list
-agentbox credential grant list --json
+agentbox profile show production
 ```
 
 Generic JSON sources can be submitted with `credential source put`. The
@@ -90,7 +89,8 @@ agentbox credential source github-app github-main \
   --repository-ids 111111,222222 \
   --permissions contents=write,pull_requests=write,issues=write
 
-agentbox credential grant set work github github-main
+agentbox profile create production
+agentbox profile set github production --source github-main
 ```
 
 The Client ID is shown on the GitHub App settings page. The installation ID is
@@ -105,20 +105,19 @@ the token all permissions granted to the installation. Neither option can
 expand beyond the App installation's repository selection or permissions.
 
 One source represents one GitHub installation and one requested repository/
-permission subset. Create additional sources for narrower container grants or
-for installations under other accounts. One token cannot span installations.
+permission subset. Create additional sources for narrower profiles or for
+installations under other accounts. One token cannot span installations.
 
-Sources and grants update while the daemon is running:
+Sources and profile bindings update while the daemon is running:
 
 ```sh
-agentbox credential grant set <container> <logical-name> <source>
-agentbox credential grant delete <container> <logical-name>
+agentbox profile set github <profile> --source <source>
+agentbox profile unset github <profile>
 agentbox credential source delete <source>
 ```
 
-Source deletion is refused while a grant references it. Container deletion
-removes its grants. Updating a source or rotating one of its encrypted keys
-invalidates the cached lease immediately.
+Source deletion is refused while a profile references it. Updating a source or
+rotating one of its encrypted keys invalidates the cached lease immediately.
 
 The broker obtains at most one lease concurrently for a source, caches it only
 in daemon memory, and refreshes five minutes before expiry. During that refresh,
@@ -140,26 +139,26 @@ opaque; no prefix or fixed-length assumption is made.
 List or export routes:
 
 ```sh
-agentbox route list
-agentbox route list --json > routes.json
+agentbox route list <profile>
+agentbox route list --json <profile> > routes.json
 ```
 
 Create or replace one named route:
 
 ```sh
-agentbox route put route.json
+agentbox route put <profile> route.json
 ```
 
-Atomically replace the entire route collection:
+Atomically replace one profile's entire route collection:
 
 ```sh
-agentbox route replace routes.json
+agentbox route replace <profile> routes.json
 ```
 
 Delete one:
 
 ```sh
-agentbox route delete <name>
+agentbox route delete <profile> <name>
 ```
 
 All input is strict JSON: unknown fields, duplicate names/selectors, invalid
@@ -173,32 +172,55 @@ HTTPS upstream. Plain HTTP is accepted for material only when the upstream host
 is a literal loopback IP such as `127.0.0.1` or `::1`; `localhost` and other
 DNS names are deliberately not trusted as proof of a local transport.
 
-Matching order is exact-host routes, then longest path prefix. For otherwise
-equivalent selectors, a route in the container's concrete scope wins over the
-universal `"*"` route. Agentbox routes do not transform request bodies, raw
+Matching order is exact-host routes, then longest path prefix within the
+container's selected profile. Agentbox routes do not transform request bodies, raw
 queries, or provider-visible path suffixes. `strip_prefix` removes only the
 local Agentbox routing namespace before joining the suffix to the upstream base
 path. Bodies remain streaming and are never parsed by the proxy.
 
-State version 2 removed the former path-map, query-drop, and JSON-transform
-features. On first load, version-1 routes without transformations are preserved.
-Any route that used one of those features is omitted rather than silently
-changing its meaning; reapply the relevant provider profile after upgrading.
+State version 3 introduces reusable profiles and migrates version-2 scopes into
+profiles. Legacy per-container grants are migrated only when every container in
+a scope has the same bindings; a conflicting scope fails startup rather than
+broadening access. Version-1 transforming routes remain omitted during
+migration because Agentbox is an authentication proxy.
 
-Provider helpers are optional route generators:
+## Profiles
+
+A profile is the reusable policy selected when a container is created. It owns
+generic routes, public container environment, and logical credential bindings.
+Provider-specific commands are convenience adapters that atomically compose
+those generic fields:
 
 ```sh
-agentbox profile apply github
-agentbox profile apply cloudflare --account-id <32-hex-id> \
-  --gateways prod,test --private-key <stored-key-name>
+agentbox profile create production
+agentbox profile set cloudflare production \
+  --account-id <32-hex-id> --gateway ff-prod \
+  --private-key <stored-key-name>
+agentbox profile set github production --source github-main
 ```
 
-Applying a profile replaces the routes it owns (`github-*` or `cloudflare-*`)
-and preserves all others. Avoid those prefixes for operator-owned routes.
+Inspect or remove assignments without exposing any secret values:
+
+```sh
+agentbox profile list
+agentbox profile show production
+agentbox profile unset github production
+agentbox profile unset cloudflare production
+agentbox profile delete production
+```
+
+Deletion is refused while a container uses the profile. `profile put` accepts
+the strict generic JSON form for integrations that do not yet have a helper.
+
+Multiple profiles can reference different Cloudflare gateways, encrypted keys,
+and GitHub App sources. Reapplying one integration replaces only that
+integration inside the selected profile and preserves its other routes and
+bindings. Avoid the reserved `github-*` and `cloudflare*` route names for
+operator-owned routes.
 
 The GitHub profile has path routes for Git HTTPS/API and exact-host routes for
-GitHub CLI. `api.github.com` and `uploads.github.com` receive the container's
-granted `github` credential;
+GitHub CLI. `api.github.com` and `uploads.github.com` receive the container
+profile's bound `github` credential;
 `objects.githubusercontent.com` and `codeload.github.com` are pass-through so
 credentials are not attached to signed asset downloads. Unmapped hosts return
 404. GitHub CLI uses its supported `http_unix_socket` setting; no TLS
@@ -213,23 +235,17 @@ delegates the Git wire protocol to the distro's original HTTP helper. This lets
 delegated unchanged, and SSH GitHub URLs are intentionally not translated.
 The helper contains no credential and never receives an installation token.
 
-Apply the routes once after configuring at least one source:
+Every container using a GitHub-enabled profile receives the same GitHub policy.
+GitHub operations are attributed to the App installation. Commands that require
+a human-user-only API endpoint may not work; validate the exact `gh` operations
+and App permissions used by agents.
 
-```sh
-agentbox profile apply github
-```
-
-Every container that should use GitHub needs its own grant, even when several
-containers intentionally share one source. GitHub operations are attributed to
-the App installation. Commands that require a human-user-only API endpoint may
-not work; validate the exact `gh` operations and App permissions used by agents.
-
-The Cloudflare profile creates one provider-native route for each named scope.
-`--private-key` explicitly references the arbitrary key-store entry containing
-the Cloudflare API token; the same entry is used for every gateway in that
-application. No key name is derived from a gateway or provider name.
-The container uses `/cloudflare/<scope>/anthropic/...` and
-`/cloudflare/<scope>/openai/...`; after removing that local namespace, Agentbox
+The Cloudflare integration creates one provider-native route in the selected
+profile. `--private-key` explicitly references the arbitrary key-store entry
+containing that gateway's Cloudflare token; no key name is derived from a
+gateway or provider name. The container uses
+`/cloudflare/<profile>/anthropic/...` and
+`/cloudflare/<profile>/openai/...`; after removing that local namespace, Agentbox
 forwards the exact suffix to Cloudflare AI Gateway's corresponding provider
 endpoint. It strips dummy/provider credentials and incoming
 `cf-aig-authorization`, then injects only the host-side value. It does not alter
@@ -245,20 +261,20 @@ shimmed through the REST API.
 ## Containers
 
 ```sh
-agentbox container create --scope prod <name>
+agentbox container create --profile production <name>
 agentbox container list
 agentbox container shell <name>
 agentbox container destroy <name>
 ```
 
-Use `--configure none` for a generic container with no Cloudflare client
-settings, and `--image <alias>` to select another image. The scope determines
-route visibility and is persisted independently of Incus. New instances have
+Use an empty profile for a generic container with no provider integrations,
+and `--image <alias>` to select another image. The profile determines route and
+credential visibility and is persisted independently of Incus. New instances have
 safe resource defaults: 4 CPUs, 8 GiB memory, 2,048 processes, and a 50 GiB
 root disk. Adjust them at creation time when needed:
 
 ```sh
-agentbox container create --scope prod --configure none \
+agentbox container create --profile production \
   --cpus 8 --memory 16GiB --processes 4096 --disk 100GiB <name>
 ```
 
@@ -266,12 +282,12 @@ To let the Incus profile and host determine available capacity without adding
 Agentbox per-instance limits, use the explicit opt-out:
 
 ```sh
-agentbox container create --scope prod --configure none \
+agentbox container create --profile production \
   --no-resource-limits <name>
 ```
 
 `--no-resource-limits` cannot be combined with `--cpus`, `--memory`,
-`--processes`, or `--disk`. Profile-level limits, if any, still apply.
+`--processes`, or `--disk`. Incus profile-level limits, if any, still apply.
 
 These limits are stored by Incus and do not apply retroactively to existing
 containers. Use `incus config set` and `incus config device override`, or
@@ -305,14 +321,14 @@ The current wire adapter is HTTP/1.1 over `/run/agentbox/control.sock`:
 | Method | Path | Operation |
 |---|---|---|
 | `GET` | `/v1/health` | daemon counts/status |
-| `GET`, `PUT` | `/v1/routes` | list or replace all routes |
-| `PUT`, `DELETE` | `/v1/routes/{name}` | upsert or delete one route |
+| `GET` | `/v1/profiles` | list reusable profiles |
+| `PUT`, `DELETE` | `/v1/profiles/{name}` | atomically upsert or delete a profile |
+| `GET`, `PUT` | `/v1/profiles/{profile}/routes` | list or replace one profile's routes |
+| `PUT`, `DELETE` | `/v1/profiles/{profile}/routes/{name}` | upsert or delete one profile route |
 | `GET` | `/v1/keys` | list key metadata |
 | `PUT`, `DELETE` | `/v1/keys/{name}` | set raw value or delete key |
 | `GET` | `/v1/credential-sources` | list non-secret source configuration |
 | `PUT`, `DELETE` | `/v1/credential-sources/{name}` | upsert or delete a source |
-| `GET` | `/v1/credential-grants` | list container credential grants |
-| `PUT`, `DELETE` | `/v1/credential-grants/{container}/{credential}` | upsert or delete a grant |
 | `GET`, `POST` | `/v1/containers` | list or register identities |
 | `PATCH`, `DELETE` | `/v1/containers/{name}` | block/unblock or unregister |
 
@@ -416,7 +432,7 @@ request and response bodies independently.
 For suspected container compromise:
 
 1. `agentbox container block --hard <name>`.
-2. Rotate every key reachable from that container's scope.
+2. Rotate every key reachable from that container's profile.
 3. Review daemon metadata and upstream audit/billing logs.
 4. Destroy and recreate the container.
 

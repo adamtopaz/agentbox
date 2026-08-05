@@ -126,8 +126,8 @@ func (b *Broker) Validate(state domain.State) error {
 	return nil
 }
 
-// Configure atomically changes source/grant lookup. Leases survive unrelated
-// edits but are cleared when their source definition changes.
+// Configure atomically changes source/profile lookup. Leases survive unrelated
+// edits but are cleared when their source definition or profile binding changes.
 func (b *Broker) Configure(state domain.State) error {
 	if err := b.Validate(state); err != nil {
 		return err
@@ -153,11 +153,17 @@ func (b *Broker) Configure(state domain.State) error {
 			resetEntry(entry)
 		}
 	}
-	nextGrants := make(map[string]string, len(state.CredentialGrants))
-	grantedSources := make(map[string]bool, len(state.CredentialGrants))
-	for _, grant := range state.CredentialGrants {
-		nextGrants[grantKey(grant.Container, grant.Credential)] = grant.Source
-		grantedSources[grant.Source] = true
+	profiles := make(map[string]domain.Profile, len(state.Profiles))
+	for _, profile := range state.Profiles {
+		profiles[profile.Name] = profile
+	}
+	nextGrants := make(map[string]string)
+	grantedSources := make(map[string]bool)
+	for _, container := range state.Containers {
+		for credential, source := range profiles[container.Profile].Credentials {
+			nextGrants[grantKey(container.Name, credential)] = source
+			grantedSources[source] = true
+		}
 	}
 	for name, entry := range b.cache {
 		if !grantedSources[name] {

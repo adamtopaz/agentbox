@@ -103,10 +103,10 @@ proxy() {
 }
 
 printf '%s' real-one | abx key set token
+abx profile create test
 cat > "$WORK/plaintext-secret-route.json" <<'EOF'
 {
   "name": "plaintext-secret",
-  "scope": "test",
   "match": {"path_prefix": "/plaintext"},
   "upstream": "http://example.invalid",
   "set_headers": [
@@ -114,13 +114,12 @@ cat > "$WORK/plaintext-secret-route.json" <<'EOF'
   ]
 }
 EOF
-if abx route put "$WORK/plaintext-secret-route.json" >/dev/null 2>&1; then
+if abx route put test "$WORK/plaintext-secret-route.json" >/dev/null 2>&1; then
     fail "secret-bearing remote plaintext route was accepted"
 fi
 cat > "$WORK/path-route.json" <<EOF
 {
   "name": "echo",
-  "scope": "test",
   "match": {"path_prefix": "/echo"},
   "upstream": "http://127.0.0.1:${PORT}/base",
   "strip_prefix": true,
@@ -129,8 +128,8 @@ cat > "$WORK/path-route.json" <<EOF
   ]
 }
 EOF
-abx route put "$WORK/path-route.json"
-control -H 'content-type: application/json' -d '{"name":"dev","scope":"test"}' \
+abx route put test "$WORK/path-route.json"
+control -H 'content-type: application/json' -d '{"name":"dev","profile":"test"}' \
     http://agentbox/v1/containers >/dev/null
 wait_for "$WORK/containers/dev.sock"
 
@@ -152,13 +151,12 @@ PY
 cat > "$WORK/transparent-route.json" <<EOF
 {
   "name": "transparent",
-  "scope": "test",
   "match": {"path_prefix": "/transparent"},
   "upstream": "http://127.0.0.1:${PORT}",
   "strip_prefix": true
 }
 EOF
-abx route put "$WORK/transparent-route.json"
+abx route put test "$WORK/transparent-route.json"
 PAYLOAD='{"model": "claude-opus-5", "system": [{"text":"rules","cache_control":{"type":"ephemeral"}}], "messages":[{"role":"system","content":"more rules"},{"role":"user","content":"say ok"}], "context_management":{"edits":[]}}'
 RESPONSE=$(proxy -H 'content-type: application/json; charset=utf-8' \
     -H 'anthropic-beta: context-management-2025-06-27' \
@@ -188,7 +186,6 @@ PY
 cat > "$WORK/host-route.json" <<EOF
 {
   "name": "host-echo",
-  "scope": "test",
   "match": {"host": "api.example.test"},
   "upstream": "http://127.0.0.1:${PORT}",
   "set_headers": [
@@ -196,7 +193,7 @@ cat > "$WORK/host-route.json" <<EOF
   ]
 }
 EOF
-abx route put "$WORK/host-route.json"
+abx route put test "$WORK/host-route.json"
 RESPONSE=$(proxy -H 'Host: api.example.test' 'http://agentbox/host/path')
 python3 - "$RESPONSE" <<'PY'
 import json, sys
@@ -209,7 +206,6 @@ PY
 cat > "$WORK/missing-route.json" <<EOF
 {
   "name": "missing",
-  "scope": "test",
   "match": {"path_prefix": "/missing"},
   "upstream": "http://127.0.0.1:${PORT}",
   "set_headers": [
@@ -217,11 +213,11 @@ cat > "$WORK/missing-route.json" <<EOF
   ]
 }
 EOF
-abx route put "$WORK/missing-route.json"
+abx route put test "$WORK/missing-route.json"
 [[ $(proxy -o /dev/null -w '%{http_code}' http://agentbox/missing/x) == 503 ]] \
     || fail "missing key did not return 503"
 
-# Renewable credentials are configured and granted independently. A missing
+# Renewable credentials are configured and bound through the profile. A missing
 # GitHub App private key fails before any network request and never forwards
 # the container's dummy Authorization header.
 abx credential source github-app github-test \
@@ -230,15 +226,14 @@ abx credential source github-app github-test \
     --private-key github-app-private-key \
     --repository-ids 42 \
     --permissions contents=write,pull_requests=write
-abx credential grant set dev github github-test
-abx profile apply github >/dev/null
+abx profile set github test --source github-test
 [[ $(proxy -o /dev/null -w '%{http_code}' -H 'Host: api.github.com' \
     -H 'Authorization: Bearer agentbox-dummy' http://agentbox/repos/example/repo) == 503 ]] \
     || fail "unavailable renewable credential did not fail closed"
 abx credential source list | grep -q 'github-test.*github-app' \
     || fail "credential source is not listed"
-abx credential grant list | grep -q 'dev.*github.*github-test' \
-    || fail "credential grant is not listed"
+abx profile show test | grep -q '"github": "github-test"' \
+    || fail "profile credential binding is not listed"
 
 abx container block dev >/dev/null
 [[ $(proxy -o /dev/null -w '%{http_code}' http://agentbox/echo/x) == 403 ]] \
@@ -248,7 +243,7 @@ control -X PATCH -H 'content-type: application/json' -d '{"blocked":false}' \
 [[ $(proxy -o /dev/null -w '%{http_code}' http://agentbox/echo/x) == 200 ]] \
     || fail "live unblock did not restore the route"
 
-abx status | grep -q '10 routes, 1 keys, 1 containers, 1 credential sources, 1 credential grants' \
+abx status | grep -q '1 profiles, 10 routes, 1 keys, 1 containers, 1 credential sources, 1 credential bindings' \
     || fail "health counts are wrong"
 for leak in QUERYSECRET container-fake real-one real-two; do
     if grep -Fq "$leak" "$WORK/daemon.log"; then

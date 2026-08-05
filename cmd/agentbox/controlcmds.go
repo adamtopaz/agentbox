@@ -27,8 +27,8 @@ func cmdStatus(ctx context.Context, client *control.Client, args []string) error
 	if err != nil {
 		return err
 	}
-	fmt.Printf("agentboxd: %s (%d routes, %d keys, %d containers, %d credential sources, %d credential grants)\n",
-		health.Status, health.Routes, health.Keys, health.Containers, health.CredentialSources, health.CredentialGrants)
+	fmt.Printf("agentboxd: %s (%d profiles, %d routes, %d keys, %d containers, %d credential sources, %d credential bindings)\n",
+		health.Status, health.Profiles, health.Routes, health.Keys, health.Containers, health.CredentialSources, health.CredentialBindings)
 	return nil
 }
 
@@ -43,10 +43,10 @@ func cmdRoute(ctx context.Context, client *control.Client, args []string) error 
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		if fs.NArg() != 0 {
-			return errors.New("usage: agentbox route list [--json]")
+		if fs.NArg() != 1 {
+			return errors.New("usage: agentbox route list [--json] <profile>")
 		}
-		routes, err := client.Routes(ctx)
+		routes, err := client.Routes(ctx, fs.Arg(0))
 		if err != nil {
 			return err
 		}
@@ -54,7 +54,7 @@ func cmdRoute(ctx context.Context, client *control.Client, args []string) error 
 			return printJSON(routes)
 		}
 		w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "NAME\tSCOPE\tMATCH\tUPSTREAM\tMATERIAL")
+		fmt.Fprintln(w, "NAME\tMATCH\tUPSTREAM\tMATERIAL")
 		for _, route := range routes {
 			match := route.Match.PathPrefix
 			if route.Match.Host != "" {
@@ -73,40 +73,40 @@ func cmdRoute(ctx context.Context, client *control.Client, args []string) error 
 			if materialList == "" {
 				materialList = "-"
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", route.Name, route.Scope, match, route.Upstream, materialList)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", route.Name, match, route.Upstream, materialList)
 		}
 		return w.Flush()
 	case "put":
-		if len(args) != 2 {
-			return errors.New("usage: agentbox route put <route.json|->")
+		if len(args) != 3 {
+			return errors.New("usage: agentbox route put <profile> <route.json|->")
 		}
 		var route domain.Route
-		if err := readJSON(args[1], &route); err != nil {
+		if err := readJSON(args[2], &route); err != nil {
 			return err
 		}
 		if err := domain.ValidateRoute(route); err != nil {
 			return err
 		}
-		return client.PutRoute(ctx, route)
+		return client.PutRoute(ctx, args[1], route)
 	case "replace":
-		if len(args) != 2 {
-			return errors.New("usage: agentbox route replace <routes.json|->")
+		if len(args) != 3 {
+			return errors.New("usage: agentbox route replace <profile> <routes.json|->")
 		}
 		var routes []domain.Route
-		if err := readJSON(args[1], &routes); err != nil {
+		if err := readJSON(args[2], &routes); err != nil {
 			return err
 		}
-		state := domain.NewState()
-		state.Routes = routes
-		if err := domain.ValidateState(state); err != nil {
-			return err
+		for i, route := range routes {
+			if err := domain.ValidateRoute(route); err != nil {
+				return fmt.Errorf("route %d: %w", i, err)
+			}
 		}
-		return client.ReplaceRoutes(ctx, routes)
+		return client.ReplaceRoutes(ctx, args[1], routes)
 	case "delete":
-		if len(args) != 2 {
-			return errors.New("usage: agentbox route delete <name>")
+		if len(args) != 3 {
+			return errors.New("usage: agentbox route delete <profile> <name>")
 		}
-		return client.DeleteRoute(ctx, args[1])
+		return client.DeleteRoute(ctx, args[1], args[2])
 	default:
 		return fmt.Errorf("unknown route command %q", args[0])
 	}
@@ -152,44 +152,158 @@ func cmdKey(ctx context.Context, client *control.Client, args []string) error {
 }
 
 func cmdProfile(ctx context.Context, client *control.Client, args []string) error {
-	if len(args) < 2 || args[0] != "apply" {
-		return errors.New("usage: agentbox profile apply github|cloudflare")
+	if len(args) == 0 {
+		return errors.New("usage: agentbox profile list|show|create|put|delete|set|unset")
 	}
-	existing, err := client.Routes(ctx)
-	if err != nil {
-		return err
-	}
-	var merged []domain.Route
-	switch args[1] {
-	case "github":
-		if len(args) != 2 {
-			return errors.New("usage: agentbox profile apply github")
-		}
-		merged = profile.ReplaceOwned(existing, profile.GitHubRoutes(), profile.OwnsGitHub)
-	case "cloudflare":
-		fs := flag.NewFlagSet("profile apply cloudflare", flag.ContinueOnError)
-		account := fs.String("account-id", "", "Cloudflare account ID")
-		gateways := fs.String("gateways", "", "comma-separated gateway names")
-		privateKey := fs.String("private-key", "", "encrypted key name containing the Cloudflare API token")
-		if err := fs.Parse(args[2:]); err != nil {
+	switch args[0] {
+	case "list":
+		fs := flag.NewFlagSet("profile list", flag.ContinueOnError)
+		asJSON := fs.Bool("json", false, "emit JSON")
+		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		if fs.NArg() != 0 || *account == "" || *gateways == "" || *privateKey == "" {
-			return errors.New("usage: agentbox profile apply cloudflare --account-id ID --gateways prod,test --private-key KEY")
+		if fs.NArg() != 0 {
+			return errors.New("usage: agentbox profile list [--json]")
 		}
-		generated, err := profile.CloudflareRoutes(*account, splitComma(*gateways), *privateKey)
+		profiles, err := client.Profiles(ctx)
 		if err != nil {
 			return err
 		}
-		merged = profile.ReplaceOwned(existing, generated, profile.OwnsCloudflare)
+		if *asJSON {
+			return printJSON(profiles)
+		}
+		w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+		fmt.Fprintln(w, "NAME\tROUTES\tCREDENTIALS\tENVIRONMENT")
+		for _, current := range profiles {
+			fmt.Fprintf(w, "%s\t%d\t%d\t%d\n", current.Name, len(current.Routes), len(current.Credentials), len(current.Environment))
+		}
+		return w.Flush()
+	case "show":
+		if len(args) != 2 {
+			return errors.New("usage: agentbox profile show <name>")
+		}
+		current, err := findProfile(ctx, client, args[1])
+		if err != nil {
+			return err
+		}
+		return printJSON(current)
+	case "create":
+		if len(args) != 2 {
+			return errors.New("usage: agentbox profile create <name>")
+		}
+		profiles, err := client.Profiles(ctx)
+		if err != nil {
+			return err
+		}
+		for _, current := range profiles {
+			if current.Name == args[1] {
+				return fmt.Errorf("profile %q already exists", args[1])
+			}
+		}
+		created, err := profile.New(args[1])
+		if err != nil {
+			return err
+		}
+		return client.PutProfile(ctx, created)
+	case "put":
+		if len(args) != 2 {
+			return errors.New("usage: agentbox profile put <profile.json|->")
+		}
+		var current domain.Profile
+		if err := readJSON(args[1], &current); err != nil {
+			return err
+		}
+		if err := domain.ValidateProfile(current); err != nil {
+			return err
+		}
+		return client.PutProfile(ctx, current)
+	case "delete":
+		if len(args) != 2 {
+			return errors.New("usage: agentbox profile delete <name>")
+		}
+		return client.DeleteProfile(ctx, args[1])
+	case "set":
+		return cmdProfileSet(ctx, client, args[1:])
+	case "unset":
+		return cmdProfileUnset(ctx, client, args[1:])
 	default:
-		return fmt.Errorf("unknown profile %q", args[1])
+		return fmt.Errorf("unknown profile command %q", args[0])
 	}
-	if err := client.ReplaceRoutes(ctx, merged); err != nil {
+}
+
+func cmdProfileSet(ctx context.Context, client *control.Client, args []string) error {
+	if len(args) < 2 {
+		return errors.New("usage: agentbox profile set cloudflare|github <profile> [flags]")
+	}
+	current, err := findProfile(ctx, client, args[1])
+	if err != nil {
 		return err
 	}
-	fmt.Printf("applied %s profile (%d total routes)\n", args[1], len(merged))
-	return nil
+	switch args[0] {
+	case "cloudflare":
+		fs := flag.NewFlagSet("profile set cloudflare", flag.ContinueOnError)
+		account := fs.String("account-id", "", "Cloudflare account ID")
+		gateway := fs.String("gateway", "", "Cloudflare gateway name")
+		privateKey := fs.String("private-key", "", "encrypted key name containing the Cloudflare AI Gateway token")
+		if err := fs.Parse(args[2:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 0 || *account == "" || *gateway == "" || *privateKey == "" {
+			return errors.New("usage: agentbox profile set cloudflare <profile> --account-id ID --gateway NAME --private-key KEY")
+		}
+		current, err = profile.SetCloudflare(current, *account, *gateway, *privateKey)
+	case "github":
+		fs := flag.NewFlagSet("profile set github", flag.ContinueOnError)
+		source := fs.String("source", "", "GitHub App credential source")
+		if err := fs.Parse(args[2:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 0 || *source == "" {
+			return errors.New("usage: agentbox profile set github <profile> --source SOURCE")
+		}
+		current, err = profile.SetGitHub(current, *source)
+	default:
+		return fmt.Errorf("unknown profile integration %q", args[0])
+	}
+	if err != nil {
+		return err
+	}
+	return client.PutProfile(ctx, current)
+}
+
+func cmdProfileUnset(ctx context.Context, client *control.Client, args []string) error {
+	if len(args) != 2 {
+		return errors.New("usage: agentbox profile unset cloudflare|github <profile>")
+	}
+	current, err := findProfile(ctx, client, args[1])
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "cloudflare":
+		current, err = profile.UnsetCloudflare(current)
+	case "github":
+		current, err = profile.UnsetGitHub(current)
+	default:
+		return fmt.Errorf("unknown profile integration %q", args[0])
+	}
+	if err != nil {
+		return err
+	}
+	return client.PutProfile(ctx, current)
+}
+
+func findProfile(ctx context.Context, client *control.Client, name string) (domain.Profile, error) {
+	profiles, err := client.Profiles(ctx)
+	if err != nil {
+		return domain.Profile{}, err
+	}
+	for _, current := range profiles {
+		if current.Name == name {
+			return current, nil
+		}
+	}
+	return domain.Profile{}, fmt.Errorf("profile %q does not exist; create it first", name)
 }
 
 func readJSON(path string, dst any) error {

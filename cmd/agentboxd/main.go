@@ -101,8 +101,8 @@ func run() error {
 		return fmt.Errorf("notify systemd that agentboxd is ready: %w", err)
 	}
 	log.Info("agentboxd ready", "version", version, "control_socket", *controlSocket,
-		"routes", health.Routes, "keys", health.Keys, "containers", health.Containers,
-		"credential_sources", health.CredentialSources, "credential_grants", health.CredentialGrants)
+		"profiles", health.Profiles, "routes", health.Routes, "keys", health.Keys, "containers", health.Containers,
+		"credential_sources", health.CredentialSources, "credential_bindings", health.CredentialBindings)
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

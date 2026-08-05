@@ -68,9 +68,9 @@ func (p *fakeProvider) Calls() int {
 
 func brokerState() domain.State {
 	state := domain.NewState()
-	state.Containers = []domain.Container{{Name: "dev", Scope: "prod", CreatedAt: time.Unix(1, 0)}}
 	state.CredentialSources = []domain.CredentialSource{{Name: "source", Provider: "fake", Parameters: map[string]string{}, Secrets: map[string]string{"root": "root-key"}}}
-	state.CredentialGrants = []domain.CredentialGrant{{Container: "dev", Credential: "api", Source: "source"}}
+	state.Profiles = []domain.Profile{{Name: "prod", Routes: []domain.Route{}, Credentials: map[string]string{"api": "source"}, Environment: map[string]string{}}}
+	state.Containers = []domain.Container{{Name: "dev", Profile: "prod", CreatedAt: time.Unix(1, 0)}}
 	return state
 }
 
@@ -198,11 +198,11 @@ func TestBrokerInvalidatesChangedAndUngrantedSources(t *testing.T) {
 	if err != nil || string(lease.Value) != "token-2" {
 		t.Fatalf("changed source lease=%q calls=%d err=%v", lease.Value, provider.Calls(), err)
 	}
-	state.CredentialGrants = nil
+	delete(state.Profiles[0].Credentials, "api")
 	if err := broker.Configure(state); err != nil {
 		t.Fatal(err)
 	}
-	state.CredentialGrants = []domain.CredentialGrant{{Container: "dev", Credential: "api", Source: "source"}}
+	state.Profiles[0].Credentials["api"] = "source"
 	if err := broker.Configure(state); err != nil {
 		t.Fatal(err)
 	}

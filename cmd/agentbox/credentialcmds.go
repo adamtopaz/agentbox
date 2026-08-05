@@ -17,13 +17,11 @@ import (
 
 func cmdCredential(ctx context.Context, client *control.Client, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: agentbox credential source|grant ...")
+		return errors.New("usage: agentbox credential source ...")
 	}
 	switch args[0] {
 	case "source":
 		return cmdCredentialSource(ctx, client, args[1:])
-	case "grant":
-		return cmdCredentialGrant(ctx, client, args[1:])
 	default:
 		return fmt.Errorf("unknown credential command %q", args[0])
 	}
@@ -119,51 +117,5 @@ func cmdCredentialSource(ctx context.Context, client *control.Client, args []str
 		return client.DeleteCredentialSource(ctx, args[1])
 	default:
 		return fmt.Errorf("unknown credential source command %q", args[0])
-	}
-}
-
-func cmdCredentialGrant(ctx context.Context, client *control.Client, args []string) error {
-	if len(args) == 0 {
-		return errors.New("usage: agentbox credential grant list|set|delete")
-	}
-	switch args[0] {
-	case "list":
-		fs := flag.NewFlagSet("credential grant list", flag.ContinueOnError)
-		asJSON := fs.Bool("json", false, "emit JSON")
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
-		}
-		if fs.NArg() != 0 {
-			return errors.New("usage: agentbox credential grant list [--json]")
-		}
-		grants, err := client.CredentialGrants(ctx)
-		if err != nil {
-			return err
-		}
-		if *asJSON {
-			return printJSON(grants)
-		}
-		w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "CONTAINER\tCREDENTIAL\tSOURCE")
-		for _, grant := range grants {
-			fmt.Fprintf(w, "%s\t%s\t%s\n", grant.Container, grant.Credential, grant.Source)
-		}
-		return w.Flush()
-	case "set":
-		if len(args) != 4 {
-			return errors.New("usage: agentbox credential grant set <container> <credential> <source>")
-		}
-		grant := domain.CredentialGrant{Container: args[1], Credential: args[2], Source: args[3]}
-		if err := domain.ValidateCredentialGrant(grant); err != nil {
-			return err
-		}
-		return client.PutCredentialGrant(ctx, grant)
-	case "delete":
-		if len(args) != 3 {
-			return errors.New("usage: agentbox credential grant delete <container> <credential>")
-		}
-		return client.DeleteCredentialGrant(ctx, args[1], args[2])
-	default:
-		return fmt.Errorf("unknown credential grant command %q", args[0])
 	}
 }

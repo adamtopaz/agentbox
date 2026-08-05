@@ -109,7 +109,7 @@ func TestCreateRegistersBeforeLaunchAndRollsBack(t *testing.T) {
 		Incus: commands, Control: control, SocketDir: "/run/test", SocketWait: time.Millisecond,
 		SocketReady: func(path string) bool { return path == "/run/test/dev.sock" },
 	}
-	err := manager.Create(context.Background(), CreateOptions{Name: "dev", Scope: "prod"})
+	err := manager.Create(context.Background(), CreateOptions{Name: "dev", Profile: "prod"})
 	if err == nil || !strings.Contains(err.Error(), "launch failure") {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestCreateAppliesDefaultResourceLimits(t *testing.T) {
 		Incus: commands, Control: control, SocketDir: "/run/test",
 		SocketReady: func(string) bool { return true },
 	}
-	if err := manager.Create(context.Background(), CreateOptions{Name: "dev", Scope: "prod"}); err != nil {
+	if err := manager.Create(context.Background(), CreateOptions{Name: "dev", Profile: "prod"}); err != nil {
 		t.Fatal(err)
 	}
 	if len(commands.calls) == 0 {
@@ -152,7 +152,7 @@ func TestCreateCanOmitResourceLimits(t *testing.T) {
 		SocketReady: func(string) bool { return true },
 	}
 	if err := manager.Create(context.Background(), CreateOptions{
-		Name: "dev", Scope: "prod", NoResourceLimits: true,
+		Name: "dev", Profile: "prod", NoResourceLimits: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestCreateRejectsInvalidResourceLimitsBeforeMutation(t *testing.T) {
 	control := &controlFake{}
 	commands := &commanderFake{}
 	manager := &Manager{Incus: commands, Control: control}
-	if err := manager.Create(context.Background(), CreateOptions{Name: "dev", Scope: "prod", Memory: "everything"}); err == nil {
+	if err := manager.Create(context.Background(), CreateOptions{Name: "dev", Profile: "prod", Memory: "everything"}); err == nil {
 		t.Fatal("invalid memory limit accepted")
 	}
 	if len(commands.calls) != 0 || len(control.containers) != 0 {
@@ -188,7 +188,7 @@ func TestCreateRollsBackInstanceCreatedBeforeLaunchError(t *testing.T) {
 		Incus: commands, Control: control, SocketDir: "/run/test", SocketWait: time.Millisecond,
 		SocketReady: func(string) bool { return true },
 	}
-	if err := manager.Create(context.Background(), CreateOptions{Name: "dev", Scope: "prod"}); err == nil {
+	if err := manager.Create(context.Background(), CreateOptions{Name: "dev", Profile: "prod"}); err == nil {
 		t.Fatal("launch failure was accepted")
 	}
 	if len(commands.instances) != 0 || len(control.containers) != 0 {
@@ -198,7 +198,7 @@ func TestCreateRollsBackInstanceCreatedBeforeLaunchError(t *testing.T) {
 
 func TestUnblockRestoresDevicesBeforePublishingState(t *testing.T) {
 	var events []string
-	control := &controlFake{containers: []domain.Container{{Name: "dev", Scope: "prod", Blocked: true, CreatedAt: time.Now()}}, events: &events}
+	control := &controlFake{containers: []domain.Container{{Name: "dev", Profile: "prod", Blocked: true, CreatedAt: time.Now()}}, events: &events}
 	commands := &commanderFake{events: &events}
 	manager := &Manager{Incus: commands, Control: control, SocketDir: "/run/test"}
 	if err := manager.Unblock(context.Background(), "dev"); err != nil {

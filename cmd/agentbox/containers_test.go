@@ -8,7 +8,7 @@ import (
 
 func TestContainerCreateRejectsNoLimitsWithIndividualLimit(t *testing.T) {
 	err := cmdContainer(context.Background(), nil, []string{
-		"create", "--scope", "test", "--configure", "none",
+		"create", "--profile", "test",
 		"--no-resource-limits", "--cpus", "2", "dev",
 	})
 	if err == nil || !strings.Contains(err.Error(), "cannot be combined with --cpus") {

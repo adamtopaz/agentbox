@@ -49,16 +49,16 @@ type Manager struct {
 }
 
 type CreateOptions struct {
-	Name, Scope, ConfigureScript string
-	CPUs                         uint
-	Memory                       string
-	Processes                    uint
-	Disk                         string
-	NoResourceLimits             bool
+	Name, Profile, ConfigureScript string
+	CPUs                           uint
+	Memory                         string
+	Processes                      uint
+	Disk                           string
+	NoResourceLimits               bool
 }
 
 func (m *Manager) Create(ctx context.Context, options CreateOptions) error {
-	container := domain.Container{Name: options.Name, Scope: options.Scope, CreatedAt: time.Now().UTC()}
+	container := domain.Container{Name: options.Name, Profile: options.Profile, CreatedAt: time.Now().UTC()}
 	if err := domain.ValidateContainer(container); err != nil {
 		return err
 	}
@@ -128,7 +128,7 @@ func (m *Manager) Create(ctx context.Context, options CreateOptions) error {
 			return rollback(err)
 		}
 	}
-	fmt.Fprintf(m.out(), "container %q ready in scope %q; enter it with: agentbox container shell %s\n", options.Name, options.Scope, options.Name)
+	fmt.Fprintf(m.out(), "container %q ready with profile %q; enter it with: agentbox container shell %s\n", options.Name, options.Profile, options.Name)
 	return nil
 }
 
@@ -260,9 +260,9 @@ func (m *Manager) Unblock(ctx context.Context, name string) error {
 }
 
 type Row struct {
-	Name, Scope, Incus string
-	Blocked, Socket    bool
-	CreatedAt          time.Time
+	Name, Profile, Incus string
+	Blocked, Socket      bool
+	CreatedAt            time.Time
 }
 
 type instance struct {
@@ -289,7 +289,7 @@ func (m *Manager) List(ctx context.Context) ([]Row, error) {
 	seen := map[string]bool{}
 	var rows []Row
 	for _, c := range containers {
-		row := Row{Name: c.Name, Scope: c.Scope, Blocked: c.Blocked, CreatedAt: c.CreatedAt, Incus: "MISSING!", Socket: m.socketLive(c.Name)}
+		row := Row{Name: c.Name, Profile: c.Profile, Blocked: c.Blocked, CreatedAt: c.CreatedAt, Incus: "MISSING!", Socket: m.socketLive(c.Name)}
 		if instance, ok := managed[c.Name]; ok {
 			row.Incus = instance.Status
 		}

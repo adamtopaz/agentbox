@@ -63,7 +63,7 @@ func (s *Server) Handler(containerName string) http.Handler {
 			return
 		}
 
-		route, routedPath, ok := snapshot.Match(container.Scope, domain.Hostname(r.Host), r.URL.Path)
+		route, routedPath, ok := snapshot.Match(container.Profile, domain.Hostname(r.Host), r.URL.Path)
 		if !ok {
 			status = http.StatusNotFound
 			http.Error(w, "unknown route", status)

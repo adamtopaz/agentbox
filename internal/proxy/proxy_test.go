@@ -37,6 +37,26 @@ type roundTrip func(*http.Request) (*http.Response, error)
 
 func (f roundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
+func proxyState(routes []domain.Route) domain.State {
+	state := domain.NewState()
+	state.Profiles = []domain.Profile{{Name: "prod", Routes: routes, Credentials: map[string]string{}, Environment: map[string]string{}}}
+	state.Containers = []domain.Container{{Name: "dev", Profile: "prod", CreatedAt: time.Now()}}
+	return state
+}
+
+func cloudflareProfile(t *testing.T) domain.Profile {
+	t.Helper()
+	current, err := profile.New("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err = profile.SetCloudflare(current, "0123456789abcdef0123456789abcdef", "prod", "cloudflare-api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return current
+}
+
 func TestDefaultTransportHasProductionBounds(t *testing.T) {
 	if defaultTransport.TLSClientConfig == nil || defaultTransport.TLSClientConfig.MinVersion < tls.VersionTLS12 {
 		t.Fatal("default transport permits TLS older than 1.2")
@@ -50,10 +70,8 @@ func TestDefaultTransportHasProductionBounds(t *testing.T) {
 }
 
 func TestProxyStripsThenInjects(t *testing.T) {
-	state := domain.NewState()
-	state.Containers = []domain.Container{{Name: "dev", Scope: "prod", CreatedAt: time.Now()}}
-	state.Routes = []domain.Route{{Name: "api", Scope: "prod", Match: domain.Match{PathPrefix: "/api"}, Upstream: "https://upstream.invalid/base", StripPrefix: true,
-		SetHeaders: []domain.HeaderValue{{Name: "Authorization", Value: "Bearer {secret:token}"}, {Name: "cf-aig-authorization", Value: "{secret:token}"}}}}
+	state := proxyState([]domain.Route{{Name: "api", Match: domain.Match{PathPrefix: "/api"}, Upstream: "https://upstream.invalid/base", StripPrefix: true,
+		SetHeaders: []domain.HeaderValue{{Name: "Authorization", Value: "Bearer {secret:token}"}, {Name: "cf-aig-authorization", Value: "{secret:token}"}}}})
 	snapshot, err := engine.Compile(state)
 	if err != nil {
 		t.Fatal(err)
@@ -93,13 +111,9 @@ func TestProxyStripsThenInjects(t *testing.T) {
 }
 
 func TestProxyPreservesProviderNativeRequest(t *testing.T) {
-	routes, err := profile.CloudflareRoutes("0123456789abcdef0123456789abcdef", []string{"prod"}, "cloudflare-api")
-	if err != nil {
-		t.Fatal(err)
-	}
 	state := domain.NewState()
-	state.Containers = []domain.Container{{Name: "dev", Scope: "prod", CreatedAt: time.Now()}}
-	state.Routes = routes
+	state.Profiles = []domain.Profile{cloudflareProfile(t)}
+	state.Containers = []domain.Container{{Name: "dev", Profile: "prod", CreatedAt: time.Now()}}
 	snapshot, err := engine.Compile(state)
 	if err != nil {
 		t.Fatal(err)
@@ -152,13 +166,9 @@ func TestProxyPreservesProviderNativeRequest(t *testing.T) {
 }
 
 func TestProxyPreservesOpenAIProviderNativeRequest(t *testing.T) {
-	routes, err := profile.CloudflareRoutes("0123456789abcdef0123456789abcdef", []string{"prod"}, "cloudflare-api")
-	if err != nil {
-		t.Fatal(err)
-	}
 	state := domain.NewState()
-	state.Containers = []domain.Container{{Name: "dev", Scope: "prod", CreatedAt: time.Now()}}
-	state.Routes = routes
+	state.Profiles = []domain.Profile{cloudflareProfile(t)}
+	state.Containers = []domain.Container{{Name: "dev", Profile: "prod", CreatedAt: time.Now()}}
 	snapshot, err := engine.Compile(state)
 	if err != nil {
 		t.Fatal(err)
@@ -212,11 +222,12 @@ func (r *credentialResolver) Resolve(_ context.Context, principal string, ref do
 
 func TestProxyResolvesCredentialForListenerPrincipal(t *testing.T) {
 	state := domain.NewState()
-	state.Containers = []domain.Container{{Name: "dev", Scope: "prod", CreatedAt: time.Now()}}
-	state.Routes = []domain.Route{{
-		Name: "github", Scope: "*", Match: domain.Match{Host: "api.github.com"}, Upstream: "https://api.github.com",
+	state.CredentialSources = []domain.CredentialSource{{Name: "source", Provider: "fake", Parameters: map[string]string{}, Secrets: map[string]string{}}}
+	state.Profiles = []domain.Profile{{Name: "prod", Credentials: map[string]string{"github": "source"}, Environment: map[string]string{}, Routes: []domain.Route{{
+		Name: "github", Match: domain.Match{Host: "api.github.com"}, Upstream: "https://api.github.com",
 		SetHeaders: []domain.HeaderValue{{Name: "Authorization", Value: "Bearer {credential:github}"}},
-	}}
+	}}}}
+	state.Containers = []domain.Container{{Name: "dev", Profile: "prod", CreatedAt: time.Now()}}
 	snapshot, err := engine.Compile(state)
 	if err != nil {
 		t.Fatal(err)
@@ -243,9 +254,7 @@ func TestProxyResolvesCredentialForListenerPrincipal(t *testing.T) {
 }
 
 func TestProxyFailsClosed(t *testing.T) {
-	state := domain.NewState()
-	state.Containers = []domain.Container{{Name: "dev", Scope: "prod", CreatedAt: time.Now()}}
-	state.Routes = []domain.Route{{Name: "api", Scope: "prod", Match: domain.Match{PathPrefix: "/api"}, Upstream: "https://upstream.invalid", SetHeaders: []domain.HeaderValue{{Name: "Authorization", Value: "{secret:missing}"}}}}
+	state := proxyState([]domain.Route{{Name: "api", Match: domain.Match{PathPrefix: "/api"}, Upstream: "https://upstream.invalid", SetHeaders: []domain.HeaderValue{{Name: "Authorization", Value: "{secret:missing}"}}}})
 	snapshot, _ := engine.Compile(state)
 	called := false
 	server := &Server{Snapshots: snapshots{snapshot}, Materials: resolver{}, Transport: roundTrip(func(*http.Request) (*http.Response, error) { called = true; return nil, context.Canceled }), Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
@@ -265,9 +274,7 @@ func TestProxyFailsClosed(t *testing.T) {
 }
 
 func TestTransportErrorDetailsAreNotLogged(t *testing.T) {
-	state := domain.NewState()
-	state.Containers = []domain.Container{{Name: "dev", Scope: "prod", CreatedAt: time.Now()}}
-	state.Routes = []domain.Route{{Name: "api", Scope: "prod", Match: domain.Match{PathPrefix: "/api"}, Upstream: "https://upstream.invalid"}}
+	state := proxyState([]domain.Route{{Name: "api", Match: domain.Match{PathPrefix: "/api"}, Upstream: "https://upstream.invalid"}})
 	snapshot, err := engine.Compile(state)
 	if err != nil {
 		t.Fatal(err)

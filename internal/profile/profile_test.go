@@ -1,65 +1,137 @@
 package profile
 
 import (
+	"os/exec"
+	"strings"
 	"testing"
 
 	"agentbox/internal/domain"
 )
 
-func TestProfilesAreOrdinaryValidRoutes(t *testing.T) {
-	cloudflare, err := CloudflareRoutes("0123456789abcdef0123456789abcdef", []string{"prod", "test"}, "cloudflare-api")
+func TestProviderHelpersComposeGenericProfile(t *testing.T) {
+	current, err := New("prod")
 	if err != nil {
 		t.Fatal(err)
 	}
-	routes := append(GitHubRoutes(), cloudflare...)
-	state := domain.NewState()
-	state.Routes = routes
-	if err := domain.ValidateState(state); err != nil {
+	current, err = SetCloudflare(current, "0123456789abcdef0123456789abcdef", "ff-prod", "cloudflare-api")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if len(routes) != 8 {
-		t.Fatalf("got %d routes", len(routes))
+	current, err = SetGitHub(current, "github-prod")
+	if err != nil {
+		t.Fatal(err)
 	}
-	byName := map[string]*domain.Route{}
-	for i := range cloudflare {
-		byName[cloudflare[i].Name] = &cloudflare[i]
+	if len(current.Routes) != 7 || current.Credentials["github"] != "github-prod" {
+		t.Fatalf("unexpected profile: %+v", current)
 	}
-	prod := byName["cloudflare-prod"]
-	if prod == nil {
-		t.Fatalf("prod provider-native route is missing: %+v", byName)
+	var cloudflare *domain.Route
+	for i := range current.Routes {
+		if current.Routes[i].Name == "cloudflare" {
+			cloudflare = &current.Routes[i]
+		}
 	}
-	wantUpstream := "https://gateway.ai.cloudflare.com/v1/0123456789abcdef0123456789abcdef/prod"
-	if prod.Match.PathPrefix != "/cloudflare/prod" || prod.Upstream != wantUpstream || !prod.StripPrefix {
-		t.Fatalf("unexpected provider-native route: %+v", prod)
+	if cloudflare == nil || cloudflare.Match.PathPrefix != "/cloudflare/prod" ||
+		cloudflare.Upstream != "https://gateway.ai.cloudflare.com/v1/0123456789abcdef0123456789abcdef/ff-prod" || !cloudflare.StripPrefix {
+		t.Fatalf("unexpected Cloudflare route: %+v", cloudflare)
 	}
-	if len(prod.SetHeaders) != 1 || prod.SetHeaders[0] != (domain.HeaderValue{
-		Name: "cf-aig-authorization", Value: "Bearer {secret:cloudflare-api}",
-	}) {
-		t.Fatalf("unexpected gateway authentication: %+v", prod.SetHeaders)
+	if got := current.Environment["ANTHROPIC_BASE_URL"]; got != "http://127.0.0.1:8787/cloudflare/prod/anthropic" {
+		t.Fatalf("Anthropic URL=%q", got)
 	}
-	credentials, err := domain.ReferencedCredentials(GitHubRoutes())
-	if err != nil || len(credentials) != 1 || credentials[0] != "github" {
-		t.Fatalf("GitHub credentials=%v err=%v", credentials, err)
-	}
-	keys, err := domain.ReferencedKeys(GitHubRoutes())
-	if err != nil || len(keys) != 0 {
-		t.Fatalf("GitHub static keys=%v err=%v", keys, err)
+	if current.Environment["GH_TOKEN"] != "agentbox-dummy" {
+		t.Fatal("GitHub client configuration missing")
 	}
 }
 
-func TestCloudflareRoutesRequireExplicitValidKeyReference(t *testing.T) {
-	for _, privateKey := range []string{"", "Cloudflare-Key", "path/to/key"} {
-		if _, err := CloudflareRoutes("0123456789abcdef0123456789abcdef", []string{"prod"}, privateKey); err == nil {
-			t.Fatalf("accepted invalid private key reference %q", privateKey)
+func TestSetCloudflareReplacesOnlyItsIntegration(t *testing.T) {
+	current, _ := New("prod")
+	current, _ = SetGitHub(current, "github-prod")
+	current, _ = SetCloudflare(current, "0123456789abcdef0123456789abcdef", "first", "first-key")
+	current, err := SetCloudflare(current, "fedcba9876543210fedcba9876543210", "second", "second-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current.Routes) != 7 || current.Credentials["github"] != "github-prod" {
+		t.Fatalf("unrelated integration changed: %+v", current)
+	}
+	for _, route := range current.Routes {
+		if route.Name == "cloudflare" && (!strings.HasSuffix(route.Upstream, "/second") || route.SetHeaders[0].Value != "Bearer {secret:second-key}") {
+			t.Fatalf("Cloudflare integration was not replaced: %+v", route)
 		}
 	}
 }
 
-func TestReplaceOwnedPreservesOperatorRoutes(t *testing.T) {
-	existing := []domain.Route{{Name: "github-old"}, {Name: "mine"}}
-	generated := []domain.Route{{Name: "github-new"}}
-	got := ReplaceOwned(existing, generated, OwnsGitHub)
-	if len(got) != 2 || got[0].Name != "github-new" || got[1].Name != "mine" {
-		t.Fatalf("%+v", got)
+func TestProfilesCarryIndependentProviderAssignments(t *testing.T) {
+	production, _ := New("production")
+	production, _ = SetCloudflare(production, "0123456789abcdef0123456789abcdef", "ff-prod", "prod-token")
+	production, _ = SetGitHub(production, "github-prod")
+	development, _ := New("development")
+	development, _ = SetCloudflare(development, "fedcba9876543210fedcba9876543210", "ff-dev", "dev-token")
+	development, _ = SetGitHub(development, "github-dev")
+
+	if production.Credentials["github"] != "github-prod" || development.Credentials["github"] != "github-dev" {
+		t.Fatalf("credential assignments crossed profiles: prod=%v dev=%v", production.Credentials, development.Credentials)
+	}
+	if production.Routes[0].Upstream == development.Routes[0].Upstream ||
+		production.Routes[0].SetHeaders[0].Value == development.Routes[0].SetHeaders[0].Value {
+		t.Fatalf("Cloudflare assignments crossed profiles: prod=%+v dev=%+v", production.Routes[0], development.Routes[0])
+	}
+}
+
+func TestUnsetIntegrationsPreservesProfile(t *testing.T) {
+	current, _ := New("prod")
+	current, _ = SetCloudflare(current, "0123456789abcdef0123456789abcdef", "ff-prod", "cloudflare-api")
+	current, _ = SetGitHub(current, "github-prod")
+	current, err := UnsetCloudflare(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Environment["ANTHROPIC_BASE_URL"] == "" || len(current.Routes) != 6 {
+		t.Fatalf("Cloudflare integration remains: %+v", current)
+	}
+	current, err = UnsetGitHub(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current.Routes) != 0 || len(current.Credentials) != 0 || current.Environment["AGENTBOX_PROFILE"] != "prod" || current.Environment["GH_TOKEN"] != "agentbox-dummy" {
+		t.Fatalf("profile cleanup failed: %+v", current)
+	}
+}
+
+func TestContainerScriptContainsOnlyPublicProfileConfiguration(t *testing.T) {
+	current, _ := New("prod")
+	current, _ = SetCloudflare(current, "0123456789abcdef0123456789abcdef", "ff-prod", "host-secret-name")
+	current, _ = SetGitHub(current, "github-prod")
+	script, err := ContainerScript(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "GH_TOKEN", "agentbox-dummy", "/home/agent/.codex/config.toml", "/home/agent/.pi/agent/models.json"} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("script missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"host-secret-name", "github-prod", "cf-aig-authorization"} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("script exposed host material/reference %q", forbidden)
+		}
+	}
+	current.Environment["CUSTOM_VALUE"] = `spaces ' quotes $ dollars \\ slashes`
+	script, err = ContainerScript(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := exec.Command("sh", "-n")
+	check.Stdin = strings.NewReader(script)
+	if output, err := check.CombinedOutput(); err != nil {
+		t.Fatalf("generated script is invalid: %v: %s", err, output)
+	}
+}
+
+func TestCloudflareRequiresExplicitValidKeyReference(t *testing.T) {
+	current, _ := New("prod")
+	for _, privateKey := range []string{"", "Cloudflare-Key", "path/to/key"} {
+		if _, err := SetCloudflare(current, "0123456789abcdef0123456789abcdef", "ff-prod", privateKey); err == nil {
+			t.Fatalf("accepted invalid private key reference %q", privateKey)
+		}
 	}
 }

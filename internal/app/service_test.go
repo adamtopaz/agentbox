@@ -62,7 +62,10 @@ func TestServiceCommitsAndRollsBack(t *testing.T) {
 	if err := service.AttachListeners(listeners); err != nil {
 		t.Fatal(err)
 	}
-	c := domain.Container{Name: "dev", Scope: "prod", CreatedAt: time.Now()}
+	if err := service.PutProfile(context.Background(), domain.Profile{Name: "prod", Routes: []domain.Route{}, Credentials: map[string]string{}, Environment: map[string]string{}}); err != nil {
+		t.Fatal(err)
+	}
+	c := domain.Container{Name: "dev", Profile: "prod", CreatedAt: time.Now()}
 	if _, err := service.AddContainer(context.Background(), c); err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +73,7 @@ func TestServiceCommitsAndRollsBack(t *testing.T) {
 		t.Fatalf("listeners: %v", listeners.seen)
 	}
 	listeners.fail = true
-	if _, err := service.AddContainer(context.Background(), domain.Container{Name: "bad", Scope: "prod", CreatedAt: time.Now()}); err == nil {
+	if _, err := service.AddContainer(context.Background(), domain.Container{Name: "bad", Profile: "prod", CreatedAt: time.Now()}); err == nil {
 		t.Fatal("listener failure accepted")
 	}
 	loaded, err := store.Load()
@@ -88,8 +91,8 @@ func TestDeleteReferencedKeyRefused(t *testing.T) {
 	if err := service.SetKey(ctx, "token", []byte("value")); err != nil {
 		t.Fatal(err)
 	}
-	route := domain.Route{Name: "api", Scope: "*", Match: domain.Match{PathPrefix: "/api"}, Upstream: "https://example.com", SetHeaders: []domain.HeaderValue{{Name: "Authorization", Value: "{secret:token}"}}}
-	if err := service.PutRoute(ctx, route); err != nil {
+	current := domain.Profile{Name: "prod", Routes: []domain.Route{{Name: "api", Match: domain.Match{PathPrefix: "/api"}, Upstream: "https://example.com", SetHeaders: []domain.HeaderValue{{Name: "Authorization", Value: "{secret:token}"}}}}, Credentials: map[string]string{}, Environment: map[string]string{}}
+	if err := service.PutProfile(ctx, current); err != nil {
 		t.Fatal(err)
 	}
 	if err := service.DeleteKey(ctx, "token"); !errors.Is(err, ErrConflict) {
@@ -97,12 +100,9 @@ func TestDeleteReferencedKeyRefused(t *testing.T) {
 	}
 }
 
-func TestCredentialSourceGrantLifecycle(t *testing.T) {
+func TestCredentialSourceProfileBindingLifecycle(t *testing.T) {
 	service, store := testService(t)
 	ctx := context.Background()
-	if _, err := service.AddContainer(ctx, domain.Container{Name: "dev", Scope: "prod"}); err != nil {
-		t.Fatal(err)
-	}
 	if err := service.SetKey(ctx, "app-key", []byte("private")); err != nil {
 		t.Fatal(err)
 	}
@@ -114,12 +114,15 @@ func TestCredentialSourceGrantLifecycle(t *testing.T) {
 	if err := service.PutCredentialSource(ctx, source); err != nil {
 		t.Fatal(err)
 	}
-	grant := domain.CredentialGrant{Container: "dev", Credential: "github", Source: "github-prod"}
-	if err := service.PutCredentialGrant(ctx, grant); err != nil {
+	current := domain.Profile{Name: "prod", Routes: []domain.Route{}, Credentials: map[string]string{"github": "github-prod"}, Environment: map[string]string{}}
+	if err := service.PutProfile(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.AddContainer(ctx, domain.Container{Name: "dev", Profile: "prod"}); err != nil {
 		t.Fatal(err)
 	}
 	health := service.Health(ctx)
-	if health.CredentialSources != 1 || health.CredentialGrants != 1 {
+	if health.CredentialSources != 1 || health.CredentialBindings != 1 || health.Profiles != 1 {
 		t.Fatalf("health=%+v", health)
 	}
 	if err := service.DeleteKey(ctx, "app-key"); !errors.Is(err, ErrConflict) {
@@ -128,11 +131,9 @@ func TestCredentialSourceGrantLifecycle(t *testing.T) {
 	if err := service.DeleteCredentialSource(ctx, "github-prod"); !errors.Is(err, ErrConflict) {
 		t.Fatalf("delete granted source=%v", err)
 	}
-	if err := service.DeleteContainer(ctx, "dev"); err != nil {
+	current.Credentials = map[string]string{}
+	if err := service.PutProfile(ctx, current); err != nil {
 		t.Fatal(err)
-	}
-	if len(service.CredentialGrants(ctx)) != 0 {
-		t.Fatal("container deletion left a credential grant")
 	}
 	if err := service.DeleteCredentialSource(ctx, "github-prod"); err != nil {
 		t.Fatal(err)
@@ -141,7 +142,7 @@ func TestCredentialSourceGrantLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded.CredentialSources) != 0 || len(loaded.CredentialGrants) != 0 {
+	if len(loaded.CredentialSources) != 0 || len(loaded.Profiles) != 1 || len(loaded.Profiles[0].Credentials) != 0 {
 		t.Fatalf("persisted state=%+v", loaded)
 	}
 }
@@ -159,13 +160,18 @@ func TestServiceResolvesContainerCredential(t *testing.T) {
 	}
 	defer service.Close()
 	ctx := context.Background()
-	if _, err := service.AddContainer(ctx, domain.Container{Name: "dev", Scope: "prod"}); err != nil {
+	current := domain.Profile{Name: "prod", Routes: []domain.Route{}, Credentials: map[string]string{}, Environment: map[string]string{}}
+	if err := service.PutProfile(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.AddContainer(ctx, domain.Container{Name: "dev", Profile: "prod"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := service.PutCredentialSource(ctx, domain.CredentialSource{Name: "source", Provider: "fake", Parameters: map[string]string{}, Secrets: map[string]string{}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.PutCredentialGrant(ctx, domain.CredentialGrant{Container: "dev", Credential: "api", Source: "source"}); err != nil {
+	current.Credentials["api"] = "source"
+	if err := service.PutProfile(ctx, current); err != nil {
 		t.Fatal(err)
 	}
 	value, err := service.Resolve(ctx, "dev", domain.MaterialReference{Kind: domain.MaterialCredential, Name: "api"})

@@ -25,10 +25,10 @@ host:
   status                        show daemon health
 
 generic control plane:
-  route list
-  route put <route.json>
-  route replace <routes.json>
-  route delete <name>
+  route list [--json] <profile>
+  route put <profile> <route.json>
+  route replace <profile> <routes.json>
+  route delete <profile> <name>
   key list
   key set <name>                read value hidden or from stdin
   key delete <name>
@@ -36,16 +36,16 @@ generic control plane:
   credential source put <source.json>
   credential source github-app <name> [flags]
   credential source delete <name>
-  credential grant list
-  credential grant set <container> <credential> <source>
-  credential grant delete <container> <credential>
 
-optional profiles:
-  profile apply github
-  profile apply cloudflare --account-id ID --gateways prod,test --private-key KEY
+profiles:
+  profile list|show|create|put|delete
+  profile set cloudflare <profile> --account-id ID --gateway NAME --private-key KEY
+  profile unset cloudflare <profile>
+  profile set github <profile> --source SOURCE
+  profile unset github <profile>
 
 containers:
-  container create --scope SCOPE [--configure cloudflare|none] [resource flags] <name>
+  container create --profile PROFILE [resource flags] <name>
   container list
   container shell <name>
   container destroy <name>

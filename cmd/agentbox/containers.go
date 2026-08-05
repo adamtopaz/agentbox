@@ -25,8 +25,7 @@ func cmdContainer(ctx context.Context, client *control.Client, args []string) er
 	switch args[0] {
 	case "create":
 		fs := flag.NewFlagSet("container create", flag.ContinueOnError)
-		scope := fs.String("scope", "", "route scope")
-		configure := fs.String("configure", "cloudflare", "container configuration profile: cloudflare or none")
+		profileName := fs.String("profile", "", "Agentbox profile")
 		image := fs.String("image", incus.DefaultImage, "Incus image alias")
 		cpus := fs.Uint("cpus", incus.DefaultCPUs, "maximum CPUs")
 		memory := fs.String("memory", incus.DefaultMemory, "maximum memory")
@@ -37,8 +36,8 @@ func cmdContainer(ctx context.Context, client *control.Client, args []string) er
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		if fs.NArg() != 1 || *scope == "" {
-			return errors.New("usage: agentbox container create --scope SCOPE [--configure cloudflare|none] [resource flags] <name>")
+		if fs.NArg() != 1 || *profileName == "" {
+			return errors.New("usage: agentbox container create --profile PROFILE [resource flags] <name>")
 		}
 		if *noResourceLimits {
 			var conflicting []string
@@ -52,22 +51,18 @@ func cmdContainer(ctx context.Context, client *control.Client, args []string) er
 				return fmt.Errorf("--no-resource-limits cannot be combined with %s", strings.Join(conflicting, ", "))
 			}
 		}
-		var script string
-		switch *configure {
-		case "none":
-		case "cloudflare":
-			var err error
-			script, err = profile.CloudflareContainerScript(*scope)
-			if err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("unknown configure profile %q", *configure)
+		current, err := findProfile(ctx, client, *profileName)
+		if err != nil {
+			return err
+		}
+		script, err := profile.ContainerScript(current)
+		if err != nil {
+			return err
 		}
 		manager := containerManager(client, *incusBin)
 		manager.Image = *image
 		return manager.Create(ctx, incus.CreateOptions{
-			Name: fs.Arg(0), Scope: *scope, ConfigureScript: script,
+			Name: fs.Arg(0), Profile: *profileName, ConfigureScript: script,
 			CPUs: *cpus, Memory: *memory, Processes: *processes, Disk: *disk,
 			NoResourceLimits: *noResourceLimits,
 		})
@@ -85,13 +80,13 @@ func cmdContainer(ctx context.Context, client *control.Client, args []string) er
 			return err
 		}
 		w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "NAME\tSCOPE\tINCUS\tBLOCKED\tSOCKET")
+		fmt.Fprintln(w, "NAME\tPROFILE\tINCUS\tBLOCKED\tSOCKET")
 		for _, row := range rows {
 			socket := "absent"
 			if row.Socket {
 				socket = "present"
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%v\t%s\n", row.Name, orDash(row.Scope), row.Incus, row.Blocked, socket)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%v\t%s\n", row.Name, orDash(row.Profile), row.Incus, row.Blocked, socket)
 		}
 		return w.Flush()
 	case "shell":

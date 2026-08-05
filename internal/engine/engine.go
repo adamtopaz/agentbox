@@ -18,6 +18,7 @@ type Header struct {
 }
 type Route struct {
 	domain.Route
+	Profile string
 	Target  *url.URL
 	Headers []Header
 }
@@ -35,24 +36,25 @@ func Compile(state domain.State) (*Snapshot, error) {
 	for _, c := range state.Containers {
 		s.containers[c.Name] = c
 	}
-	for _, source := range state.Routes {
-		target, err := url.Parse(source.Upstream)
-		if err != nil {
-			return nil, err
-		}
-		r := Route{Route: source, Target: target}
-		for _, h := range source.SetHeaders {
-			t, err := domain.ParseTemplate(h.Value)
+	for _, profile := range state.Profiles {
+		for _, source := range profile.Routes {
+			target, err := url.Parse(source.Upstream)
 			if err != nil {
-				return nil, fmt.Errorf("route %q: %w", source.Name, err)
+				return nil, err
 			}
-			r.Headers = append(r.Headers, Header{Name: h.Name, Template: t})
+			r := Route{Route: source, Profile: profile.Name, Target: target}
+			for _, h := range source.SetHeaders {
+				t, err := domain.ParseTemplate(h.Value)
+				if err != nil {
+					return nil, fmt.Errorf("route %q in profile %q: %w", source.Name, profile.Name, err)
+				}
+				r.Headers = append(r.Headers, Header{Name: h.Name, Template: t})
+			}
+			s.routes = append(s.routes, r)
 		}
-		s.routes = append(s.routes, r)
 	}
-	// Hosts beat paths. Longer path prefixes beat shorter ones. A specific
-	// scope beats a universal route only when those selectors are otherwise
-	// equivalent. Names make the remaining order deterministic.
+	// Hosts beat paths and longer path prefixes beat shorter ones. Names make
+	// the remaining order deterministic.
 	sort.Slice(s.routes, func(i, j int) bool {
 		a, b := s.routes[i], s.routes[j]
 		if (a.Match.Host != "") != (b.Match.Host != "") {
@@ -61,8 +63,8 @@ func Compile(state domain.State) (*Snapshot, error) {
 		if len(a.Match.PathPrefix) != len(b.Match.PathPrefix) {
 			return len(a.Match.PathPrefix) > len(b.Match.PathPrefix)
 		}
-		if (a.Scope == domain.UniversalScope) != (b.Scope == domain.UniversalScope) {
-			return b.Scope == domain.UniversalScope
+		if a.Profile != b.Profile {
+			return a.Profile < b.Profile
 		}
 		return a.Name < b.Name
 	})
@@ -83,11 +85,11 @@ func (s *Snapshot) Containers() []domain.Container {
 	return out
 }
 
-func (s *Snapshot) Match(scope, host, requestPath string) (*Route, string, bool) {
+func (s *Snapshot) Match(profile, host, requestPath string) (*Route, string, bool) {
 	host = domain.Hostname(host)
 	for i := range s.routes {
 		r := &s.routes[i]
-		if r.Scope != domain.UniversalScope && r.Scope != scope {
+		if r.Profile != profile {
 			continue
 		}
 		if r.Match.Host != "" {
