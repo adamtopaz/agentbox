@@ -189,7 +189,8 @@ Provider helpers are optional route generators:
 
 ```sh
 agentbox profile apply github
-agentbox profile apply cloudflare --account-id <32-hex-id> --gateways prod,test
+agentbox profile apply cloudflare --account-id <32-hex-id> \
+  --gateways prod,test --private-key <stored-key-name>
 ```
 
 Applying a profile replaces the routes it owns (`github-*` or `cloudflare-*`)
@@ -224,6 +225,9 @@ the App installation. Commands that require a human-user-only API endpoint may
 not work; validate the exact `gh` operations and App permissions used by agents.
 
 The Cloudflare profile creates one provider-native route for each named scope.
+`--private-key` explicitly references the arbitrary key-store entry containing
+the Cloudflare API token; the same entry is used for every gateway in that
+application. No key name is derived from a gateway or provider name.
 The container uses `/cloudflare/<scope>/anthropic/...` and
 `/cloudflare/<scope>/openai/...`; after removing that local namespace, Agentbox
 forwards the exact suffix to Cloudflare AI Gateway's corresponding provider

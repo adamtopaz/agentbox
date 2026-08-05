@@ -7,7 +7,7 @@ import (
 )
 
 func TestProfilesAreOrdinaryValidRoutes(t *testing.T) {
-	cloudflare, err := CloudflareRoutes("0123456789abcdef0123456789abcdef", []string{"prod", "test"})
+	cloudflare, err := CloudflareRoutes("0123456789abcdef0123456789abcdef", []string{"prod", "test"}, "cloudflare-api")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +33,7 @@ func TestProfilesAreOrdinaryValidRoutes(t *testing.T) {
 		t.Fatalf("unexpected provider-native route: %+v", prod)
 	}
 	if len(prod.SetHeaders) != 1 || prod.SetHeaders[0] != (domain.HeaderValue{
-		Name: "cf-aig-authorization", Value: "Bearer {secret:cf-aig-token-prod}",
+		Name: "cf-aig-authorization", Value: "Bearer {secret:cloudflare-api}",
 	}) {
 		t.Fatalf("unexpected gateway authentication: %+v", prod.SetHeaders)
 	}
@@ -44,6 +44,14 @@ func TestProfilesAreOrdinaryValidRoutes(t *testing.T) {
 	keys, err := domain.ReferencedKeys(GitHubRoutes())
 	if err != nil || len(keys) != 0 {
 		t.Fatalf("GitHub static keys=%v err=%v", keys, err)
+	}
+}
+
+func TestCloudflareRoutesRequireExplicitValidKeyReference(t *testing.T) {
+	for _, privateKey := range []string{"", "Cloudflare-Key", "path/to/key"} {
+		if _, err := CloudflareRoutes("0123456789abcdef0123456789abcdef", []string{"prod"}, privateKey); err == nil {
+			t.Fatalf("accepted invalid private key reference %q", privateKey)
+		}
 	}
 }
 

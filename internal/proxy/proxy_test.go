@@ -93,7 +93,7 @@ func TestProxyStripsThenInjects(t *testing.T) {
 }
 
 func TestProxyPreservesProviderNativeRequest(t *testing.T) {
-	routes, err := profile.CloudflareRoutes("0123456789abcdef0123456789abcdef", []string{"prod"})
+	routes, err := profile.CloudflareRoutes("0123456789abcdef0123456789abcdef", []string{"prod"}, "cloudflare-api")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +135,7 @@ func TestProxyPreservesProviderNativeRequest(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok")), Request: request}, nil
 	})
 	server := &Server{
-		Snapshots: snapshots{snapshot}, Materials: resolver{"cf-aig-token-prod": []byte("cloudflare-token")},
+		Snapshots: snapshots{snapshot}, Materials: resolver{"cloudflare-api": []byte("cloudflare-token")},
 		Transport: transport, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	request := httptest.NewRequest(http.MethodPost, "http://agentbox/cloudflare/prod/anthropic/v1/messages?beta=true&feature=%2Fraw", bytes.NewReader(body))
@@ -152,7 +152,7 @@ func TestProxyPreservesProviderNativeRequest(t *testing.T) {
 }
 
 func TestProxyPreservesOpenAIProviderNativeRequest(t *testing.T) {
-	routes, err := profile.CloudflareRoutes("0123456789abcdef0123456789abcdef", []string{"prod"})
+	routes, err := profile.CloudflareRoutes("0123456789abcdef0123456789abcdef", []string{"prod"}, "cloudflare-api")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +186,7 @@ func TestProxyPreservesOpenAIProviderNativeRequest(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok")), Request: request}, nil
 	})
 	server := &Server{
-		Snapshots: snapshots{snapshot}, Materials: resolver{"cf-aig-token-prod": []byte("cloudflare-token")},
+		Snapshots: snapshots{snapshot}, Materials: resolver{"cloudflare-api": []byte("cloudflare-token")},
 		Transport: transport, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	request := httptest.NewRequest(http.MethodPost, "http://agentbox/cloudflare/prod/openai/responses?include%5B%5D=reasoning.encrypted_content", bytes.NewReader(body))

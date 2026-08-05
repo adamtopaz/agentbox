@@ -42,7 +42,7 @@ generic control plane:
 
 optional profiles:
   profile apply github
-  profile apply cloudflare --account-id ID --gateways prod,test
+  profile apply cloudflare --account-id ID --gateways prod,test --private-key KEY
 
 containers:
   container create --scope SCOPE [--configure cloudflare|none] [resource flags] <name>

@@ -170,13 +170,14 @@ func cmdProfile(ctx context.Context, client *control.Client, args []string) erro
 		fs := flag.NewFlagSet("profile apply cloudflare", flag.ContinueOnError)
 		account := fs.String("account-id", "", "Cloudflare account ID")
 		gateways := fs.String("gateways", "", "comma-separated gateway names")
+		privateKey := fs.String("private-key", "", "encrypted key name containing the Cloudflare API token")
 		if err := fs.Parse(args[2:]); err != nil {
 			return err
 		}
-		if fs.NArg() != 0 || *account == "" || *gateways == "" {
-			return errors.New("usage: agentbox profile apply cloudflare --account-id ID --gateways prod,test")
+		if fs.NArg() != 0 || *account == "" || *gateways == "" || *privateKey == "" {
+			return errors.New("usage: agentbox profile apply cloudflare --account-id ID --gateways prod,test --private-key KEY")
 		}
-		generated, err := profile.CloudflareRoutes(*account, splitComma(*gateways))
+		generated, err := profile.CloudflareRoutes(*account, splitComma(*gateways), *privateKey)
 		if err != nil {
 			return err
 		}

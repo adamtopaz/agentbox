@@ -43,9 +43,12 @@ func GitHubRoutes() []domain.Route {
 
 func OwnsGitHub(route domain.Route) bool { return strings.HasPrefix(route.Name, "github-") }
 
-func CloudflareRoutes(accountID string, gateways []string) ([]domain.Route, error) {
+func CloudflareRoutes(accountID string, gateways []string, privateKey string) ([]domain.Route, error) {
 	if !accountIDRE.MatchString(accountID) {
 		return nil, fmt.Errorf("Cloudflare account ID must be 32 lowercase hexadecimal characters")
+	}
+	if !domain.ValidKeyName(privateKey) {
+		return nil, fmt.Errorf("private key must reference a valid encrypted key name")
 	}
 	seen := map[string]bool{}
 	var routes []domain.Route
@@ -62,7 +65,7 @@ func CloudflareRoutes(accountID string, gateways []string) ([]domain.Route, erro
 			Match: domain.Match{PathPrefix: "/cloudflare/" + gateway}, StripPrefix: true,
 			Upstream: "https://gateway.ai.cloudflare.com/v1/" + accountID + "/" + gateway,
 			SetHeaders: []domain.HeaderValue{{
-				Name: "cf-aig-authorization", Value: "Bearer {secret:cf-aig-token-" + gateway + "}",
+				Name: "cf-aig-authorization", Value: "Bearer {secret:" + privateKey + "}",
 			}},
 		})
 	}

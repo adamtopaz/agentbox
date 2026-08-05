@@ -113,14 +113,15 @@ repository metadata. GitHub CLI API calls use its supported
 [`http_unix_socket`](https://cli.github.com/manual/gh_config) setting for
 `/run/agentbox.sock`; `gh` and Git continue to see only dummy credentials.
 
-Cloudflare AI Gateway is also an optional profile. Each gateway is both a route
-scope and a separately named key:
+Cloudflare AI Gateway is also an optional profile. Key-store names are arbitrary;
+the profile explicitly names the entry containing its API token:
 
 ```sh
-agentbox key set cf-aig-token-prod
+agentbox key set cloudflare-production
 agentbox profile apply cloudflare \
   --account-id 0123456789abcdef0123456789abcdef \
-  --gateways prod
+  --gateways prod \
+  --private-key cloudflare-production
 
 agentbox container create --scope prod work
 agentbox container shell work
@@ -191,7 +192,9 @@ agentbox route put route.json
 Header values support durable `{secret:key-name}` references, renewable
 `{credential:name}` references, and Basic forms such as
 `{basic:username:key-name}` or `{basic:username:credential:name}`. Credential
-names are resolved against the grant for the request's container listener. A
+names are resolved against the grant for the request's container listener.
+Credential and profile commands likewise take explicit references to key-store
+entries; key names carry no provider-specific meaning. A
 missing key, grant, or valid lease returns 503 before any upstream request.
 Routes intentionally have no body, query, or provider-path transformation
 features. For a path route, `strip_prefix` removes only Agentbox's local routing
@@ -203,9 +206,9 @@ HTTP upstreams are permitted for host-local services. `localhost` is not
 accepted because resolving a name is weaker than verifying a loopback address.
 Incoming authorization, cookies, forwarding headers, Cloudflare Access
 credentials, and `cf-aig-authorization` are removed; configured headers are
-applied afterward. Other provider and gateway headers are preserved. Queries are forwarded but never
-logged. Ambiguous escaped paths, dot segments, repeated separators, backslashes,
-and semicolons are rejected.
+applied afterward. Other provider and gateway headers are preserved. Queries
+are forwarded but never logged. Ambiguous escaped paths, dot segments, repeated
+separators, backslashes, and semicolons are rejected.
 
 ## Security boundaries
 
