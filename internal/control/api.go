@@ -43,6 +43,8 @@ type Service interface {
 	AddContainer(context.Context, domain.Container) (domain.Container, error)
 	SetContainerBlocked(context.Context, string, bool) error
 	DeleteContainer(context.Context, string) error
+	AddHostSession(context.Context, domain.Container) (domain.Container, error)
+	DeleteHostSession(context.Context, string) error
 }
 
 type API struct {
@@ -78,6 +80,8 @@ func (a API) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/containers", a.addContainer)
 	mux.HandleFunc("PATCH /v1/containers/{name}", a.patchContainer)
 	mux.HandleFunc("DELETE /v1/containers/{name}", a.deleteContainer)
+	mux.HandleFunc("POST /v1/host-sessions", a.addHostSession)
+	mux.HandleFunc("DELETE /v1/host-sessions/{name}", a.deleteHostSession)
 	return a.logRequests(mux)
 }
 
@@ -230,6 +234,27 @@ func (a API) patchContainer(w http.ResponseWriter, r *http.Request) {
 
 func (a API) deleteContainer(w http.ResponseWriter, r *http.Request) {
 	if err := a.Service.DeleteContainer(r.Context(), r.PathValue("name")); err != nil {
+		writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a API) addHostSession(w http.ResponseWriter, r *http.Request) {
+	var session domain.Container
+	if !decodeJSON(w, r, &session) {
+		return
+	}
+	created, err := a.Service.AddHostSession(r.Context(), session)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, created)
+}
+
+func (a API) deleteHostSession(w http.ResponseWriter, r *http.Request) {
+	if err := a.Service.DeleteHostSession(r.Context(), r.PathValue("name")); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -460,6 +485,14 @@ func (c *Client) SetContainerBlocked(ctx context.Context, name string, blocked b
 }
 func (c *Client) DeleteContainer(ctx context.Context, name string) error {
 	return c.json(ctx, http.MethodDelete, "/v1/containers/"+name, nil, nil)
+}
+func (c *Client) AddHostSession(ctx context.Context, value domain.Container) (domain.Container, error) {
+	var created domain.Container
+	err := c.json(ctx, http.MethodPost, "/v1/host-sessions", value, &created)
+	return created, err
+}
+func (c *Client) DeleteHostSession(ctx context.Context, name string) error {
+	return c.json(ctx, http.MethodDelete, "/v1/host-sessions/"+name, nil, nil)
 }
 
 func (c *Client) json(ctx context.Context, method, path string, body, dst any) error {

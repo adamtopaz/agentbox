@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"agentbox/internal/control"
+	"agentbox/internal/hostrun"
 	"agentbox/internal/paths"
 )
 
@@ -22,6 +23,7 @@ usage: agentbox [--socket PATH] <command> ...
 host:
   setup                         install agentboxd and its systemd unit
   image build                   provision and publish the declarative Incus image
+  host codex --profile PROFILE  run Codex on the host through Agentbox
   status                        show daemon health
 
 generic control plane:
@@ -57,6 +59,9 @@ var version = "dev"
 
 func main() {
 	if err := run(); err != nil {
+		if exit, ok := err.(*hostrun.ExitError); ok {
+			os.Exit(exit.Code)
+		}
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
@@ -104,6 +109,8 @@ func run() error {
 		return cmdSetup(args[1:])
 	case "image":
 		return cmdImage(args[1:])
+	case "host":
+		return cmdHost(ctx, client, *socket, args[1:])
 	default:
 		return fmt.Errorf("unknown command %q\n\n%s", args[0], usage)
 	}

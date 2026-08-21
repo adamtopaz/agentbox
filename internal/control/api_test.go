@@ -67,13 +67,20 @@ func TestUnixSocketRoundTrip(t *testing.T) {
 	if created.CreatedAt.IsZero() {
 		t.Fatal("server did not return its canonical creation timestamp")
 	}
+	host, err := client.AddHostSession(ctx, domain.Container{Name: "host-test", Profile: "dev"})
+	if err != nil || host.CreatedAt.IsZero() {
+		t.Fatalf("host session=%+v err=%v", host, err)
+	}
 
 	health, err := client.Health(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if health.Profiles != 1 || health.Routes != 1 || health.Keys != 1 || health.Containers != 1 || health.CredentialSources != 1 || health.CredentialBindings != 1 {
+	if health.Profiles != 1 || health.Routes != 1 || health.Keys != 1 || health.Containers != 1 || health.HostSessions != 1 || health.CredentialSources != 1 || health.CredentialBindings != 1 {
 		t.Fatalf("unexpected health: %+v", health)
+	}
+	if err := client.DeleteHostSession(ctx, host.Name); err != nil {
+		t.Fatal(err)
 	}
 	routes, err := client.Routes(ctx, "dev")
 	if err != nil {

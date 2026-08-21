@@ -1,14 +1,43 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"os"
 
+	"agentbox/internal/control"
+	"agentbox/internal/hostrun"
 	"agentbox/internal/hostsetup"
 	"agentbox/internal/imagebuild"
 	"agentbox/internal/incus"
+	"agentbox/internal/paths"
 )
+
+func cmdHost(ctx context.Context, client *control.Client, controlSocket string, args []string) error {
+	if len(args) == 0 || args[0] != "codex" {
+		return errors.New("usage: agentbox host codex --profile PROFILE [--codex-bin PATH] [--git-bin PATH] [--] [CODEX_ARGS...]")
+	}
+	fs := flag.NewFlagSet("host codex", flag.ContinueOnError)
+	profileName := fs.String("profile", "", "Agentbox profile")
+	codexBin := fs.String("codex-bin", "codex", "Codex CLI executable")
+	gitBin := fs.String("git-bin", "git", "Git executable")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if *profileName == "" {
+		return errors.New("usage: agentbox host codex --profile PROFILE [--codex-bin PATH] [--git-bin PATH] [--] [CODEX_ARGS...]")
+	}
+	current, err := findProfile(ctx, client, *profileName)
+	if err != nil {
+		return err
+	}
+	return hostrun.Run(ctx, client, hostrun.Options{
+		Profile: current, CodexBin: *codexBin, CodexArgs: fs.Args(), GitBin: *gitBin,
+		ControlSocket: controlSocket, SocketDir: paths.ContainerSocketsDir,
+		Environment: os.Environ(), Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr,
+	})
+}
 
 func cmdSetup(args []string) error {
 	fs := flag.NewFlagSet("setup", flag.ContinueOnError)

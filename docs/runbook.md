@@ -297,6 +297,30 @@ recreate an old container, to bring it under the same limits.
 daemon socket, or tagged but unregistered Incus instance is shown instead of
 being repaired implicitly.
 
+## Host Codex sessions
+
+Launch Codex on the main host with an existing profile:
+
+```sh
+agentbox host codex --profile production
+agentbox host codex --profile production -- exec "run the test suite"
+```
+
+Agentbox registers an in-memory host identity and gives it a normal per-identity
+Unix listener. A random-port loopback HTTP bridge lets Codex and Git clients
+that cannot dial Unix sockets reach that listener. The bridge requires a
+random, session-only credential and removes it before forwarding; it is not an
+upstream API key. `gh` uses a temporary `GH_CONFIG_DIR` whose
+`http_unix_socket` points directly at the protected session socket. A temporary
+`GIT_EXEC_PATH` wraps only `git-remote-https` for `https://github.com/...` and
+delegates every other HTTPS remote unchanged.
+
+The launcher deletes its daemon identity and temporary files when Codex exits.
+Host identities are not persisted, so restarting `agentboxd` also revokes any
+identity left behind by an uncatchable process termination. A live host session
+prevents deletion of its selected profile. GitHub SSH remotes and arbitrary
+process traffic are not redirected.
+
 Soft containment changes the live snapshot so new requests return 403:
 
 ```sh
@@ -331,6 +355,8 @@ The current wire adapter is HTTP/1.1 over `/run/agentbox/control.sock`:
 | `PUT`, `DELETE` | `/v1/credential-sources/{name}` | upsert or delete a source |
 | `GET`, `POST` | `/v1/containers` | list or register identities |
 | `PATCH`, `DELETE` | `/v1/containers/{name}` | block/unblock or unregister |
+| `POST` | `/v1/host-sessions` | register a non-persistent host identity |
+| `DELETE` | `/v1/host-sessions/{name}` | revoke a host identity |
 
 The protocol is not the domain boundary. Handlers call a typed application
 service that contains all mutation and validation semantics; another local

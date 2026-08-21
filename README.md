@@ -1,8 +1,9 @@
 # agentbox
 
-Agentbox runs coding agents in Incus containers without putting real API keys
-in those containers. A small Go daemon owns both the reverse proxy and its live
-configuration. Containers receive dummy credentials; `agentboxd` removes
+Agentbox runs coding agents in Incus containers or directly on the main host
+without putting real API keys in those processes. A small Go daemon owns both
+the reverse proxy and its live configuration. Agents receive short-lived or
+dummy credentials; `agentboxd` removes
 credential-bearing request headers and injects an appropriate host-side static
 secret or renewable credential only after a route has matched.
 
@@ -21,6 +22,8 @@ operator
 
 container ── Incus proxy device ──> per-container Unix socket
                                       └── Go httputil.ReverseProxy ──> upstream
+
+host Codex ── authenticated loopback bridge ──> ephemeral Unix socket ──> upstream
 ```
 
 HTTP is only the current adapter for the control socket. Validation,
@@ -184,6 +187,36 @@ agentbox container block --hard work
 agentbox container unblock work
 agentbox container destroy work
 ```
+
+## Run Codex directly on the host
+
+Codex can use the same profile without an Incus container:
+
+```sh
+agentbox host codex --profile production
+# Separate Agentbox flags from Codex arguments with `--`:
+agentbox host codex --profile production -- exec "inspect this repository"
+```
+
+The command creates a non-persistent host identity in `agentboxd`, starts an
+authenticated random-port loopback bridge, and launches the installed `codex`
+binary with per-run custom-provider overrides. It does not replace or edit the
+user's `~/.codex` configuration. On normal exit or a handled signal, the bridge
+and daemon identity are removed; a daemon restart also revokes all host
+identities because they are never written to `state.json`.
+
+Within that Codex process, `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` use the
+selected Agentbox profile. GitHub CLI API traffic uses the session's protected
+Unix socket. A temporary Git HTTPS transport helper sends only canonical
+`https://github.com/...` clone/fetch/push operations through `/github-git/`, so
+repository remotes remain unchanged; other Git HTTPS hosts are delegated to
+Git's normal helper. As in the container image, GitHub SSH remotes are not
+rewritten. Direct `curl`, MCP-server, connector/app, web-search, SSH, and other
+unrecognized network traffic is outside this routing mechanism.
+
+The host user must be able to access the Agentbox control/data sockets (normally
+through the `agentbox` group) and must have `codex` and `git` installed. Use
+`--codex-bin` or `--git-bin` when either executable is not on `PATH`.
 
 ## Generic routes
 

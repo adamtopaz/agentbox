@@ -35,6 +35,7 @@ type Service struct {
 
 	mu        sync.Mutex
 	state     domain.State
+	hosts     []domain.Container
 	listeners ListenerReconciler
 	snapshot  atomic.Pointer[engine.Snapshot]
 }
@@ -47,6 +48,7 @@ type Health struct {
 	Containers         int    `json:"containers"`
 	CredentialSources  int    `json:"credential_sources"`
 	CredentialBindings int    `json:"credential_bindings"`
+	HostSessions       int    `json:"host_sessions"`
 }
 
 func Open(stateStore state.Store, keys *secret.Store) (*Service, error) {
@@ -85,7 +87,7 @@ func (s *Service) AttachListeners(listeners ListenerReconciler) error {
 	if s.listeners != nil {
 		return errors.New("listeners already attached")
 	}
-	if err := listeners.Reconcile(s.state.Containers); err != nil {
+	if err := listeners.Reconcile(s.runtimeState(s.state).Containers); err != nil {
 		return err
 	}
 	s.listeners = listeners
@@ -123,7 +125,7 @@ func (s *Service) Health(context.Context) Health {
 		bindings += len(profile.Credentials)
 	}
 	return Health{Status: "ok", Profiles: len(s.state.Profiles), Routes: len(domain.AllRoutes(s.state)), Keys: len(s.keys.List()), Containers: len(s.state.Containers),
-		CredentialSources: len(s.state.CredentialSources), CredentialBindings: bindings}
+		CredentialSources: len(s.state.CredentialSources), CredentialBindings: bindings, HostSessions: len(s.hosts)}
 }
 
 func (s *Service) Routes(_ context.Context, profileName string) ([]domain.Route, error) {
@@ -206,6 +208,11 @@ func (s *Service) PutProfile(_ context.Context, profile domain.Profile) error {
 
 func (s *Service) DeleteProfile(_ context.Context, name string) error {
 	return s.change(func(next *domain.State) error {
+		for _, host := range s.hosts {
+			if host.Profile == name {
+				return fmt.Errorf("%w: profile %q is used by host session %q", ErrConflict, name, host.Name)
+			}
+		}
 		for _, container := range next.Containers {
 			if container.Profile == name {
 				return fmt.Errorf("%w: profile %q is used by container %q", ErrConflict, name, container.Name)
@@ -306,6 +313,11 @@ func (s *Service) AddContainer(_ context.Context, container domain.Container) (d
 		container.CreatedAt = time.Now().UTC()
 	}
 	err := s.change(func(next *domain.State) error {
+		for _, existing := range s.hosts {
+			if existing.Name == container.Name {
+				return fmt.Errorf("%w: identity %q", ErrConflict, container.Name)
+			}
+		}
 		for _, existing := range next.Containers {
 			if existing.Name == container.Name {
 				return fmt.Errorf("%w: container %q", ErrConflict, container.Name)
@@ -315,6 +327,42 @@ func (s *Service) AddContainer(_ context.Context, container domain.Container) (d
 		return nil
 	})
 	return container, err
+}
+
+// AddHostSession registers an in-memory data-plane identity for a process on
+// the main host. Unlike containers, host sessions are deliberately not
+// persisted: a daemon restart revokes them and removes their listeners.
+func (s *Service) AddHostSession(_ context.Context, host domain.Container) (domain.Container, error) {
+	if host.CreatedAt.IsZero() {
+		host.CreatedAt = time.Now().UTC()
+	}
+	err := s.changeHosts(func(next *[]domain.Container) error {
+		for _, existing := range s.state.Containers {
+			if existing.Name == host.Name {
+				return fmt.Errorf("%w: identity %q", ErrConflict, host.Name)
+			}
+		}
+		for _, existing := range *next {
+			if existing.Name == host.Name {
+				return fmt.Errorf("%w: host session %q", ErrConflict, host.Name)
+			}
+		}
+		*next = append(*next, host)
+		return nil
+	})
+	return host, err
+}
+
+func (s *Service) DeleteHostSession(_ context.Context, name string) error {
+	return s.changeHosts(func(next *[]domain.Container) error {
+		for i, host := range *next {
+			if host.Name == name {
+				*next = append((*next)[:i], (*next)[i+1:]...)
+				return nil
+			}
+		}
+		return fmt.Errorf("%w: host session %q", ErrNotFound, name)
+	})
 }
 
 func (s *Service) SetContainerBlocked(_ context.Context, name string, blocked bool) error {
@@ -350,29 +398,31 @@ func (s *Service) change(mutator func(*domain.State) error) error {
 		return err
 	}
 	next = domain.NormalizeState(next)
-	compiled, err := engine.Compile(next)
+	previousRuntime := s.runtimeState(previous)
+	nextRuntime := s.runtimeState(next)
+	compiled, err := engine.Compile(nextRuntime)
 	if err != nil {
 		return err
 	}
-	if err := s.credentials.Validate(next); err != nil {
+	if err := s.credentials.Validate(nextRuntime); err != nil {
 		return err
 	}
 	if s.listeners != nil {
-		if err := s.listeners.Reconcile(next.Containers); err != nil {
-			rollbackErr := s.listeners.Reconcile(previous.Containers)
+		if err := s.listeners.Reconcile(nextRuntime.Containers); err != nil {
+			rollbackErr := s.listeners.Reconcile(previousRuntime.Containers)
 			return fmt.Errorf("reconcile listeners: %w (rollback listeners: %v)", err, rollbackErr)
 		}
 	}
-	if err := s.credentials.Configure(next); err != nil {
+	if err := s.credentials.Configure(nextRuntime); err != nil {
 		if s.listeners != nil {
-			_ = s.listeners.Reconcile(previous.Containers)
+			_ = s.listeners.Reconcile(previousRuntime.Containers)
 		}
 		return fmt.Errorf("configure credentials: %w", err)
 	}
 	if err := s.stateStore.Save(next); err != nil {
-		_ = s.credentials.Configure(previous)
+		_ = s.credentials.Configure(previousRuntime)
 		if s.listeners != nil {
-			rollbackErr := s.listeners.Reconcile(previous.Containers)
+			rollbackErr := s.listeners.Reconcile(previousRuntime.Containers)
 			return fmt.Errorf("persist state: %w (rollback listeners: %v)", err, rollbackErr)
 		}
 		return err
@@ -380,4 +430,48 @@ func (s *Service) change(mutator func(*domain.State) error) error {
 	s.state = next
 	s.snapshot.Store(compiled)
 	return nil
+}
+
+func (s *Service) changeHosts(mutator func(*[]domain.Container) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := append([]domain.Container(nil), s.hosts...)
+	next := append([]domain.Container(nil), s.hosts...)
+	if err := mutator(&next); err != nil {
+		return err
+	}
+	nextRuntime := domain.CloneState(s.state)
+	nextRuntime.Containers = append(nextRuntime.Containers, next...)
+	nextRuntime = domain.NormalizeState(nextRuntime)
+	compiled, err := engine.Compile(nextRuntime)
+	if err != nil {
+		return err
+	}
+	if err := s.credentials.Validate(nextRuntime); err != nil {
+		return err
+	}
+	previousRuntime := domain.CloneState(s.state)
+	previousRuntime.Containers = append(previousRuntime.Containers, previous...)
+	previousRuntime = domain.NormalizeState(previousRuntime)
+	if s.listeners != nil {
+		if err := s.listeners.Reconcile(nextRuntime.Containers); err != nil {
+			rollbackErr := s.listeners.Reconcile(previousRuntime.Containers)
+			return fmt.Errorf("reconcile listeners: %w (rollback listeners: %v)", err, rollbackErr)
+		}
+	}
+	if err := s.credentials.Configure(nextRuntime); err != nil {
+		if s.listeners != nil {
+			_ = s.listeners.Reconcile(previousRuntime.Containers)
+		}
+		return fmt.Errorf("configure credentials: %w", err)
+	}
+	s.hosts = next
+	s.snapshot.Store(compiled)
+	return nil
+}
+
+func (s *Service) runtimeState(persisted domain.State) domain.State {
+	runtime := domain.CloneState(persisted)
+	runtime.Containers = append(runtime.Containers, s.hosts...)
+	return domain.NormalizeState(runtime)
 }

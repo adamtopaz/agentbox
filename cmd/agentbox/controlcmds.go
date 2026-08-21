@@ -27,8 +27,8 @@ func cmdStatus(ctx context.Context, client *control.Client, args []string) error
 	if err != nil {
 		return err
 	}
-	fmt.Printf("agentboxd: %s (%d profiles, %d routes, %d keys, %d containers, %d credential sources, %d credential bindings)\n",
-		health.Status, health.Profiles, health.Routes, health.Keys, health.Containers, health.CredentialSources, health.CredentialBindings)
+	fmt.Printf("agentboxd: %s (%d profiles, %d routes, %d keys, %d containers, %d host sessions, %d credential sources, %d credential bindings)\n",
+		health.Status, health.Profiles, health.Routes, health.Keys, health.Containers, health.HostSessions, health.CredentialSources, health.CredentialBindings)
 	return nil
 }
 

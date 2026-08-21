@@ -200,6 +200,23 @@ import json, sys
 d = json.loads(sys.argv[1])
 assert d["path"] == "/host/path", d
 PY
+
+# Host identities use the same data plane but are runtime-only.
+control -H 'content-type: application/json' \
+    -d '{"name":"host-e2e","profile":"test"}' \
+    http://agentbox/v1/host-sessions >/dev/null
+wait_for "$WORK/containers/host-e2e.sock"
+RESPONSE=$(curl --silent --show-error --unix-socket "$WORK/containers/host-e2e.sock" \
+    'http://agentbox/echo/from-host')
+python3 - "$RESPONSE" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["path"] == "/base/from-host", d
+PY
+grep -Fq 'host-e2e' "$WORK/state.json" && fail "host session was persisted"
+control -X DELETE http://agentbox/v1/host-sessions/host-e2e >/dev/null
+[[ ! -e "$WORK/containers/host-e2e.sock" ]] || fail "host session socket was not removed"
+
 [[ $(proxy -o /dev/null -w '%{http_code}' -H 'Host: unknown.example' http://agentbox/x) == 404 ]] \
     || fail "unmapped host did not fail closed"
 
@@ -243,7 +260,7 @@ control -X PATCH -H 'content-type: application/json' -d '{"blocked":false}' \
 [[ $(proxy -o /dev/null -w '%{http_code}' http://agentbox/echo/x) == 200 ]] \
     || fail "live unblock did not restore the route"
 
-abx status | grep -q '1 profiles, 10 routes, 1 keys, 1 containers, 1 credential sources, 1 credential bindings' \
+abx status | grep -q '1 profiles, 10 routes, 1 keys, 1 containers, 0 host sessions, 1 credential sources, 1 credential bindings' \
     || fail "health counts are wrong"
 for leak in QUERYSECRET container-fake real-one real-two; do
     if grep -Fq "$leak" "$WORK/daemon.log"; then
