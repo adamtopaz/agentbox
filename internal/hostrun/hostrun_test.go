@@ -3,6 +3,7 @@ package hostrun
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -59,6 +60,35 @@ func TestAuthorizedAcceptsSupportedClientHeaders(t *testing.T) {
 	}
 }
 
+func TestBridgeAnswersClaudeHealthCheckLocally(t *testing.T) {
+	bridge, err := startBridge(filepath.Join(t.TempDir(), "unused.sock"), "temporary-capability")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bridge.Close()
+	request, err := http.NewRequest(http.MethodHead, bridge.URL()+"/api/hello", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", response.StatusCode)
+	}
+
+	response, err = http.Get(bridge.URL() + "/api/hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated GET status=%d", response.StatusCode)
+	}
+}
+
 func TestCodexArgsUseEphemeralProviderOverride(t *testing.T) {
 	args := codexArgs("http://127.0.0.1:43210/cloudflare/prod/openai", []string{"exec", "hello"})
 	joined := strings.Join(args, "\n")
@@ -72,6 +102,72 @@ func TestCodexArgsUseEphemeralProviderOverride(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Errorf("args do not contain %q: %v", want, args)
 		}
+	}
+}
+
+func TestPreparePiAgentDirOverlaysProvidersAndCredentials(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "source")
+	if err := os.Mkdir(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "models.json"), []byte(`{
+  // Pi supports comments and trailing commas here.
+  "providers": {
+    "anthropic": {"baseUrl": "https://old.invalid", "headers": {"x-extra": "yes"}},
+    "custom": {"baseUrl": "https://custom.example", "api": "openai-completions", "models": [{"id": "local"}]},
+  },
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "auth.json"), []byte(`{
+  "anthropic": {"type": "api_key", "key": "old-secret"},
+  "custom": {"type": "api_key", "key": "custom-secret"}
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "settings.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	target := filepath.Join(t.TempDir(), "target")
+	if err := preparePiAgentDir(source, target, "http://127.0.0.1:1234/openai", "http://127.0.0.1:1234/anthropic"); err != nil {
+		t.Fatal(err)
+	}
+	var models struct {
+		Providers map[string]struct {
+			BaseURL string            `json:"baseUrl"`
+			Headers map[string]string `json:"headers"`
+		} `json:"providers"`
+	}
+	readJSONFile(t, filepath.Join(target, "models.json"), &models)
+	if got := models.Providers["anthropic"].BaseURL; got != "http://127.0.0.1:1234/anthropic" {
+		t.Fatalf("Anthropic base URL=%q", got)
+	}
+	if got := models.Providers["openai"].BaseURL; got != "http://127.0.0.1:1234/openai" {
+		t.Fatalf("OpenAI base URL=%q", got)
+	}
+	if got := models.Providers["anthropic"].Headers["x-extra"]; got != "yes" {
+		t.Fatalf("Anthropic provider setting was not preserved: %q", got)
+	}
+	if got := models.Providers["custom"].BaseURL; got != "https://custom.example" {
+		t.Fatalf("custom provider was not preserved: %q", got)
+	}
+	var auth map[string]struct {
+		Type string `json:"type"`
+		Key  string `json:"key"`
+	}
+	readJSONFile(t, filepath.Join(target, "auth.json"), &auth)
+	if got := auth["anthropic"].Key; got != "$ANTHROPIC_API_KEY" {
+		t.Fatalf("Anthropic credential=%q", got)
+	}
+	if got := auth["openai"].Key; got != "$OPENAI_API_KEY" {
+		t.Fatalf("OpenAI credential=%q", got)
+	}
+	if got := auth["custom"].Key; got != "custom-secret" {
+		t.Fatalf("custom credential was not preserved: %q", got)
+	}
+	if info, err := os.Lstat(filepath.Join(target, "settings.json")); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("settings link: info=%v err=%v", info, err)
 	}
 }
 
@@ -125,8 +221,8 @@ func TestRunRejectsMissingOpenAIBaseAndCleansSession(t *testing.T) {
 	writeExecutable(t, filepath.Join(original, "git-remote-http"), "#!/bin/sh\nexit 0\n")
 	writeExecutable(t, fakeGit, "#!/bin/sh\nprintf '%s\\n' "+shellQuote(original)+"\n")
 	err := Run(context.Background(), control, Options{
-		Profile:  domain.Profile{Name: "prod", Routes: []domain.Route{}, Credentials: map[string]string{}, Environment: map[string]string{}},
-		CodexBin: fakeCodex, GitBin: fakeGit, SocketDir: control.dir,
+		Profile: domain.Profile{Name: "prod", Routes: []domain.Route{}, Credentials: map[string]string{}, Environment: map[string]string{}},
+		Agent:   AgentCodex, AgentBin: fakeCodex, GitBin: fakeGit, SocketDir: control.dir,
 	})
 	if err == nil || !strings.Contains(err.Error(), "OPENAI_BASE_URL") {
 		t.Fatalf("unexpected error: %v", err)
@@ -157,7 +253,7 @@ func TestRunForwardsCodexRequestAndCleansSession(t *testing.T) {
 		Environment: map[string]string{"OPENAI_BASE_URL": "http://127.0.0.1:8787/cloudflare/prod/openai"},
 	}
 	err := Run(context.Background(), control, Options{
-		Profile: profile, CodexBin: fakeCodex, GitBin: fakeGit, SocketDir: control.dir,
+		Profile: profile, Agent: AgentCodex, AgentBin: fakeCodex, GitBin: fakeGit, SocketDir: control.dir,
 		Environment: os.Environ(), Stdout: io.Discard, Stderr: io.Discard,
 	})
 	if err != nil {
@@ -173,6 +269,82 @@ func TestRunForwardsCodexRequestAndCleansSession(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Codex request did not reach the host-session socket")
+	}
+	if control.added == "" || control.deleted != control.added {
+		t.Fatalf("session lifecycle added=%q deleted=%q", control.added, control.deleted)
+	}
+}
+
+func TestRunForwardsClaudeRequestAndCleansSession(t *testing.T) {
+	requestSeen := make(chan *http.Request, 1)
+	control := &controlFake{dir: t.TempDir(), handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestSeen <- r.Clone(context.Background())
+		_, _ = io.WriteString(w, "ok")
+	})}
+	root := t.TempDir()
+	fakeClaude := filepath.Join(root, "claude")
+	writeExecutable(t, fakeClaude, "#!/bin/sh\nset -eu\ntest \"${ANTHROPIC_API_KEY+x}\" != x\ntest \"${CLAUDE_CODE_OAUTH_TOKEN+x}\" != x\ntest \"$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\" = 1\ncurl -fsS -H \"Authorization: Bearer $ANTHROPIC_AUTH_TOKEN\" \"$ANTHROPIC_BASE_URL/v1/messages\" >/dev/null\n")
+	profile := domain.Profile{
+		Name: "prod", Routes: []domain.Route{}, Credentials: map[string]string{},
+		Environment: map[string]string{"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787/cloudflare/prod/anthropic"},
+	}
+	err := Run(context.Background(), control, Options{
+		Profile: profile, Agent: AgentClaude, AgentBin: fakeClaude, GitBin: makeFakeGit(t, root), SocketDir: control.dir,
+		Environment: append(os.Environ(), "ANTHROPIC_API_KEY=user-key", "CLAUDE_CODE_OAUTH_TOKEN=user-token"),
+		Stdout:      io.Discard, Stderr: io.Discard,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case request := <-requestSeen:
+		if request.URL.Path != "/cloudflare/prod/anthropic/v1/messages" {
+			t.Fatalf("path=%q", request.URL.Path)
+		}
+		if request.Header.Get("Authorization") != "" {
+			t.Fatal("session authorization reached the Agentbox data plane")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Claude request did not reach the host-session socket")
+	}
+	if control.added == "" || control.deleted != control.added {
+		t.Fatalf("session lifecycle added=%q deleted=%q", control.added, control.deleted)
+	}
+}
+
+func TestRunForwardsPiRequestAndCleansSession(t *testing.T) {
+	requestSeen := make(chan *http.Request, 1)
+	control := &controlFake{dir: t.TempDir(), handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestSeen <- r.Clone(context.Background())
+		_, _ = io.WriteString(w, "ok")
+	})}
+	root := t.TempDir()
+	fakePi := filepath.Join(root, "pi")
+	writeExecutable(t, fakePi, "#!/bin/sh\nset -eu\ntest \"$PI_OFFLINE\" = 1\ntest -f \"$PI_CODING_AGENT_DIR/models.json\"\ntest -f \"$PI_CODING_AGENT_DIR/auth.json\"\ncurl -fsS -H \"Authorization: Bearer $OPENAI_API_KEY\" \"$OPENAI_BASE_URL/responses\" >/dev/null\n")
+	profile := domain.Profile{
+		Name: "prod", Routes: []domain.Route{}, Credentials: map[string]string{},
+		Environment: map[string]string{
+			"OPENAI_BASE_URL":    "http://127.0.0.1:8787/cloudflare/prod/openai",
+			"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787/cloudflare/prod/anthropic",
+		},
+	}
+	err := Run(context.Background(), control, Options{
+		Profile: profile, Agent: AgentPi, AgentBin: fakePi, GitBin: makeFakeGit(t, root), SocketDir: control.dir,
+		Environment: []string{"PATH=" + os.Getenv("PATH"), "HOME=" + root}, Stdout: io.Discard, Stderr: io.Discard,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case request := <-requestSeen:
+		if request.URL.Path != "/cloudflare/prod/openai/responses" {
+			t.Fatalf("path=%q", request.URL.Path)
+		}
+		if request.Header.Get("Authorization") != "" {
+			t.Fatal("session authorization reached the Agentbox data plane")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Pi request did not reach the host-session socket")
 	}
 	if control.added == "" || control.deleted != control.added {
 		t.Fatalf("session lifecycle added=%q deleted=%q", control.added, control.deleted)
@@ -222,6 +394,29 @@ func newUnixHTTPServer(path string, handler http.Handler) (*http.Server, error) 
 func writeExecutable(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func makeFakeGit(t *testing.T, root string) string {
+	t.Helper()
+	original := filepath.Join(root, "git-core-for-"+filepath.Base(root))
+	if err := os.Mkdir(original, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(original, "git-remote-http"), "#!/bin/sh\nexit 0\n")
+	fake := filepath.Join(root, "git-for-"+filepath.Base(root))
+	writeExecutable(t, fake, "#!/bin/sh\nprintf '%s\\n' "+shellQuote(original)+"\n")
+	return fake
+}
+
+func readJSONFile(t *testing.T, path string, target any) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, target); err != nil {
 		t.Fatal(err)
 	}
 }

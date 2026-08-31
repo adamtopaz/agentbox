@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"os"
+	"strings"
 
 	"agentbox/internal/control"
 	"agentbox/internal/hostrun"
@@ -15,25 +17,31 @@ import (
 )
 
 func cmdHost(ctx context.Context, client *control.Client, controlSocket string, args []string) error {
-	if len(args) == 0 || args[0] != "codex" {
-		return errors.New("usage: agentbox host codex --profile PROFILE [--codex-bin PATH] [--git-bin PATH] [--] [CODEX_ARGS...]")
+	if len(args) == 0 {
+		return errors.New("usage: agentbox host <claude|codex|pi> --profile PROFILE [agent options]")
 	}
-	fs := flag.NewFlagSet("host codex", flag.ContinueOnError)
+	agent := hostrun.Agent(args[0])
+	if !agent.Valid() {
+		return fmt.Errorf("unknown host agent %q (want claude, codex, or pi)", args[0])
+	}
+	command := "host " + string(agent)
+	usage := "usage: agentbox " + command + " --profile PROFILE [--" + string(agent) + "-bin PATH] [--git-bin PATH] [--] [" + strings.ToUpper(string(agent)) + "_ARGS...]"
+	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	profileName := fs.String("profile", "", "Agentbox profile")
-	codexBin := fs.String("codex-bin", "codex", "Codex CLI executable")
+	agentBin := fs.String(string(agent)+"-bin", string(agent), agent.DisplayName()+" executable")
 	gitBin := fs.String("git-bin", "git", "Git executable")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 	if *profileName == "" {
-		return errors.New("usage: agentbox host codex --profile PROFILE [--codex-bin PATH] [--git-bin PATH] [--] [CODEX_ARGS...]")
+		return errors.New(usage)
 	}
 	current, err := findProfile(ctx, client, *profileName)
 	if err != nil {
 		return err
 	}
 	return hostrun.Run(ctx, client, hostrun.Options{
-		Profile: current, CodexBin: *codexBin, CodexArgs: fs.Args(), GitBin: *gitBin,
+		Profile: current, Agent: agent, AgentBin: *agentBin, AgentArgs: fs.Args(), GitBin: *gitBin,
 		ControlSocket: controlSocket, SocketDir: paths.ContainerSocketsDir,
 		Environment: os.Environ(), Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr,
 	})

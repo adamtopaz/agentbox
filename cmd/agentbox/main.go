@@ -23,7 +23,9 @@ usage: agentbox [--socket PATH] <command> ...
 host:
   setup                         install agentboxd and its systemd unit
   image build                   provision and publish the declarative Incus image
+  host claude --profile PROFILE run Claude Code on the host through Agentbox
   host codex --profile PROFILE  run Codex on the host through Agentbox
+  host pi --profile PROFILE     run Pi on the host through Agentbox
   status                        show daemon health
 
 generic control plane:

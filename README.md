@@ -23,7 +23,7 @@ operator
 container ── Incus proxy device ──> per-container Unix socket
                                       └── Go httputil.ReverseProxy ──> upstream
 
-host Codex ── authenticated loopback bridge ──> ephemeral Unix socket ──> upstream
+host coding agent ── authenticated loopback bridge ──> ephemeral Unix socket ──> upstream
 ```
 
 HTTP is only the current adapter for the control socket. Validation,
@@ -188,24 +188,31 @@ agentbox container unblock work
 agentbox container destroy work
 ```
 
-## Run Codex directly on the host
+## Run coding agents directly on the host
 
-Codex can use the same profile without an Incus container:
+Claude Code, Codex, and Pi can use the same profile without an Incus container:
 
 ```sh
+agentbox host claude --profile production
 agentbox host codex --profile production
-# Separate Agentbox flags from Codex arguments with `--`:
+agentbox host pi --profile production
+# Separate Agentbox flags from agent arguments with `--`:
+agentbox host claude --profile production -- -p "inspect this repository"
 agentbox host codex --profile production -- exec "inspect this repository"
+agentbox host pi --profile production -- -p "inspect this repository"
 ```
 
 The command creates a non-persistent host identity in `agentboxd`, starts an
-authenticated random-port loopback bridge, and launches the installed `codex`
-binary with per-run custom-provider overrides. It does not replace or edit the
-user's `~/.codex` configuration. On normal exit or a handled signal, the bridge
-and daemon identity are removed; a daemon restart also revokes all host
+authenticated random-port loopback bridge, and launches the selected agent.
+Codex receives per-run custom-provider arguments. Claude Code receives a
+session-only gateway token. Pi receives a temporary configuration that merges
+its existing providers and credentials while overriding the built-in OpenAI and
+Anthropic providers. Agentbox does not replace or edit the user's persistent
+agent configuration. On normal exit or a handled signal, the bridge, temporary
+files, and daemon identity are removed; a daemon restart also revokes all host
 identities because they are never written to `state.json`.
 
-Within that Codex process, `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` use the
+Within the agent process, `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` use the
 selected Agentbox profile. GitHub CLI API traffic uses the session's protected
 Unix socket. A temporary Git HTTPS transport helper sends only canonical
 `https://github.com/...` clone/fetch/push operations through `/github-git/`, so
@@ -215,8 +222,9 @@ rewritten. Direct `curl`, MCP-server, connector/app, web-search, SSH, and other
 unrecognized network traffic is outside this routing mechanism.
 
 The host user must be able to access the Agentbox control/data sockets (normally
-through the `agentbox` group) and must have `codex` and `git` installed. Use
-`--codex-bin` or `--git-bin` when either executable is not on `PATH`.
+through the `agentbox` group) and must have the selected agent and `git`
+installed. Use `--claude-bin`, `--codex-bin`, `--pi-bin`, or `--git-bin` when an
+executable is not on `PATH`.
 
 ## Generic routes
 

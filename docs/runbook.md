@@ -297,29 +297,33 @@ recreate an old container, to bring it under the same limits.
 daemon socket, or tagged but unregistered Incus instance is shown instead of
 being repaired implicitly.
 
-## Host Codex sessions
+## Host coding-agent sessions
 
-Launch Codex on the main host with an existing profile:
+Launch Claude Code, Codex, or Pi on the main host with an existing profile:
 
 ```sh
+agentbox host claude --profile production
 agentbox host codex --profile production
 agentbox host codex --profile production -- exec "run the test suite"
+agentbox host pi --profile production
 ```
 
 Agentbox registers an in-memory host identity and gives it a normal per-identity
-Unix listener. A random-port loopback HTTP bridge lets Codex and Git clients
-that cannot dial Unix sockets reach that listener. The bridge requires a
-random, session-only credential and removes it before forwarding; it is not an
-upstream API key. `gh` uses a temporary `GH_CONFIG_DIR` whose
+Unix listener. A random-port loopback HTTP bridge lets the selected agent and
+Git clients that cannot dial Unix sockets reach that listener. The bridge
+requires a random, session-only credential and removes it before forwarding;
+it is not an upstream API key. `gh` uses a temporary `GH_CONFIG_DIR` whose
 `http_unix_socket` points directly at the protected session socket. A temporary
 `GIT_EXEC_PATH` wraps only `git-remote-https` for `https://github.com/...` and
 delegates every other HTTPS remote unchanged.
 
-The launcher deletes its daemon identity and temporary files when Codex exits.
-Host identities are not persisted, so restarting `agentboxd` also revokes any
-identity left behind by an uncatchable process termination. A live host session
-prevents deletion of its selected profile. GitHub SSH remotes and arbitrary
-process traffic are not redirected.
+Codex uses command-line provider overrides, Claude Code uses a temporary gateway
+token, and Pi uses a temporary overlay of its provider and auth configuration.
+The launcher deletes its daemon identity and temporary files when the agent
+exits. Host identities are not persisted, so restarting `agentboxd` also
+revokes any identity left behind by an uncatchable process termination. A live
+host session prevents deletion of its selected profile. GitHub SSH remotes and
+arbitrary process traffic are not redirected.
 
 Soft containment changes the live snapshot so new requests return 403:
 
