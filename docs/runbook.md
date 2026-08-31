@@ -3,7 +3,7 @@
 ## Service health
 
 ```sh
-agentbox status
+sudo agentbox status
 systemctl status agentboxd
 journalctl -u agentboxd
 ```
@@ -12,33 +12,44 @@ Production paths are:
 
 | Purpose | Path |
 |---|---|
-| Control socket | `/run/agentbox/control.sock` |
-| Container listeners | `/run/agentbox/containers/<name>.sock` |
+| Administrator control socket | `/run/agentbox/admin.sock` |
+| Restricted user control socket | `/run/agentbox/user.sock` |
+| Administrator-only container listeners | `/run/agentbox/containers/<name>.sock` |
+| UID-protected host-session listeners | `/run/agentbox/users/<random-name>.sock` |
 | Non-secret state | `/var/lib/agentbox/state.json` |
 | Encrypted key envelopes | `/var/lib/agentbox/secrets/<name>.json` |
 | Encrypted master credential | `/etc/agentbox/master-key.cred` |
 | Unit | `/etc/systemd/system/agentboxd.service` |
 
-The sockets are group-accessible to `agentbox`; their directories grant the
-group traverse but not replace permission. The state and encrypted key
+The user control socket and host-session directory are group-accessible to
+`agentbox`. Every host-session listener additionally verifies the connecting
+Unix UID. The administrator socket is mode `0600`, accepts UID 0 only, and
+container listeners reside in a mode `0700` directory. State and encrypted-key
 directories belong to the unprivileged service account.
+
+An upgrade from state version 3 does not implicitly grant any profile. Stop
+active host work before upgrading because the required daemon restart revokes
+all in-memory sessions; after restart, add the intended UID grants explicitly.
+Older Agentbox installers added the initial operator to `incus-admin`; remove
+that pre-existing membership separately if the account should now have
+host-only access, and have the user log out and back in.
 
 ## Keys
 
 Add or rotate a key without restarting the daemon:
 
 ```sh
-agentbox key set <name>
+sudo agentbox key set <name>
 # or
-printf '%s' "$VALUE" | agentbox key set <name>
+printf '%s' "$VALUE" | sudo agentbox key set <name>
 ```
 
 The CLI never puts the value in argv. Interactive input is hidden; piped input
 has one trailing newline removed. The API never returns key values.
 
 ```sh
-agentbox key list
-agentbox key delete <name>
+sudo agentbox key list
+sudo agentbox key delete <name>
 ```
 
 Deletion is refused while any route or credential source references the key.
@@ -70,9 +81,9 @@ github-app provider → expiring lease
 List the live, non-secret configuration:
 
 ```sh
-agentbox credential source list
-agentbox credential source list --json
-agentbox profile show production
+sudo agentbox credential source list
+sudo agentbox credential source list --json
+sudo agentbox profile show production
 ```
 
 Generic JSON sources can be submitted with `credential source put`. The
@@ -80,17 +91,17 @@ GitHub-specific CLI adapter constructs the same generic source after validating
 its flags:
 
 ```sh
-agentbox key set github-app-private-key < /path/to/app.private-key.pem
+sudo agentbox key set github-app-private-key < /path/to/app.private-key.pem
 
-agentbox credential source github-app github-main \
+sudo agentbox credential source github-app github-main \
   --client-id Iv1.example \
   --installation-id 12345678 \
   --private-key github-app-private-key \
   --repository-ids 111111,222222 \
   --permissions contents=write,pull_requests=write,issues=write
 
-agentbox profile create production
-agentbox profile set github production --source github-main
+sudo agentbox profile create production
+sudo agentbox profile set github production --source github-main
 ```
 
 The Client ID is shown on the GitHub App settings page. The installation ID is
@@ -111,9 +122,9 @@ installations under other accounts. One token cannot span installations.
 Sources and profile bindings update while the daemon is running:
 
 ```sh
-agentbox profile set github <profile> --source <source>
-agentbox profile unset github <profile>
-agentbox credential source delete <source>
+sudo agentbox profile set github <profile> --source <source>
+sudo agentbox profile unset github <profile>
+sudo agentbox credential source delete <source>
 ```
 
 Source deletion is refused while a profile references it. Updating a source or
@@ -139,26 +150,26 @@ opaque; no prefix or fixed-length assumption is made.
 List or export routes:
 
 ```sh
-agentbox route list <profile>
-agentbox route list --json <profile> > routes.json
+sudo agentbox route list <profile>
+sudo agentbox route list --json <profile> > routes.json
 ```
 
 Create or replace one named route:
 
 ```sh
-agentbox route put <profile> route.json
+sudo agentbox route put <profile> route.json
 ```
 
 Atomically replace one profile's entire route collection:
 
 ```sh
-agentbox route replace <profile> routes.json
+sudo agentbox route replace <profile> routes.json
 ```
 
 Delete one:
 
 ```sh
-agentbox route delete <profile> <name>
+sudo agentbox route delete <profile> <name>
 ```
 
 All input is strict JSON: unknown fields, duplicate names/selectors, invalid
@@ -178,11 +189,10 @@ queries, or provider-visible path suffixes. `strip_prefix` removes only the
 local Agentbox routing namespace before joining the suffix to the upstream base
 path. Bodies remain streaming and are never parsed by the proxy.
 
-State version 3 introduces reusable profiles and migrates version-2 scopes into
-profiles. Legacy per-container grants are migrated only when every container in
-a scope has the same bindings; a conflicting scope fails startup rather than
-broadening access. Version-1 transforming routes remain omitted during
-migration because Agentbox is an authentication proxy.
+State version 4 adds explicit Unix-UID profile grants. Version-3 profiles are
+migrated without implicitly granting them to any user. Version-2 scopes and
+legacy per-container credential grants retain their existing conservative
+migration behavior.
 
 ## Profiles
 
@@ -192,21 +202,21 @@ Provider-specific commands are convenience adapters that atomically compose
 those generic fields:
 
 ```sh
-agentbox profile create production
-agentbox profile set cloudflare production \
+sudo agentbox profile create production
+sudo agentbox profile set cloudflare production \
   --account-id <32-hex-id> --gateway ff-prod \
   --private-key <stored-key-name>
-agentbox profile set github production --source github-main
+sudo agentbox profile set github production --source github-main
 ```
 
 Inspect or remove assignments without exposing any secret values:
 
 ```sh
-agentbox profile list
-agentbox profile show production
-agentbox profile unset github production
-agentbox profile unset cloudflare production
-agentbox profile delete production
+sudo agentbox profile list
+sudo agentbox profile show production
+sudo agentbox profile unset github production
+sudo agentbox profile unset cloudflare production
+sudo agentbox profile delete production
 ```
 
 Deletion is refused while a container uses the profile. `profile put` accepts
@@ -217,6 +227,37 @@ and GitHub App sources. Reapplying one integration replaces only that
 integration inside the selected profile and preserves its other routes and
 bindings. Avoid the reserved `github-*` and `cloudflare*` route names for
 operator-owned routes.
+
+## User profile grants
+
+Only root can inspect or change profile grants. Grants are stored by numeric
+Unix UID so account renames do not silently lose access:
+
+```sh
+sudo usermod -aG agentbox alice
+sudo agentbox user grant alice production
+sudo agentbox user list
+sudo agentbox user list alice
+sudo agentbox user revoke alice production
+```
+
+Group membership takes effect on the user's next login. Removing a user from
+the group prevents new user-socket connections; revoke profile grants as well
+to remove active host sessions immediately. Revoke grants before deleting an
+account or reusing its UID, because a future account with the same UID inherits
+any grant that was left behind.
+
+A regular user can start host sessions only with profiles granted to that UID.
+The user API returns only the profile name and public launch environment; route
+definitions, key names, credential sources, and bindings remain available only
+through the administrator socket. Removing a grant immediately removes that
+user's active sessions for the profile. A user can have at most 16 concurrent
+host sessions.
+
+A profile with credential-bearing HTTP routes, including literal loopback
+routes, cannot be granted to regular users. HTTPS is mandatory because loopback
+TCP does not identify a process on a multi-user system. Admin-only container
+profiles retain the existing loopback exception.
 
 The GitHub profile has path routes for Git HTTPS/API and exact-host routes for
 GitHub CLI. `api.github.com` and `uploads.github.com` receive the container
@@ -261,10 +302,10 @@ shimmed through the REST API.
 ## Containers
 
 ```sh
-agentbox container create --profile production <name>
-agentbox container list
-agentbox container shell <name>
-agentbox container destroy <name>
+sudo agentbox container create --profile production <name>
+sudo agentbox container list
+sudo agentbox container shell <name>
+sudo agentbox container destroy <name>
 ```
 
 Use an empty profile for a generic container with no provider integrations,
@@ -274,7 +315,7 @@ safe resource defaults: 4 CPUs, 8 GiB memory, 2,048 processes, and a 50 GiB
 root disk. Adjust them at creation time when needed:
 
 ```sh
-agentbox container create --profile production \
+sudo agentbox container create --profile production \
   --cpus 8 --memory 16GiB --processes 4096 --disk 100GiB <name>
 ```
 
@@ -282,7 +323,7 @@ To let the Incus profile and host determine available capacity without adding
 Agentbox per-instance limits, use the explicit opt-out:
 
 ```sh
-agentbox container create --profile production \
+sudo agentbox container create --profile production \
   --no-resource-limits <name>
 ```
 
@@ -299,23 +340,26 @@ being repaired implicitly.
 
 ## Host coding-agent sessions
 
-Launch Claude Code, Codex, or Pi on the main host with an existing profile:
+Grant an existing profile, then launch Claude Code, Codex, or Pi as the regular
+user—without `sudo` and without Incus access:
 
 ```sh
+sudo agentbox user grant alice production
+# Run the following as alice:
+agentbox host profiles
 agentbox host claude --profile production
 agentbox host codex --profile production
 agentbox host codex --profile production -- exec "run the test suite"
 agentbox host pi --profile production
 ```
 
-Agentbox registers an in-memory host identity and gives it a normal per-identity
-Unix listener. A random-port loopback HTTP bridge lets the selected agent and
-Git clients that cannot dial Unix sockets reach that listener. The bridge
-requires a random, session-only credential and removes it before forwarding;
-it is not an upstream API key. `gh` uses a temporary `GH_CONFIG_DIR` whose
-`http_unix_socket` points directly at the protected session socket. A temporary
-`GIT_EXEC_PATH` wraps only `git-remote-https` for `https://github.com/...` and
-delegates every other HTTPS remote unchanged.
+Agentbox derives the caller's UID from the user control socket and ignores any
+client claim about identity. It generates the session name, binds the selected
+profile only after checking the UID grant, and gives the session a Unix listener
+that accepts only that UID (or root). A random-port loopback HTTP bridge lets
+clients that cannot dial Unix sockets reach that listener. The bridge requires
+a random session-only credential and removes it before forwarding; it is not an
+upstream API key. `gh` points directly at the UID-protected session socket.
 
 Codex uses command-line provider overrides, Claude Code uses a temporary gateway
 token, and Pi uses a temporary overlay of its provider and auth configuration.
@@ -328,15 +372,15 @@ arbitrary process traffic are not redirected.
 Soft containment changes the live snapshot so new requests return 403:
 
 ```sh
-agentbox container block <name>
-agentbox container unblock <name>
+sudo agentbox container block <name>
+sudo agentbox container unblock <name>
 ```
 
 Hard containment first blocks the identity, then removes both Incus proxy
 devices to sever existing connections:
 
 ```sh
-agentbox container block --hard <name>
+sudo agentbox container block --hard <name>
 ```
 
 Unblock re-adds missing managed devices. Destroy refuses to delete an existing
@@ -344,7 +388,8 @@ Incus instance unless it carries `user.agentbox=true`.
 
 ## Control protocol
 
-The current wire adapter is HTTP/1.1 over `/run/agentbox/control.sock`:
+The administrator API is HTTP/1.1 over the root-only
+`/run/agentbox/admin.sock`:
 
 | Method | Path | Operation |
 |---|---|---|
@@ -357,19 +402,29 @@ The current wire adapter is HTTP/1.1 over `/run/agentbox/control.sock`:
 | `PUT`, `DELETE` | `/v1/keys/{name}` | set raw value or delete key |
 | `GET` | `/v1/credential-sources` | list non-secret source configuration |
 | `PUT`, `DELETE` | `/v1/credential-sources/{name}` | upsert or delete a source |
+| `GET` | `/v1/profile-grants` | list all UID/profile grants |
+| `PUT`, `DELETE` | `/v1/profile-grants/{uid}/{profile}` | grant or revoke host use |
 | `GET`, `POST` | `/v1/containers` | list or register identities |
 | `PATCH`, `DELETE` | `/v1/containers/{name}` | block/unblock or unregister |
-| `POST` | `/v1/host-sessions` | register a non-persistent host identity |
-| `DELETE` | `/v1/host-sessions/{name}` | revoke a host identity |
+
+The restricted API on `/run/agentbox/user.sock` contains only:
+
+| Method | Path | Operation |
+|---|---|---|
+| `GET` | `/v1/user/profiles` | list the caller's sanitized assigned profiles |
+| `POST` | `/v1/user/host-sessions` | create a session for an assigned profile |
+| `DELETE` | `/v1/user/host-sessions/{name}` | revoke one of the caller's sessions |
 
 The protocol is not the domain boundary. Handlers call a typed application
 service that contains all mutation and validation semantics; another local
 transport can be added without duplicating route, key, or credential logic.
 
-There is no bearer authentication on this local API. Authorization is the
-kernel-enforced owner/group/mode on the Unix socket. Linux peer credentials are
-recorded in control logs for attribution. Members of `agentbox` are trusted
-because arbitrary route management can redirect injected keys and credentials.
+There is no reusable bearer authentication on either local API. The admin
+socket is mode `0600` and requires peer UID 0. The user socket is accessible to
+the `agentbox` group, and Linux peer credentials supply the authoritative UID
+for every profile and session decision. Failure to obtain peer credentials
+fails closed. Administrative commands therefore use explicit `sudo`; do not run
+host coding agents with `sudo`.
 
 The systemd unit uses `Type=notify`, so setup/restart is not considered
 successful until state, encrypted keys, the control listener, and all persisted
@@ -413,11 +468,11 @@ It is an Incus instance configuration whose `cloud-init.user-data` installs
 packages, creates the agent user, writes proxy configuration, and installs the
 pinned coding agents.
 
-Build and publish it through your existing Incus access—no `sudo` or separate
-image-builder installation is required:
+Build and publish it as an Agentbox administrator; no separate image-builder
+installation is required:
 
 ```sh
-agentbox image build
+sudo agentbox image build
 ```
 
 The command refuses to touch an existing `agentbox-build` instance unless it
@@ -433,7 +488,7 @@ cloud-init-enabled base image. `--keep-builder` retains the stopped builder on
 success—or its current state on failure—for diagnosis:
 
 ```sh
-agentbox image build --alias agentbox-test --keep-builder
+sudo agentbox image build --alias agentbox-test --keep-builder
 incus delete --force agentbox-build   # when finished inspecting it
 ```
 
@@ -461,7 +516,7 @@ request and response bodies independently.
 
 For suspected container compromise:
 
-1. `agentbox container block --hard <name>`.
+1. `sudo agentbox container block --hard <name>`.
 2. Rotate every key reachable from that container's profile.
 3. Review daemon metadata and upstream audit/billing logs.
 4. Destroy and recreate the container.

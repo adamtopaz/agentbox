@@ -128,7 +128,7 @@ func (m *Manager) Create(ctx context.Context, options CreateOptions) error {
 			return rollback(err)
 		}
 	}
-	fmt.Fprintf(m.out(), "container %q ready with profile %q; enter it with: agentbox container shell %s\n", options.Name, options.Profile, options.Name)
+	fmt.Fprintf(m.out(), "container %q ready with profile %q; enter it with: sudo agentbox container shell %s\n", options.Name, options.Profile, options.Name)
 	return nil
 }
 

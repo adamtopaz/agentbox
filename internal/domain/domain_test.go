@@ -165,3 +165,22 @@ func TestMaterialRequiresEncryptedOrLoopbackTransport(t *testing.T) {
 		t.Fatalf("plaintext route without material rejected: %v", err)
 	}
 }
+
+func TestGrantedProfileRequiresHTTPSForMaterial(t *testing.T) {
+	state := NewState()
+	route := validRoute()
+	route.Upstream = "http://127.0.0.1:8080"
+	state.Profiles = []Profile{{Name: "prod", Routes: []Route{route}, Credentials: map[string]string{}, Environment: map[string]string{}}}
+	if err := ValidateState(state); err != nil {
+		t.Fatalf("admin-only loopback profile rejected: %v", err)
+	}
+	state.ProfileGrants = []ProfileGrant{{UID: 1001, Profile: "prod"}}
+	if err := ValidateState(state); err == nil {
+		t.Fatal("granted profile accepted a credential-bearing loopback HTTP route")
+	}
+	route.Upstream = "https://example.com"
+	state.Profiles[0].Routes[0] = route
+	if err := ValidateState(state); err != nil {
+		t.Fatalf("granted HTTPS profile rejected: %v", err)
+	}
+}

@@ -97,17 +97,21 @@ func TestHostSessionIsRuntimeOnly(t *testing.T) {
 	if err := service.PutProfile(ctx, profile); err != nil {
 		t.Fatal(err)
 	}
-	created, err := service.AddHostSession(ctx, domain.Container{Name: "host-test", Profile: "prod"})
+	const uid = 1001
+	if err := service.PutProfileGrant(ctx, domain.ProfileGrant{UID: uid, Profile: "prod"}); err != nil {
+		t.Fatal(err)
+	}
+	created, err := service.AddHostSession(ctx, uid, "prod")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if created.CreatedAt.IsZero() {
 		t.Fatal("host session has no creation timestamp")
 	}
-	if current, ok := service.Snapshot().Container("host-test"); !ok || current.Profile != "prod" {
+	if current, ok := service.Snapshot().Container(created.Name); !ok || current.Profile != "prod" || current.OwnerUID != uid || !current.Host {
 		t.Fatalf("runtime snapshot does not contain host session: %+v %v", current, ok)
 	}
-	if len(listeners.seen) != 1 || listeners.seen[0].Name != "host-test" {
+	if len(listeners.seen) != 1 || listeners.seen[0].Name != created.Name {
 		t.Fatalf("listeners=%+v", listeners.seen)
 	}
 	loaded, err := store.Load()
@@ -123,14 +127,54 @@ func TestHostSessionIsRuntimeOnly(t *testing.T) {
 	if err := service.DeleteProfile(ctx, "prod"); !errors.Is(err, ErrConflict) {
 		t.Fatalf("active session did not protect profile: %v", err)
 	}
-	if err := service.DeleteHostSession(ctx, "host-test"); err != nil {
+	if err := service.DeleteHostSession(ctx, uid, created.Name); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := service.Snapshot().Container("host-test"); ok {
+	if _, ok := service.Snapshot().Container(created.Name); ok {
 		t.Fatal("deleted host session remains in runtime snapshot")
 	}
 	if len(listeners.seen) != 0 {
 		t.Fatalf("listener remains after deletion: %+v", listeners.seen)
+	}
+}
+
+func TestHostSessionRequiresGrantAndRevokesWithIt(t *testing.T) {
+	service, _ := testService(t)
+	defer service.Close()
+	listeners := &listenerFake{}
+	if err := service.AttachListeners(listeners); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	profile := domain.Profile{Name: "prod", Routes: []domain.Route{}, Credentials: map[string]string{}, Environment: map[string]string{"PUBLIC": "value"}}
+	if err := service.PutProfile(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.AddHostSession(ctx, 1001, "prod"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("ungranted session error=%v", err)
+	}
+	if err := service.PutProfileGrant(ctx, domain.ProfileGrant{UID: 1001, Profile: "prod"}); err != nil {
+		t.Fatal(err)
+	}
+	profiles := service.UserProfiles(ctx, 1001)
+	if len(profiles) != 1 || profiles[0].Name != "prod" || profiles[0].Environment["PUBLIC"] != "value" {
+		t.Fatalf("user profiles=%+v", profiles)
+	}
+	created, err := service.AddHostSession(ctx, 1001, "prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.DeleteHostSession(ctx, 1002, created.Name); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-user delete error=%v", err)
+	}
+	if err := service.DeleteProfileGrant(ctx, 1001, "prod"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := service.Snapshot().Container(created.Name); ok {
+		t.Fatal("session survived profile-grant revocation")
+	}
+	if len(listeners.seen) != 0 {
+		t.Fatalf("revoked listener remains: %+v", listeners.seen)
 	}
 }
 

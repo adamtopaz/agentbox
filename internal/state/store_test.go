@@ -17,6 +17,7 @@ func TestStoreRoundTripAndStrictInput(t *testing.T) {
 	state.CredentialSources = []domain.CredentialSource{{Name: "source", Provider: "provider", Parameters: map[string]string{"public": "value"}, Secrets: map[string]string{"root": "root-key"}}}
 	state.Profiles = []domain.Profile{{Name: "prod", Routes: []domain.Route{{Name: "api", Match: domain.Match{PathPrefix: "/api"}, Upstream: "https://example.com"}}, Credentials: map[string]string{"api": "source"}, Environment: map[string]string{"AGENTBOX_PROFILE": "prod"}}}
 	state.Containers = []domain.Container{{Name: "dev", Profile: "prod", CreatedAt: time.Now()}}
+	state.ProfileGrants = []domain.ProfileGrant{{UID: 1001, Profile: "prod"}}
 	if err := store.Save(state); err != nil {
 		t.Fatal(err)
 	}
@@ -24,7 +25,7 @@ func TestStoreRoundTripAndStrictInput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded.Profiles) != 1 || len(loaded.Profiles[0].Routes) != 1 || len(loaded.Containers) != 1 || len(loaded.CredentialSources) != 1 {
+	if len(loaded.Profiles) != 1 || len(loaded.Profiles[0].Routes) != 1 || len(loaded.Containers) != 1 || len(loaded.CredentialSources) != 1 || len(loaded.ProfileGrants) != 1 {
 		t.Fatalf("unexpected state: %+v", loaded)
 	}
 	info, err := os.Stat(path)
@@ -40,6 +41,21 @@ func TestStoreRoundTripAndStrictInput(t *testing.T) {
 	}
 	if _, err := store.Load(); err == nil {
 		t.Fatal("unknown state field was accepted")
+	}
+}
+
+func TestStoreMigratesV3WithoutImplicitUserGrants(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	data := `{"version":3,"profiles":[{"name":"prod","routes":[],"credentials":{},"environment":{}}],"containers":[],"credential_sources":[]}`
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := (Store{Path: path}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Version != domain.StateVersion || len(loaded.Profiles) != 1 || len(loaded.ProfileGrants) != 0 {
+		t.Fatalf("unexpected migrated state: %+v", loaded)
 	}
 }
 

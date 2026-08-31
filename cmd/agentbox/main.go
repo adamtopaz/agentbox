@@ -18,17 +18,20 @@ import (
 
 const usage = `agentbox — credential-isolating coding-agent containers
 
-usage: agentbox [--socket PATH] <command> ...
+usage: agentbox [--admin-socket PATH] [--user-socket PATH] <command> ...
 
-host:
-  setup                         install agentboxd and its systemd unit
-  image build                   provision and publish the declarative Incus image
+regular user:
+  host profiles                 list profiles assigned to this Unix user
   host claude --profile PROFILE run Claude Code on the host through Agentbox
   host codex --profile PROFILE  run Codex on the host through Agentbox
   host pi --profile PROFILE     run Pi on the host through Agentbox
+
+administrator (run with sudo):
+  setup                         install agentboxd and its systemd unit
+  image build                   provision and publish the declarative Incus image
   status                        show daemon health
 
-generic control plane:
+administrator control plane:
   route list [--json] <profile>
   route put <profile> <route.json>
   route replace <profile> <routes.json>
@@ -47,6 +50,11 @@ profiles:
   profile unset cloudflare <profile>
   profile set github <profile> --source SOURCE
   profile unset github <profile>
+
+user grants (admin):
+  user list [USERNAME]
+  user grant USERNAME PROFILE
+  user revoke USERNAME PROFILE
 
 containers:
   container create --profile PROFILE [resource flags] <name>
@@ -72,7 +80,9 @@ func main() {
 func run() error {
 	global := flag.NewFlagSet("agentbox", flag.ContinueOnError)
 	global.SetOutput(os.Stderr)
-	socket := global.String("socket", envOr("AGENTBOX_SOCKET", paths.ControlSocket), "agentboxd control socket")
+	legacySocket := global.String("socket", "", "deprecated alias for --admin-socket")
+	adminSocket := global.String("admin-socket", envOr("AGENTBOX_ADMIN_SOCKET", paths.ControlSocket), "root-only agentboxd administrator socket")
+	userSocket := global.String("user-socket", envOr("AGENTBOX_SOCKET", paths.UserControlSocket), "agentboxd user socket")
 	showVersion := global.Bool("version", false, "print version")
 	global.Usage = func() { fmt.Fprint(global.Output(), usage) }
 	if err := global.Parse(os.Args[1:]); err != nil {
@@ -93,26 +103,38 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	client := control.NewClient(*socket)
+	if *legacySocket != "" {
+		*adminSocket = *legacySocket
+	}
+	adminClient := control.NewClient(*adminSocket)
+	userClient := control.NewClient(*userSocket)
 	switch args[0] {
 	case "status":
-		return cmdStatus(ctx, client, args[1:])
+		return cmdStatus(ctx, adminClient, args[1:])
 	case "route":
-		return cmdRoute(ctx, client, args[1:])
+		return cmdRoute(ctx, adminClient, args[1:])
 	case "key":
-		return cmdKey(ctx, client, args[1:])
+		return cmdKey(ctx, adminClient, args[1:])
 	case "credential":
-		return cmdCredential(ctx, client, args[1:])
+		return cmdCredential(ctx, adminClient, args[1:])
 	case "profile":
-		return cmdProfile(ctx, client, args[1:])
+		return cmdProfile(ctx, adminClient, args[1:])
+	case "user":
+		return cmdUser(ctx, adminClient, args[1:])
 	case "container":
-		return cmdContainer(ctx, client, args[1:])
+		if os.Geteuid() != 0 {
+			return fmt.Errorf("container commands require administrator elevation (run with sudo)")
+		}
+		return cmdContainer(ctx, adminClient, args[1:])
 	case "setup":
 		return cmdSetup(args[1:])
 	case "image":
+		if os.Geteuid() != 0 {
+			return fmt.Errorf("image commands require administrator elevation (run with sudo)")
+		}
 		return cmdImage(args[1:])
 	case "host":
-		return cmdHost(ctx, client, *socket, args[1:])
+		return cmdHost(ctx, userClient, *userSocket, args[1:])
 	default:
 		return fmt.Errorf("unknown command %q\n\n%s", args[0], usage)
 	}

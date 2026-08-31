@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"agentbox/internal/control"
+	"agentbox/internal/domain"
 	"agentbox/internal/hostrun"
 	"agentbox/internal/hostsetup"
 	"agentbox/internal/imagebuild"
@@ -18,7 +19,20 @@ import (
 
 func cmdHost(ctx context.Context, client *control.Client, controlSocket string, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: agentbox host <claude|codex|pi> --profile PROFILE [agent options]")
+		return errors.New("usage: agentbox host profiles | <claude|codex|pi> --profile PROFILE [agent options]")
+	}
+	if args[0] == "profiles" {
+		if len(args) != 1 {
+			return errors.New("usage: agentbox host profiles")
+		}
+		profiles, err := client.UserProfiles(ctx)
+		if err != nil {
+			return err
+		}
+		for _, profile := range profiles {
+			fmt.Println(profile.Name)
+		}
+		return nil
 	}
 	agent := hostrun.Agent(args[0])
 	if !agent.Valid() {
@@ -36,20 +50,30 @@ func cmdHost(ctx context.Context, client *control.Client, controlSocket string, 
 	if *profileName == "" {
 		return errors.New(usage)
 	}
-	current, err := findProfile(ctx, client, *profileName)
+	profiles, err := client.UserProfiles(ctx)
 	if err != nil {
 		return err
 	}
+	var current *domain.UserProfile
+	for i := range profiles {
+		if profiles[i].Name == *profileName {
+			current = &profiles[i]
+			break
+		}
+	}
+	if current == nil {
+		return fmt.Errorf("profile %q is not assigned to this user", *profileName)
+	}
 	return hostrun.Run(ctx, client, hostrun.Options{
-		Profile: current, Agent: agent, AgentBin: *agentBin, AgentArgs: fs.Args(), GitBin: *gitBin,
-		ControlSocket: controlSocket, SocketDir: paths.ContainerSocketsDir,
+		Profile: *current, Agent: agent, AgentBin: *agentBin, AgentArgs: fs.Args(), GitBin: *gitBin,
+		ControlSocket: controlSocket, SocketDir: paths.HostSocketsDir,
 		Environment: os.Environ(), Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr,
 	})
 }
 
 func cmdSetup(args []string) error {
 	fs := flag.NewFlagSet("setup", flag.ContinueOnError)
-	admin := fs.String("admin-user", "", "user to add to agentbox and incus-admin groups (default $SUDO_USER)")
+	admin := fs.String("admin-user", "", "initial user to add to the agentbox host-access group (default $SUDO_USER)")
 	daemon := fs.String("daemon-binary", "", "agentboxd binary (default: sibling of agentbox)")
 	noStart := fs.Bool("no-start", false, "install without restarting agentboxd")
 	prefix := fs.String("prefix", "", "root filesystem writes under this test directory")

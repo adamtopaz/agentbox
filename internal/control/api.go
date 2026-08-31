@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,19 +40,26 @@ type Service interface {
 	CredentialSources(context.Context) []domain.CredentialSource
 	PutCredentialSource(context.Context, domain.CredentialSource) error
 	DeleteCredentialSource(context.Context, string) error
+	ProfileGrants(context.Context) []domain.ProfileGrant
+	PutProfileGrant(context.Context, domain.ProfileGrant) error
+	DeleteProfileGrant(context.Context, uint32, string) error
 	Containers(context.Context) []domain.Container
 	AddContainer(context.Context, domain.Container) (domain.Container, error)
 	SetContainerBlocked(context.Context, string, bool) error
 	DeleteContainer(context.Context, string) error
-	AddHostSession(context.Context, domain.Container) (domain.Container, error)
-	DeleteHostSession(context.Context, string) error
+	UserProfiles(context.Context, uint32) []domain.UserProfile
+	AddHostSession(context.Context, uint32, string) (domain.HostSession, error)
+	DeleteHostSession(context.Context, uint32, string) error
 }
 
 type API struct {
-	Service Service
-	Log     *slog.Logger
+	Service  Service
+	Log      *slog.Logger
+	AdminUID uint32
 }
 
+// Handler is the administrator API. Production exposes it only on a root-only
+// Unix socket and also verifies that the connecting peer is AdminUID.
 func (a API) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, r *http.Request) {
@@ -74,15 +82,28 @@ func (a API) Handler() http.Handler {
 	})
 	mux.HandleFunc("PUT /v1/credential-sources/{name}", a.putCredentialSource)
 	mux.HandleFunc("DELETE /v1/credential-sources/{name}", a.deleteCredentialSource)
+	mux.HandleFunc("GET /v1/profile-grants", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, a.Service.ProfileGrants(r.Context()))
+	})
+	mux.HandleFunc("PUT /v1/profile-grants/{uid}/{profile}", a.putProfileGrant)
+	mux.HandleFunc("DELETE /v1/profile-grants/{uid}/{profile}", a.deleteProfileGrant)
 	mux.HandleFunc("GET /v1/containers", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, a.Service.Containers(r.Context()))
 	})
 	mux.HandleFunc("POST /v1/containers", a.addContainer)
 	mux.HandleFunc("PATCH /v1/containers/{name}", a.patchContainer)
 	mux.HandleFunc("DELETE /v1/containers/{name}", a.deleteContainer)
-	mux.HandleFunc("POST /v1/host-sessions", a.addHostSession)
-	mux.HandleFunc("DELETE /v1/host-sessions/{name}", a.deleteHostSession)
-	return a.logRequests(mux)
+	return a.logRequests(a.requireAdmin(mux))
+}
+
+// UserHandler exposes only the operations needed by `agentbox host`. The
+// caller's UID always comes from the Unix connection, never from request data.
+func (a API) UserHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/user/profiles", a.getUserProfiles)
+	mux.HandleFunc("POST /v1/user/host-sessions", a.addHostSession)
+	mux.HandleFunc("DELETE /v1/user/host-sessions/{name}", a.deleteHostSession)
+	return a.logRequests(a.requirePeer(mux))
 }
 
 func (a API) putProfile(w http.ResponseWriter, r *http.Request) {
@@ -201,6 +222,31 @@ func (a API) deleteCredentialSource(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (a API) putProfileGrant(w http.ResponseWriter, r *http.Request) {
+	uid, ok := parseUID(w, r.PathValue("uid"))
+	if !ok {
+		return
+	}
+	grant := domain.ProfileGrant{UID: uid, Profile: r.PathValue("profile")}
+	if err := a.Service.PutProfileGrant(r.Context(), grant); err != nil {
+		writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a API) deleteProfileGrant(w http.ResponseWriter, r *http.Request) {
+	uid, ok := parseUID(w, r.PathValue("uid"))
+	if !ok {
+		return
+	}
+	if err := a.Service.DeleteProfileGrant(r.Context(), uid, r.PathValue("profile")); err != nil {
+		writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (a API) addContainer(w http.ResponseWriter, r *http.Request) {
 	var container domain.Container
 	if !decodeJSON(w, r, &container) {
@@ -241,11 +287,14 @@ func (a API) deleteContainer(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a API) addHostSession(w http.ResponseWriter, r *http.Request) {
-	var session domain.Container
-	if !decodeJSON(w, r, &session) {
+	var request struct {
+		Profile string `json:"profile"`
+	}
+	if !decodeJSON(w, r, &request) {
 		return
 	}
-	created, err := a.Service.AddHostSession(r.Context(), session)
+	peer, _ := PeerFromContext(r.Context())
+	created, err := a.Service.AddHostSession(r.Context(), peer.UID, request.Profile)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -254,21 +303,48 @@ func (a API) addHostSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a API) deleteHostSession(w http.ResponseWriter, r *http.Request) {
-	if err := a.Service.DeleteHostSession(r.Context(), r.PathValue("name")); err != nil {
+	peer, _ := PeerFromContext(r.Context())
+	if err := a.Service.DeleteHostSession(r.Context(), peer.UID, r.PathValue("name")); err != nil {
 		writeError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (a API) getUserProfiles(w http.ResponseWriter, r *http.Request) {
+	peer, _ := PeerFromContext(r.Context())
+	writeJSON(w, http.StatusOK, a.Service.UserProfiles(r.Context(), peer.UID))
+}
+
 func (a API) logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
-		peer, _ := r.Context().Value(peerKey{}).(Peer)
+		peer, _ := PeerFromContext(r.Context())
 		next.ServeHTTP(w, r)
 		a.logger().Info("control request", "method", r.Method, "path", r.URL.Path,
 			"peer_uid", peer.UID, "peer_gid", peer.GID, "peer_pid", peer.PID,
 			"duration_ms", time.Since(started).Milliseconds())
+	})
+}
+
+func (a API) requireAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		peer, ok := PeerFromContext(r.Context())
+		if !ok || peer.UID != a.AdminUID {
+			writeErrorStatus(w, http.StatusForbidden, "administrator access required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (a API) requirePeer(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := PeerFromContext(r.Context()); !ok {
+			writeErrorStatus(w, http.StatusForbidden, "authenticated local user required")
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -309,7 +385,19 @@ func writeError(w http.ResponseWriter, err error) {
 	if errors.Is(err, app.ErrConflict) {
 		status = http.StatusConflict
 	}
+	if errors.Is(err, app.ErrForbidden) {
+		status = http.StatusForbidden
+	}
 	writeErrorStatus(w, status, err.Error())
+}
+
+func parseUID(w http.ResponseWriter, value string) (uint32, bool) {
+	uid, err := strconv.ParseUint(value, 10, 32)
+	if err != nil {
+		writeErrorStatus(w, http.StatusBadRequest, "invalid uid")
+		return 0, false
+	}
+	return uint32(uid), true
 }
 
 func writeErrorStatus(w http.ResponseWriter, status int, message string) {
@@ -322,12 +410,19 @@ type Peer struct {
 }
 type peerKey struct{}
 
+func PeerFromContext(ctx context.Context) (Peer, bool) {
+	peer, ok := ctx.Value(peerKey{}).(Peer)
+	return peer, ok
+}
+
 type Server struct {
-	Socket   string
-	Handler  http.Handler
-	Log      *slog.Logger
-	server   *http.Server
-	listener net.Listener
+	Socket     string
+	SocketMode os.FileMode
+	SocketGID  *int
+	Handler    http.Handler
+	Log        *slog.Logger
+	server     *http.Server
+	listener   net.Listener
 }
 
 func (s *Server) Start() error {
@@ -351,7 +446,17 @@ func (s *Server) Start() error {
 	if err != nil {
 		return err
 	}
-	if err := os.Chmod(s.Socket, 0o660); err != nil {
+	mode := s.SocketMode
+	if mode == 0 {
+		mode = 0o660
+	}
+	if s.SocketGID != nil {
+		if err := os.Chown(s.Socket, -1, *s.SocketGID); err != nil {
+			ln.Close()
+			return err
+		}
+	}
+	if err := os.Chmod(s.Socket, mode); err != nil {
 		ln.Close()
 		return err
 	}
@@ -470,6 +575,19 @@ func (c *Client) PutCredentialSource(ctx context.Context, source domain.Credenti
 func (c *Client) DeleteCredentialSource(ctx context.Context, name string) error {
 	return c.json(ctx, http.MethodDelete, "/v1/credential-sources/"+name, nil, nil)
 }
+func (c *Client) ProfileGrants(ctx context.Context) ([]domain.ProfileGrant, error) {
+	var out []domain.ProfileGrant
+	err := c.json(ctx, http.MethodGet, "/v1/profile-grants", nil, &out)
+	return out, err
+}
+func (c *Client) PutProfileGrant(ctx context.Context, uid uint32, profile string) error {
+	path := fmt.Sprintf("/v1/profile-grants/%d/%s", uid, profile)
+	return c.json(ctx, http.MethodPut, path, nil, nil)
+}
+func (c *Client) DeleteProfileGrant(ctx context.Context, uid uint32, profile string) error {
+	path := fmt.Sprintf("/v1/profile-grants/%d/%s", uid, profile)
+	return c.json(ctx, http.MethodDelete, path, nil, nil)
+}
 func (c *Client) Containers(ctx context.Context) ([]domain.Container, error) {
 	var out []domain.Container
 	err := c.json(ctx, http.MethodGet, "/v1/containers", nil, &out)
@@ -486,13 +604,18 @@ func (c *Client) SetContainerBlocked(ctx context.Context, name string, blocked b
 func (c *Client) DeleteContainer(ctx context.Context, name string) error {
 	return c.json(ctx, http.MethodDelete, "/v1/containers/"+name, nil, nil)
 }
-func (c *Client) AddHostSession(ctx context.Context, value domain.Container) (domain.Container, error) {
-	var created domain.Container
-	err := c.json(ctx, http.MethodPost, "/v1/host-sessions", value, &created)
+func (c *Client) UserProfiles(ctx context.Context) ([]domain.UserProfile, error) {
+	var out []domain.UserProfile
+	err := c.json(ctx, http.MethodGet, "/v1/user/profiles", nil, &out)
+	return out, err
+}
+func (c *Client) AddHostSession(ctx context.Context, profile string) (domain.HostSession, error) {
+	var created domain.HostSession
+	err := c.json(ctx, http.MethodPost, "/v1/user/host-sessions", map[string]string{"profile": profile}, &created)
 	return created, err
 }
 func (c *Client) DeleteHostSession(ctx context.Context, name string) error {
-	return c.json(ctx, http.MethodDelete, "/v1/host-sessions/"+name, nil, nil)
+	return c.json(ctx, http.MethodDelete, "/v1/user/host-sessions/"+name, nil, nil)
 }
 
 func (c *Client) json(ctx context.Context, method, path string, body, dst any) error {

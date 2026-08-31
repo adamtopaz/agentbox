@@ -27,7 +27,7 @@ import (
 )
 
 type Control interface {
-	AddHostSession(context.Context, domain.Container) (domain.Container, error)
+	AddHostSession(context.Context, string) (domain.HostSession, error)
 	DeleteHostSession(context.Context, string) error
 }
 
@@ -57,7 +57,7 @@ func (a Agent) DisplayName() string {
 }
 
 type Options struct {
-	Profile       domain.Profile
+	Profile       domain.UserProfile
 	Agent         Agent
 	AgentBin      string
 	AgentArgs     []string
@@ -87,7 +87,7 @@ func Run(ctx context.Context, control Control, options Options) (retErr error) {
 	if control == nil {
 		return errors.New("control client is required")
 	}
-	if err := domain.ValidateProfile(options.Profile); err != nil {
+	if err := domain.ValidateProfile(domain.Profile{Name: options.Profile.Name, Routes: []domain.Route{}, Credentials: map[string]string{}, Environment: options.Profile.Environment}); err != nil {
 		return err
 	}
 	if options.Agent == "" {
@@ -110,15 +110,11 @@ func Run(ctx context.Context, control Control, options Options) (retErr error) {
 		return errors.New("host-session socket directory is required")
 	}
 
-	name, err := randomSessionName()
+	created, err := control.AddHostSession(ctx, options.Profile.Name)
 	if err != nil {
 		return err
 	}
-	created, err := control.AddHostSession(ctx, domain.Container{Name: name, Profile: options.Profile.Name})
-	if err != nil {
-		return err
-	}
-	name = created.Name
+	name := created.Name
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
@@ -542,14 +538,6 @@ func cleanJSONC(data []byte) []byte {
 		out = append(out, current)
 	}
 	return out
-}
-
-func randomSessionName() (string, error) {
-	var random [6]byte
-	if _, err := rand.Read(random[:]); err != nil {
-		return "", fmt.Errorf("generate host session name: %w", err)
-	}
-	return fmt.Sprintf("host-%d-%d-%s", os.Getuid(), os.Getpid(), hex.EncodeToString(random[:])), nil
 }
 
 func randomToken() (string, error) {

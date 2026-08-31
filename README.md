@@ -13,8 +13,7 @@ keys, and container registrations change while the daemon is running.
 ## Architecture
 
 ```text
-operator
-  agentbox CLI ── HTTP/Unix socket ──> typed application service
+administrator (explicit sudo) ── root-only admin socket ──> typed application service
                                            ├── state.json (profiles/routes/containers/sources)
                                            ├── AES-256-GCM key envelopes
                                            ├── expiring credential broker
@@ -23,7 +22,8 @@ operator
 container ── Incus proxy device ──> per-container Unix socket
                                       └── Go httputil.ReverseProxy ──> upstream
 
-host coding agent ── authenticated loopback bridge ──> ephemeral Unix socket ──> upstream
+regular user ── group-protected user socket ──> UID-authorized host session
+host coding agent ── authenticated loopback bridge ──> UID-protected Unix socket ──> upstream
 ```
 
 HTTP is only the current adapter for the control socket. Validation,
@@ -32,10 +32,11 @@ transport-independent application service. Provider integrations are ordinary
 compositions of the same generic profile, route, key-reference, and credential
 binding model.
 
-The per-container socket is its identity. A container has no bearer token with
-which to claim another identity. Each container names exactly one reusable
-profile, and its listener sees only the routes and credential bindings in that
-profile.
+Container lifecycle and container sockets are administrator-only. Each
+container names exactly one reusable profile, and its listener sees only the
+routes and credential bindings in that profile. Host-session listeners are
+separate and verify the connecting Unix UID, so another `agentbox` group member
+cannot claim the session by discovering its socket name.
 
 ## Requirements
 
@@ -57,24 +58,38 @@ on first launch.
 
 ```sh
 make setup
-# Log out and back in after setup activates group membership, then:
-agentbox image build
+# Log out and back in after setup activates host-user group membership, then:
+sudo agentbox image build
 ```
 
 `make setup` builds both binaries as the current user, then runs the privileged
 `agentbox setup` installation step through `sudo`. The installer installs
 `agentbox` and `agentboxd`, creates the unprivileged
 `agentboxd` account, generates one encrypted systemd credential for the master
-key, and installs the only systemd unit in the project. It also adds
-`$SUDO_USER` to `agentbox` and `incus-admin` when those groups exist. Log out
-and back in after the first setup.
+key, and installs the only systemd unit in the project. It adds `$SUDO_USER` to
+the `agentbox` host-access group; it does not grant Incus administration.
+Administrative Agentbox and Incus operations use explicit `sudo`, keeping that
+authority out of coding-agent processes. Log out and back in after setup.
 
-The image build does not require root. It gives the embedded Incus/cloud-init
-configuration to a disposable `agentbox-build` instance, waits for provisioning,
-verifies every pinned tool and proxy configuration, removes instance-specific
-state, disables cloud-init in the baked result, and publishes it as
-`agentbox-base`. Incus performs the privileged work behind its daemon boundary.
-Rebuilding the same alias uses `incus publish --reuse`.
+Upgrading from state version 3 preserves profiles, routes, credentials, and
+containers but creates no implicit user grants. Because restarting `agentboxd`
+revokes all in-memory host sessions, finish any active `agentbox host` work
+before installing the new binaries, then grant the intended profiles with
+`sudo agentbox user grant USER PROFILE`.
+
+Older Agentbox installers added the initial operator to `incus-admin`. The new
+installer does not remove existing group memberships. On an upgraded host,
+remove users from `incus-admin` separately if they should have host-only access,
+then have them log out and back in. Keep Incus privilege only for accounts that
+are intentionally allowed to administer Incus outside Agentbox as well.
+
+Image building is an administrator operation invoked with explicit elevation.
+It gives the embedded Incus/cloud-init configuration to a disposable
+`agentbox-build` instance, waits for provisioning, verifies every pinned tool
+and proxy configuration, removes instance-specific state, disables cloud-init
+in the baked result, and publishes it as `agentbox-base`. Incus performs the
+container work behind its daemon boundary. Rebuilding the same alias uses
+`incus publish --reuse`.
 
 ## Configure and use
 
@@ -83,7 +98,7 @@ public client settings, encrypted-key references, and renewable credential
 bindings to that profile atomically:
 
 ```sh
-agentbox profile create production
+sudo agentbox profile create production
 ```
 
 GitHub support is built from ordinary routes and a renewable credential. Give
@@ -93,19 +108,19 @@ The Client ID, installation ID, repository selection, and permission subset
 are non-secret configuration; only the PEM is stored as an encrypted key.
 
 ```sh
-agentbox key set github-app-private-key < /path/to/app.private-key.pem
+sudo agentbox key set github-app-private-key < /path/to/app.private-key.pem
 
-agentbox credential source github-app github-main \
+sudo agentbox credential source github-app github-main \
   --client-id Iv1.example \
   --installation-id 12345678 \
   --private-key github-app-private-key \
   --repository-ids 111111,222222 \
   --permissions contents=write,pull_requests=write,issues=write
 
-agentbox profile set github production --source github-main
+sudo agentbox profile set github production --source github-main
 
-agentbox container create --profile production work
-agentbox container shell work
+sudo agentbox container create --profile production work
+sudo agentbox container shell work
 ```
 
 Use `--repositories repo-a,repo-b` instead of numeric IDs if preferred; names
@@ -130,14 +145,14 @@ Cloudflare AI Gateway is also an optional profile. Key-store names are arbitrary
 the profile explicitly names the entry containing its API token:
 
 ```sh
-agentbox key set cloudflare-production
-agentbox profile set cloudflare production \
+sudo agentbox key set cloudflare-production
+sudo agentbox profile set cloudflare production \
   --account-id 0123456789abcdef0123456789abcdef \
   --gateway ff-prod \
   --private-key cloudflare-production
 
-agentbox container create --profile production work
-agentbox container shell work
+sudo agentbox container create --profile production work
+sudo agentbox container shell work
 ```
 
 AI inference uses Cloudflare AI Gateway's provider-native paths: `/anthropic`
@@ -175,24 +190,34 @@ assigned gateway, key, or GitHub source does not require recreating containers.
 Useful live operations:
 
 ```sh
-agentbox status
-agentbox profile list
-agentbox profile show production
-agentbox route list production
-agentbox key list
-agentbox credential source list
-agentbox container list
-agentbox container block work
-agentbox container block --hard work
-agentbox container unblock work
-agentbox container destroy work
+sudo agentbox status
+sudo agentbox profile list
+sudo agentbox profile show production
+sudo agentbox route list production
+sudo agentbox key list
+sudo agentbox credential source list
+sudo agentbox container list
+sudo agentbox container block work
+sudo agentbox container block --hard work
+sudo agentbox container unblock work
+sudo agentbox container destroy work
 ```
 
 ## Run coding agents directly on the host
 
-Claude Code, Codex, and Pi can use the same profile without an Incus container:
+An administrator must first grant a profile to the user's Unix account:
 
 ```sh
+sudo usermod -aG agentbox alice
+sudo agentbox user grant alice production
+```
+
+The user must start a new login session after first being added to the group.
+
+That user can then run Claude Code, Codex, or Pi without Incus access:
+
+```sh
+agentbox host profiles
 agentbox host claude --profile production
 agentbox host codex --profile production
 agentbox host pi --profile production
@@ -221,10 +246,11 @@ Git's normal helper. As in the container image, GitHub SSH remotes are not
 rewritten. Direct `curl`, MCP-server, connector/app, web-search, SSH, and other
 unrecognized network traffic is outside this routing mechanism.
 
-The host user must be able to access the Agentbox control/data sockets (normally
-through the `agentbox` group) and must have the selected agent and `git`
-installed. Use `--claude-bin`, `--codex-bin`, `--pi-bin`, or `--git-bin` when an
-executable is not on `PATH`.
+The host user must belong to `agentbox`, have an explicit grant for the selected
+profile, and have the selected agent and `git` installed. The user API returns
+only assigned profile names and public launch environment—not routes, key names,
+or credential-source bindings. Use `--claude-bin`, `--codex-bin`, `--pi-bin`,
+or `--git-bin` when an executable is not on `PATH`.
 
 ## Generic routes
 
@@ -245,8 +271,8 @@ available for integrations that do not yet have a convenience helper.
 ```
 
 ```sh
-agentbox key set example-token
-agentbox route put production route.json
+sudo agentbox key set example-token
+sudo agentbox route put production route.json
 ```
 
 Header values support durable `{secret:key-name}` references, renewable
@@ -284,12 +310,17 @@ needs no restart.
 Renewable leases exist only in daemon memory, are never returned by the control
 API, and are cleared on source/key changes and shutdown.
 
-Membership in group `agentbox` is a trusted secret-management role. A member
-cannot list plaintext through the API, but can set a route that sends a stored
-key to an upstream they control, which is equivalent access. Root on the
-running host can also reach daemon memory. Encryption at rest protects copied
-or offline storage; it is not a defense against a compromised running host,
-and full-disk encryption remains valuable.
+Membership in `agentbox` permits only assigned-profile host sessions. Routes,
+profiles, grants, keys, credential sources, image management, and containers use
+a separate root-authenticated API and explicit elevation. A root process can set
+a route that sends a stored key to an upstream it controls, which is equivalent
+to plaintext access; root can also reach daemon memory. Encryption at rest
+protects copied or offline storage, not a compromised running host.
+
+A profile granted to regular users may inject credential material only into
+HTTPS upstreams. Agentbox cannot prevent a trusted upstream from reflecting an
+injected credential in its response, so administrators must grant only profiles
+whose upstream behavior they trust.
 
 Container egress is intentionally not restricted. A compromised agent can use
 the routes assigned to its profile and spend against them, but it cannot recover
@@ -309,7 +340,7 @@ make                 # vet, tests, both binaries
 make race
 test/e2e.sh          # local daemon + real Unix sockets + local upstream
 # Full image validation provisions and publishes a disposable test alias:
-agentbox image build --alias agentbox-test
+sudo agentbox image build --alias agentbox-test
 ```
 
 The Go module currently has no third-party dependencies.

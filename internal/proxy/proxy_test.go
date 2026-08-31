@@ -16,6 +16,7 @@ import (
 
 	"agentbox/internal/domain"
 	"agentbox/internal/engine"
+	"agentbox/internal/peercred"
 	"agentbox/internal/profile"
 )
 
@@ -34,6 +35,27 @@ func (r resolver) Resolve(_ context.Context, _ string, ref domain.MaterialRefere
 }
 
 type roundTrip func(*http.Request) (*http.Response, error)
+
+func TestHostSessionRequiresOwningPeerUID(t *testing.T) {
+	called := false
+	handler := requireOwnerUID(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }), 1001)
+
+	request := httptest.NewRequest(http.MethodGet, "http://agentbox/", nil)
+	request = request.WithContext(context.WithValue(request.Context(), dataPeerKey{}, peercred.Credentials{UID: 1002}))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden || called {
+		t.Fatalf("cross-user request status=%d called=%v", response.Code, called)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "http://agentbox/", nil)
+	request = request.WithContext(context.WithValue(request.Context(), dataPeerKey{}, peercred.Credentials{UID: 1001}))
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !called {
+		t.Fatalf("owner request status=%d called=%v", response.Code, called)
+	}
+}
 
 func (f roundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 

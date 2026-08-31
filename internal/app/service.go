@@ -5,6 +5,8 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
@@ -20,9 +22,12 @@ import (
 )
 
 var (
-	ErrNotFound = errors.New("not found")
-	ErrConflict = errors.New("conflict")
+	ErrNotFound  = errors.New("not found")
+	ErrConflict  = errors.New("conflict")
+	ErrForbidden = errors.New("forbidden")
 )
+
+const maxHostSessionsPerUser = 16
 
 type ListenerReconciler interface {
 	Reconcile([]domain.Container) error
@@ -193,6 +198,57 @@ func (s *Service) Profiles(context.Context) []domain.Profile {
 	return domain.CloneState(s.state).Profiles
 }
 
+// UserProfiles returns only the public launch configuration for profiles
+// explicitly granted to uid. It deliberately excludes routes, key references,
+// and credential-source bindings.
+func (s *Service) UserProfiles(_ context.Context, uid uint32) []domain.UserProfile {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	allowed := make(map[string]bool)
+	for _, grant := range s.state.ProfileGrants {
+		if grant.UID == uid {
+			allowed[grant.Profile] = true
+		}
+	}
+	var out []domain.UserProfile
+	for _, profile := range s.state.Profiles {
+		if allowed[profile.Name] {
+			out = append(out, domain.UserProfile{Name: profile.Name, Environment: cloneStrings(profile.Environment)})
+		}
+	}
+	return out
+}
+
+func (s *Service) ProfileGrants(context.Context) []domain.ProfileGrant {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]domain.ProfileGrant(nil), s.state.ProfileGrants...)
+}
+
+func (s *Service) PutProfileGrant(_ context.Context, grant domain.ProfileGrant) error {
+	return s.change(func(next *domain.State) error {
+		for _, existing := range next.ProfileGrants {
+			if existing == grant {
+				return nil
+			}
+		}
+		next.ProfileGrants = append(next.ProfileGrants, grant)
+		return nil
+	})
+}
+
+func (s *Service) DeleteProfileGrant(_ context.Context, uid uint32, profile string) error {
+	return s.change(func(next *domain.State) error {
+		for i, grant := range next.ProfileGrants {
+			if grant.UID == uid && grant.Profile == profile {
+				next.ProfileGrants = append(next.ProfileGrants[:i], next.ProfileGrants[i+1:]...)
+				return nil
+			}
+		}
+		return fmt.Errorf("%w: profile %q is not granted to uid %d", ErrNotFound, profile, uid)
+	})
+}
+
 func (s *Service) PutProfile(_ context.Context, profile domain.Profile) error {
 	return s.change(func(next *domain.State) error {
 		for i := range next.Profiles {
@@ -216,6 +272,11 @@ func (s *Service) DeleteProfile(_ context.Context, name string) error {
 		for _, container := range next.Containers {
 			if container.Profile == name {
 				return fmt.Errorf("%w: profile %q is used by container %q", ErrConflict, name, container.Name)
+			}
+		}
+		for _, grant := range next.ProfileGrants {
+			if grant.Profile == name {
+				return fmt.Errorf("%w: profile %q is granted to uid %d", ErrConflict, name, grant.UID)
 			}
 		}
 		for i, profile := range next.Profiles {
@@ -309,6 +370,8 @@ func (s *Service) Containers(context.Context) []domain.Container {
 }
 
 func (s *Service) AddContainer(_ context.Context, container domain.Container) (domain.Container, error) {
+	container.Host = false
+	container.OwnerUID = 0
 	if container.CreatedAt.IsZero() {
 		container.CreatedAt = time.Now().UTC()
 	}
@@ -329,14 +392,28 @@ func (s *Service) AddContainer(_ context.Context, container domain.Container) (d
 	return container, err
 }
 
-// AddHostSession registers an in-memory data-plane identity for a process on
-// the main host. Unlike containers, host sessions are deliberately not
-// persisted: a daemon restart revokes them and removes their listeners.
-func (s *Service) AddHostSession(_ context.Context, host domain.Container) (domain.Container, error) {
-	if host.CreatedAt.IsZero() {
-		host.CreatedAt = time.Now().UTC()
+// AddHostSession registers an in-memory data-plane identity owned by uid. The
+// name and owner are server-derived, and the selected profile must be granted
+// to that uid. Host sessions are deliberately not persisted.
+func (s *Service) AddHostSession(_ context.Context, uid uint32, profile string) (domain.HostSession, error) {
+	name, err := randomHostName(uid)
+	if err != nil {
+		return domain.HostSession{}, err
 	}
-	err := s.changeHosts(func(next *[]domain.Container) error {
+	host := domain.Container{Name: name, Profile: profile, CreatedAt: time.Now().UTC(), Host: true, OwnerUID: uid}
+	err = s.changeHosts(func(next *[]domain.Container) error {
+		if !profileGranted(s.state, uid, profile) {
+			return fmt.Errorf("%w: profile %q is not granted to uid %d", ErrForbidden, profile, uid)
+		}
+		owned := 0
+		for _, existing := range *next {
+			if existing.OwnerUID == uid {
+				owned++
+			}
+		}
+		if owned >= maxHostSessionsPerUser {
+			return fmt.Errorf("%w: uid %d already has %d host sessions", ErrConflict, uid, maxHostSessionsPerUser)
+		}
 		for _, existing := range s.state.Containers {
 			if existing.Name == host.Name {
 				return fmt.Errorf("%w: identity %q", ErrConflict, host.Name)
@@ -350,13 +427,13 @@ func (s *Service) AddHostSession(_ context.Context, host domain.Container) (doma
 		*next = append(*next, host)
 		return nil
 	})
-	return host, err
+	return domain.HostSession{Name: host.Name, Profile: host.Profile, CreatedAt: host.CreatedAt}, err
 }
 
-func (s *Service) DeleteHostSession(_ context.Context, name string) error {
+func (s *Service) DeleteHostSession(_ context.Context, uid uint32, name string) error {
 	return s.changeHosts(func(next *[]domain.Container) error {
 		for i, host := range *next {
-			if host.Name == name {
+			if host.Name == name && host.OwnerUID == uid {
 				*next = append((*next)[:i], (*next)[i+1:]...)
 				return nil
 			}
@@ -398,8 +475,9 @@ func (s *Service) change(mutator func(*domain.State) error) error {
 		return err
 	}
 	next = domain.NormalizeState(next)
+	nextHosts := authorizedHosts(s.hosts, next)
 	previousRuntime := s.runtimeState(previous)
-	nextRuntime := s.runtimeState(next)
+	nextRuntime := runtimeState(next, nextHosts)
 	compiled, err := engine.Compile(nextRuntime)
 	if err != nil {
 		return err
@@ -428,6 +506,7 @@ func (s *Service) change(mutator func(*domain.State) error) error {
 		return err
 	}
 	s.state = next
+	s.hosts = nextHosts
 	s.snapshot.Store(compiled)
 	return nil
 }
@@ -471,7 +550,46 @@ func (s *Service) changeHosts(mutator func(*[]domain.Container) error) error {
 }
 
 func (s *Service) runtimeState(persisted domain.State) domain.State {
+	return runtimeState(persisted, s.hosts)
+}
+
+func runtimeState(persisted domain.State, hosts []domain.Container) domain.State {
 	runtime := domain.CloneState(persisted)
-	runtime.Containers = append(runtime.Containers, s.hosts...)
+	runtime.Containers = append(runtime.Containers, hosts...)
 	return domain.NormalizeState(runtime)
+}
+
+func profileGranted(state domain.State, uid uint32, profile string) bool {
+	for _, grant := range state.ProfileGrants {
+		if grant.UID == uid && grant.Profile == profile {
+			return true
+		}
+	}
+	return false
+}
+
+func authorizedHosts(hosts []domain.Container, state domain.State) []domain.Container {
+	out := make([]domain.Container, 0, len(hosts))
+	for _, host := range hosts {
+		if profileGranted(state, host.OwnerUID, host.Profile) {
+			out = append(out, host)
+		}
+	}
+	return out
+}
+
+func cloneStrings(values map[string]string) map[string]string {
+	out := make(map[string]string, len(values))
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
+}
+
+func randomHostName(uid uint32) (string, error) {
+	var random [12]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", fmt.Errorf("generate host session name: %w", err)
+	}
+	return fmt.Sprintf("host-%d-%s", uid, hex.EncodeToString(random[:])), nil
 }

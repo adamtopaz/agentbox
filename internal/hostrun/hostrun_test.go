@@ -221,7 +221,7 @@ func TestRunRejectsMissingOpenAIBaseAndCleansSession(t *testing.T) {
 	writeExecutable(t, filepath.Join(original, "git-remote-http"), "#!/bin/sh\nexit 0\n")
 	writeExecutable(t, fakeGit, "#!/bin/sh\nprintf '%s\\n' "+shellQuote(original)+"\n")
 	err := Run(context.Background(), control, Options{
-		Profile: domain.Profile{Name: "prod", Routes: []domain.Route{}, Credentials: map[string]string{}, Environment: map[string]string{}},
+		Profile: domain.UserProfile{Name: "prod", Environment: map[string]string{}},
 		Agent:   AgentCodex, AgentBin: fakeCodex, GitBin: fakeGit, SocketDir: control.dir,
 	})
 	if err == nil || !strings.Contains(err.Error(), "OPENAI_BASE_URL") {
@@ -248,8 +248,8 @@ func TestRunForwardsCodexRequestAndCleansSession(t *testing.T) {
 	writeExecutable(t, filepath.Join(original, "git-remote-http"), "#!/bin/sh\nexit 0\n")
 	fakeGit := filepath.Join(root, "git")
 	writeExecutable(t, fakeGit, "#!/bin/sh\nprintf '%s\\n' "+shellQuote(original)+"\n")
-	profile := domain.Profile{
-		Name: "prod", Routes: []domain.Route{}, Credentials: map[string]string{},
+	profile := domain.UserProfile{
+		Name:        "prod",
 		Environment: map[string]string{"OPENAI_BASE_URL": "http://127.0.0.1:8787/cloudflare/prod/openai"},
 	}
 	err := Run(context.Background(), control, Options{
@@ -284,8 +284,8 @@ func TestRunForwardsClaudeRequestAndCleansSession(t *testing.T) {
 	root := t.TempDir()
 	fakeClaude := filepath.Join(root, "claude")
 	writeExecutable(t, fakeClaude, "#!/bin/sh\nset -eu\ntest \"${ANTHROPIC_API_KEY+x}\" != x\ntest \"${CLAUDE_CODE_OAUTH_TOKEN+x}\" != x\ntest \"$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\" = 1\ncurl -fsS -H \"Authorization: Bearer $ANTHROPIC_AUTH_TOKEN\" \"$ANTHROPIC_BASE_URL/v1/messages\" >/dev/null\n")
-	profile := domain.Profile{
-		Name: "prod", Routes: []domain.Route{}, Credentials: map[string]string{},
+	profile := domain.UserProfile{
+		Name:        "prod",
 		Environment: map[string]string{"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787/cloudflare/prod/anthropic"},
 	}
 	err := Run(context.Background(), control, Options{
@@ -321,8 +321,8 @@ func TestRunForwardsPiRequestAndCleansSession(t *testing.T) {
 	root := t.TempDir()
 	fakePi := filepath.Join(root, "pi")
 	writeExecutable(t, fakePi, "#!/bin/sh\nset -eu\ntest \"$PI_OFFLINE\" = 1\ntest -f \"$PI_CODING_AGENT_DIR/models.json\"\ntest -f \"$PI_CODING_AGENT_DIR/auth.json\"\ncurl -fsS -H \"Authorization: Bearer $OPENAI_API_KEY\" \"$OPENAI_BASE_URL/responses\" >/dev/null\n")
-	profile := domain.Profile{
-		Name: "prod", Routes: []domain.Route{}, Credentials: map[string]string{},
+	profile := domain.UserProfile{
+		Name: "prod",
 		Environment: map[string]string{
 			"OPENAI_BASE_URL":    "http://127.0.0.1:8787/cloudflare/prod/openai",
 			"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787/cloudflare/prod/anthropic",
@@ -358,16 +358,16 @@ type controlFake struct {
 	handler        http.Handler
 }
 
-func (c *controlFake) AddHostSession(_ context.Context, value domain.Container) (domain.Container, error) {
+func (c *controlFake) AddHostSession(_ context.Context, profile string) (domain.HostSession, error) {
+	value := domain.HostSession{Name: "host-test", Profile: profile, CreatedAt: time.Now().UTC()}
 	c.added = value.Name
-	value.CreatedAt = value.CreatedAt.UTC()
 	handler := c.handler
 	if handler == nil {
 		handler = http.NotFoundHandler()
 	}
 	listener, err := newUnixHTTPServer(filepath.Join(c.dir, value.Name+".sock"), handler)
 	if err != nil {
-		return domain.Container{}, err
+		return domain.HostSession{}, err
 	}
 	c.listener = listener
 	return value, nil

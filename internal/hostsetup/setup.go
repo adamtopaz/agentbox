@@ -1,7 +1,7 @@
 // Package hostsetup performs the small amount of privileged installation
-// agentbox requires: a service user/group, two binaries, one encrypted master
-// key, and one hardened systemd unit. Runtime configuration is managed through
-// the daemon API, not by rewriting unit files.
+// agentbox requires: a service user/user-access group, two binaries, one
+// encrypted master key, and one hardened systemd unit. Runtime configuration
+// is managed through split administrator and user APIs.
 package hostsetup
 
 import (
@@ -53,7 +53,7 @@ func Run(options Options) error {
 		return fmt.Errorf("unit: %w", err)
 	}
 	if options.Prefix == "" {
-		r.addAdminGroups()
+		r.addUserGroup()
 		if !options.NoStart {
 			for _, command := range [][]string{{"systemctl", "daemon-reload"}, {"systemctl", "enable", "agentboxd.service"}, {"systemctl", "restart", "agentboxd.service"}} {
 				if err := r.command(command[0], command[1:]...); err != nil {
@@ -66,7 +66,7 @@ func Run(options Options) error {
 	if options.NoStart {
 		fmt.Fprintln(r.out, "next: systemctl daemon-reload && systemctl enable --now agentboxd")
 	} else {
-		fmt.Fprintln(r.out, "next: agentbox profile create <name>")
+		fmt.Fprintln(r.out, "next: sudo agentbox profile create <name>")
 	}
 	return nil
 }
@@ -241,13 +241,13 @@ NotifyAccess=main
 User=agentboxd
 Group=agentbox
 UMask=0007
-ExecStart=` + paths.InstalledDaemon + `
+ExecStart=` + paths.InstalledDaemon + ` --user-group=agentbox
 Restart=on-failure
 RestartSec=2s
 TimeoutStartSec=30s
 TimeoutStopSec=15s
 RuntimeDirectory=agentbox
-RuntimeDirectoryMode=0750
+RuntimeDirectoryMode=0711
 StateDirectory=agentbox
 StateDirectoryMode=0700
 LoadCredentialEncrypted=` + paths.MasterKeyName + `:` + paths.MasterCredential + `
@@ -289,7 +289,7 @@ WantedBy=multi-user.target
 	return nil
 }
 
-func (r *runner) addAdminGroups() {
+func (r *runner) addUserGroup() {
 	admin := r.options.AdminUser
 	if admin == "" {
 		admin = os.Getenv("SUDO_USER")
@@ -297,15 +297,10 @@ func (r *runner) addAdminGroups() {
 	if admin == "" || admin == "root" {
 		return
 	}
-	for _, group := range []string{"agentbox", "incus-admin"} {
-		if _, err := user.LookupGroup(group); err != nil {
-			continue
-		}
-		if err := r.command("usermod", "-aG", group, admin); err != nil {
-			fmt.Fprintf(r.out, "warning: add %s to %s: %v\n", admin, group, err)
-		}
+	if err := r.command("usermod", "-aG", "agentbox", admin); err != nil {
+		fmt.Fprintf(r.out, "warning: add %s to agentbox: %v\n", admin, err)
 	}
-	fmt.Fprintf(r.out, "group membership changed for %s; log out and back in\n", admin)
+	fmt.Fprintf(r.out, "agentbox user membership changed for %s; log out and back in\n", admin)
 }
 
 func (r *runner) command(name string, args ...string) error {

@@ -1,6 +1,6 @@
-// Package proxy is agentbox's data plane. It serves the same HTTP handler on
-// one host-side Unix socket per container; the socket on which a request
-// arrives is the container's unforgeable identity.
+// Package proxy is agentbox's data plane. It serves one host-side Unix socket
+// per identity. Container sockets live in an administrator-only directory;
+// host-session sockets additionally enforce the owning Unix UID.
 package proxy
 
 import (
@@ -16,10 +16,12 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"agentbox/internal/domain"
 	"agentbox/internal/engine"
+	"agentbox/internal/peercred"
 )
 
 type SnapshotSource interface{ Snapshot() *engine.Snapshot }
@@ -233,6 +235,8 @@ func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 // ListenerManager reconciles the set of per-container Unix HTTP servers.
 type ListenerManager struct {
 	Dir            string
+	HostDir        string
+	HostGID        *int
 	Proxy          *Server
 	Log            *slog.Logger
 	MaxConnections int
@@ -251,11 +255,14 @@ func (m *ListenerManager) Reconcile(containers []domain.Container) error {
 	if m.active == nil {
 		m.active = map[string]*listener{}
 	}
-	if err := os.MkdirAll(m.Dir, 0o750); err != nil {
+	if err := prepareSocketDir(m.Dir, 0o700, nil); err != nil {
 		return err
 	}
-	if err := os.Chmod(m.Dir, 0o750); err != nil {
-		return err
+	hostDir := m.hostDir()
+	if hostDir != m.Dir {
+		if err := prepareSocketDir(hostDir, 0o710, m.HostGID); err != nil {
+			return err
+		}
 	}
 	want := map[string]bool{}
 	for _, c := range containers {
@@ -263,7 +270,7 @@ func (m *ListenerManager) Reconcile(containers []domain.Container) error {
 		if _, ok := m.active[c.Name]; ok {
 			continue
 		}
-		if err := m.start(c.Name); err != nil {
+		if err := m.start(c); err != nil {
 			return err
 		}
 	}
@@ -278,8 +285,9 @@ func (m *ListenerManager) Reconcile(containers []domain.Container) error {
 	return nil
 }
 
-func (m *ListenerManager) start(name string) error {
-	path := m.Dir + "/" + name + ".sock"
+func (m *ListenerManager) start(identity domain.Container) error {
+	name := identity.Name
+	path := m.path(identity)
 	if info, err := os.Lstat(path); err == nil {
 		if info.Mode()&os.ModeSocket == 0 {
 			return fmt.Errorf("refusing to replace non-socket path %s", path)
@@ -294,7 +302,17 @@ func (m *ListenerManager) start(name string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.Chmod(path, 0o660); err != nil {
+	mode := os.FileMode(0o600)
+	if identity.Host {
+		mode = 0o660
+		if m.HostGID != nil {
+			if err := os.Chown(path, -1, *m.HostGID); err != nil {
+				ln.Close()
+				return err
+			}
+		}
+	}
+	if err := os.Chmod(path, mode); err != nil {
 		ln.Close()
 		return err
 	}
@@ -309,11 +327,21 @@ func (m *ListenerManager) start(name string) error {
 	if maxConnections > 0 {
 		ln = newLimitListener(ln, maxConnections)
 	}
+	handler := m.Proxy.Handler(name)
+	if identity.Host {
+		handler = requireOwnerUID(handler, identity.OwnerUID)
+	}
 	srv := &http.Server{
-		Handler:           m.Proxy.Handler(name),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    64 << 10,
+		ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
+			if peer, err := peercred.FromConn(conn); err == nil {
+				return context.WithValue(ctx, dataPeerKey{}, peer)
+			}
+			return ctx
+		},
 	}
 	m.active[name] = &listener{server: srv, socket: ln}
 	go func() {
@@ -339,11 +367,51 @@ func (m *ListenerManager) Close(ctx context.Context) error {
 }
 
 func (m *ListenerManager) SocketPath(name string) string { return m.Dir + "/" + name + ".sock" }
+func (m *ListenerManager) HostSocketPath(name string) string {
+	return m.hostDir() + "/" + name + ".sock"
+}
+func (m *ListenerManager) hostDir() string {
+	if m.HostDir != "" {
+		return m.HostDir
+	}
+	return m.Dir
+}
+func (m *ListenerManager) path(identity domain.Container) string {
+	if identity.Host {
+		return m.HostSocketPath(identity.Name)
+	}
+	return m.SocketPath(identity.Name)
+}
 func (m *ListenerManager) logger() *slog.Logger {
 	if m.Log != nil {
 		return m.Log
 	}
 	return slog.Default()
+}
+
+type dataPeerKey struct{}
+
+func requireOwnerUID(next http.Handler, owner uint32) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		peer, ok := r.Context().Value(dataPeerKey{}).(peercred.Credentials)
+		if !ok || (peer.UID != owner && peer.UID != 0) {
+			http.Error(w, "host session access denied", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func prepareSocketDir(path string, mode os.FileMode, gid *int) error {
+	if err := os.MkdirAll(path, mode); err != nil {
+		return err
+	}
+	if gid != nil {
+		if err := os.Chown(path, -1, *gid); err != nil {
+			return err
+		}
+	}
+	return os.Chmod(path, mode)
 }
 
 type limitListener struct {
@@ -380,6 +448,14 @@ type limitConn struct {
 	net.Conn
 	release func()
 	once    sync.Once
+}
+
+func (c *limitConn) SyscallConn() (syscall.RawConn, error) {
+	connection, ok := c.Conn.(syscall.Conn)
+	if !ok {
+		return nil, fmt.Errorf("connection has no syscall handle")
+	}
+	return connection.SyscallConn()
 }
 
 func (c *limitConn) Close() error {

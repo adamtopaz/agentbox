@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	StateVersion = 3
+	StateVersion = 4
 )
 
 var (
@@ -66,6 +66,31 @@ type Container struct {
 	Profile   string    `json:"profile"`
 	Blocked   bool      `json:"blocked,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
+
+	// Host and OwnerUID describe an ephemeral host-session identity. They are
+	// runtime-only and are never accepted from or written to persistent state.
+	Host     bool   `json:"-"`
+	OwnerUID uint32 `json:"-"`
+}
+
+// ProfileGrant allows one local Unix user to start host sessions with a
+// profile. Grants do not authorize profile inspection or mutation.
+type ProfileGrant struct {
+	UID     uint32 `json:"uid"`
+	Profile string `json:"profile"`
+}
+
+// UserProfile is the deliberately limited view returned to regular users.
+// Routes, key references, and credential-source bindings remain admin-only.
+type UserProfile struct {
+	Name        string            `json:"name"`
+	Environment map[string]string `json:"environment"`
+}
+
+type HostSession struct {
+	Name      string    `json:"name"`
+	Profile   string    `json:"profile"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // CredentialSource is provider-neutral configuration for an object capable
@@ -91,6 +116,7 @@ type State struct {
 	Profiles          []Profile          `json:"profiles"`
 	Containers        []Container        `json:"containers"`
 	CredentialSources []CredentialSource `json:"credential_sources"`
+	ProfileGrants     []ProfileGrant     `json:"profile_grants"`
 }
 
 type KeyInfo struct {
@@ -100,7 +126,7 @@ type KeyInfo struct {
 
 func NewState() State {
 	return State{Version: StateVersion, Profiles: []Profile{}, Containers: []Container{},
-		CredentialSources: []CredentialSource{}}
+		CredentialSources: []CredentialSource{}, ProfileGrants: []ProfileGrant{}}
 }
 
 func ValidName(s string) bool        { return nameRE.MatchString(s) }
@@ -148,6 +174,52 @@ func ValidateState(s State) error {
 			return fmt.Errorf("container %d: unknown profile %q", i, c.Profile)
 		}
 		containers[c.Name] = true
+	}
+	grants := map[string]bool{}
+	for i, grant := range s.ProfileGrants {
+		if !ValidProfileName(grant.Profile) {
+			return fmt.Errorf("profile grant %d: invalid profile %q", i, grant.Profile)
+		}
+		if !profiles[grant.Profile] {
+			return fmt.Errorf("profile grant %d: unknown profile %q", i, grant.Profile)
+		}
+		key := fmt.Sprintf("%d\x00%s", grant.UID, grant.Profile)
+		if grants[key] {
+			return fmt.Errorf("duplicate profile grant for uid %d and profile %q", grant.UID, grant.Profile)
+		}
+		grants[key] = true
+		for _, profile := range s.Profiles {
+			if profile.Name == grant.Profile {
+				if err := ValidateUserProfile(profile); err != nil {
+					return fmt.Errorf("profile grant %d: %w", i, err)
+				}
+				break
+			}
+		}
+	}
+	return nil
+}
+
+// ValidateUserProfile applies the stricter transport policy required when a
+// profile is usable by unprivileged host users. Loopback HTTP is not a trusted
+// credential transport on a multi-user machine.
+func ValidateUserProfile(profile Profile) error {
+	for _, route := range profile.Routes {
+		keys, err := ReferencedKeys([]Route{route})
+		if err != nil {
+			return err
+		}
+		credentials, err := ReferencedCredentials([]Route{route})
+		if err != nil {
+			return err
+		}
+		if len(keys) == 0 && len(credentials) == 0 {
+			continue
+		}
+		upstream, err := url.Parse(route.Upstream)
+		if err != nil || upstream.Scheme != "https" {
+			return fmt.Errorf("profile %q route %q injects credential material and must use HTTPS before it can be granted to users", profile.Name, route.Name)
+		}
 	}
 	return nil
 }
@@ -364,6 +436,12 @@ func NormalizeState(s State) State {
 	sort.Slice(s.Profiles, func(i, j int) bool { return s.Profiles[i].Name < s.Profiles[j].Name })
 	sort.Slice(s.Containers, func(i, j int) bool { return s.Containers[i].Name < s.Containers[j].Name })
 	sort.Slice(s.CredentialSources, func(i, j int) bool { return s.CredentialSources[i].Name < s.CredentialSources[j].Name })
+	sort.Slice(s.ProfileGrants, func(i, j int) bool {
+		if s.ProfileGrants[i].UID != s.ProfileGrants[j].UID {
+			return s.ProfileGrants[i].UID < s.ProfileGrants[j].UID
+		}
+		return s.ProfileGrants[i].Profile < s.ProfileGrants[j].Profile
+	})
 	return s
 }
 
@@ -372,6 +450,7 @@ func NormalizeState(s State) State {
 func CloneState(s State) State {
 	out := State{Version: s.Version}
 	out.Containers = append([]Container(nil), s.Containers...)
+	out.ProfileGrants = append([]ProfileGrant(nil), s.ProfileGrants...)
 	out.Profiles = make([]Profile, len(s.Profiles))
 	for i, profile := range s.Profiles {
 		out.Profiles[i] = profile
@@ -397,6 +476,9 @@ func CloneState(s State) State {
 	}
 	if out.CredentialSources == nil {
 		out.CredentialSources = []CredentialSource{}
+	}
+	if out.ProfileGrants == nil {
+		out.ProfileGrants = []ProfileGrant{}
 	}
 	return out
 }

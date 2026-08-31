@@ -51,6 +51,8 @@ func decodeState(data []byte) (domain.State, error) {
 			return domain.State{}, err
 		}
 		return current, nil
+	case 3:
+		return migrateV3(data)
 	case 2:
 		return migrateV2(data)
 	case 1:
@@ -58,6 +60,26 @@ func decodeState(data []byte) (domain.State, error) {
 	default:
 		return domain.State{}, fmt.Errorf("unsupported state version %d (want %d)", version.Version, domain.StateVersion)
 	}
+}
+
+// Version 4 adds explicit Unix-UID-to-profile grants for host sessions.
+// Existing profiles remain admin-managed but are not implicitly granted to any
+// user during migration; an administrator must make each intended assignment.
+func migrateV3(data []byte) (domain.State, error) {
+	type stateV3 struct {
+		Version           int                       `json:"version"`
+		Profiles          []domain.Profile          `json:"profiles"`
+		Containers        []domain.Container        `json:"containers"`
+		CredentialSources []domain.CredentialSource `json:"credential_sources"`
+	}
+	var old stateV3
+	if err := decodeStrict(data, &old); err != nil {
+		return domain.State{}, err
+	}
+	return domain.State{
+		Version: domain.StateVersion, Profiles: old.Profiles, Containers: old.Containers,
+		CredentialSources: old.CredentialSources, ProfileGrants: []domain.ProfileGrant{},
+	}, nil
 }
 
 // Version 1 briefly supported path, query, and JSON-body transformations.

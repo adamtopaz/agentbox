@@ -44,7 +44,8 @@ func TestPrefixInstallLayout(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"Type=notify", "NotifyAccess=main", "User=agentboxd", "RuntimeDirectoryMode=0750",
+		"Type=notify", "NotifyAccess=main", "User=agentboxd", "RuntimeDirectoryMode=0711",
+		"ExecStart=/usr/local/bin/agentboxd --user-group=agentbox",
 		"LoadCredentialEncrypted=master-key:", "ProtectProc=invisible", "ProcSubset=pid",
 		"SystemCallArchitectures=native", "LimitCORE=0", "LimitNOFILE=8192", "TasksMax=512",
 		"CapabilityBoundingSet=",

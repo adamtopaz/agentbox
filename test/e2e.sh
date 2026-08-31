@@ -87,16 +87,23 @@ dd if=/dev/urandom of="$WORK/master.key" bs=32 count=1 status=none
 "$ROOT/bin/agentboxd" \
     --state "$WORK/state.json" \
     --secrets "$WORK/secrets" \
-    --control-socket "$WORK/control.sock" \
+    --control-socket "$WORK/admin.sock" \
+    --user-control-socket "$WORK/user.sock" \
     --container-sockets "$WORK/containers" \
+    --host-sockets "$WORK/users" \
+    --admin-uid "$(id -u)" \
     --master-key-file "$WORK/master.key" \
     --log-format json 2>"$WORK/daemon.log" &
 DAEMON_PID=$!
-wait_for "$WORK/control.sock"
+wait_for "$WORK/admin.sock"
+wait_for "$WORK/user.sock"
 
-abx() { "$ROOT/bin/agentbox" --socket "$WORK/control.sock" "$@"; }
+abx() { "$ROOT/bin/agentbox" --admin-socket "$WORK/admin.sock" "$@"; }
 control() {
-    curl --silent --show-error --fail-with-body --unix-socket "$WORK/control.sock" "$@"
+    curl --silent --show-error --fail-with-body --unix-socket "$WORK/admin.sock" "$@"
+}
+user_control() {
+    curl --silent --show-error --fail-with-body --unix-socket "$WORK/user.sock" "$@"
 }
 proxy() {
     curl --silent --show-error --unix-socket "$WORK/containers/dev.sock" "$@"
@@ -129,6 +136,9 @@ cat > "$WORK/path-route.json" <<EOF
 }
 EOF
 abx route put test "$WORK/path-route.json"
+if control -X PUT "http://agentbox/v1/profile-grants/$(id -u)/test" >/dev/null 2>&1; then
+    fail "credential-bearing loopback profile was granted to a host user"
+fi
 control -H 'content-type: application/json' -d '{"name":"dev","profile":"test"}' \
     http://agentbox/v1/containers >/dev/null
 wait_for "$WORK/containers/dev.sock"
@@ -201,21 +211,38 @@ d = json.loads(sys.argv[1])
 assert d["path"] == "/host/path", d
 PY
 
-# Host identities use the same data plane but are runtime-only.
-control -H 'content-type: application/json' \
-    -d '{"name":"host-e2e","profile":"test"}' \
-    http://agentbox/v1/host-sessions >/dev/null
-wait_for "$WORK/containers/host-e2e.sock"
-RESPONSE=$(curl --silent --show-error --unix-socket "$WORK/containers/host-e2e.sock" \
-    'http://agentbox/echo/from-host')
+# Host identities use a separate UID-protected data plane and are runtime-only.
+# This profile has no credential-bearing loopback route, so it is safe to grant
+# to a regular user on a multi-user host.
+abx profile create hosttest
+cat > "$WORK/host-user-route.json" <<EOF
+{
+  "name": "host-user",
+  "match": {"path_prefix": "/host-user"},
+  "upstream": "http://127.0.0.1:${PORT}",
+  "strip_prefix": true
+}
+EOF
+abx route put hosttest "$WORK/host-user-route.json"
+control -X PUT "http://agentbox/v1/profile-grants/$(id -u)/hosttest" >/dev/null
+user_control http://agentbox/v1/user/profiles | grep -q '"name":"hosttest"' \
+    || fail "assigned host profile was not visible to its user"
+[[ $(curl --silent --output /dev/null --write-out '%{http_code}' --unix-socket "$WORK/user.sock" http://agentbox/v1/keys) == 404 ]] \
+    || fail "user API exposed administrator key endpoint"
+HOST_SESSION=$(user_control -H 'content-type: application/json' \
+    -d '{"profile":"hosttest"}' http://agentbox/v1/user/host-sessions)
+HOST_NAME=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' <<<"$HOST_SESSION")
+wait_for "$WORK/users/${HOST_NAME}.sock"
+RESPONSE=$(curl --silent --show-error --unix-socket "$WORK/users/${HOST_NAME}.sock" \
+    'http://agentbox/host-user/from-host')
 python3 - "$RESPONSE" <<'PY'
 import json, sys
 d = json.loads(sys.argv[1])
-assert d["path"] == "/base/from-host", d
+assert d["path"] == "/from-host", d
 PY
-grep -Fq 'host-e2e' "$WORK/state.json" && fail "host session was persisted"
-control -X DELETE http://agentbox/v1/host-sessions/host-e2e >/dev/null
-[[ ! -e "$WORK/containers/host-e2e.sock" ]] || fail "host session socket was not removed"
+grep -Fq "$HOST_NAME" "$WORK/state.json" && fail "host session was persisted"
+user_control -X DELETE "http://agentbox/v1/user/host-sessions/${HOST_NAME}" >/dev/null
+[[ ! -e "$WORK/users/${HOST_NAME}.sock" ]] || fail "host session socket was not removed"
 
 [[ $(proxy -o /dev/null -w '%{http_code}' -H 'Host: unknown.example' http://agentbox/x) == 404 ]] \
     || fail "unmapped host did not fail closed"
@@ -260,7 +287,7 @@ control -X PATCH -H 'content-type: application/json' -d '{"blocked":false}' \
 [[ $(proxy -o /dev/null -w '%{http_code}' http://agentbox/echo/x) == 200 ]] \
     || fail "live unblock did not restore the route"
 
-abx status | grep -q '1 profiles, 10 routes, 1 keys, 1 containers, 0 host sessions, 1 credential sources, 1 credential bindings' \
+abx status | grep -q '2 profiles, 11 routes, 1 keys, 1 containers, 0 host sessions, 1 credential sources, 1 credential bindings' \
     || fail "health counts are wrong"
 for leak in QUERYSECRET container-fake real-one real-two; do
     if grep -Fq "$leak" "$WORK/daemon.log"; then

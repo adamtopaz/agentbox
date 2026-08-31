@@ -1,7 +1,8 @@
 // Package imagebuild creates the reusable agent image through Incus itself.
 // A disposable cloud image consumes the embedded cloud-init specification,
 // is verified and scrubbed, then is published. Privilege stays behind the
-// Incus daemon boundary; the operator-facing command does not require sudo.
+// Incus daemon boundary; Agentbox additionally restricts this lifecycle command
+// to explicitly elevated administrators.
 package imagebuild
 
 import (
