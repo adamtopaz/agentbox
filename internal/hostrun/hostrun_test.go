@@ -10,8 +10,10 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -29,13 +31,15 @@ func TestHostEnvironmentRewritesOnlyAgentboxLoopback(t *testing.T) {
 		"http://127.0.0.1:43210", "session-token", map[string]string{"GH_CONFIG_DIR": "/tmp/gh"},
 	)
 	for name, want := range map[string]string{
-		"OPENAI_BASE_URL":    "http://127.0.0.1:43210/cloudflare/prod/openai",
-		"ANTHROPIC_BASE_URL": "http://example.test/v1",
-		"OPENAI_API_KEY":     "session-token",
-		"ANTHROPIC_API_KEY":  "session-token",
-		"GH_TOKEN":           "session-token",
-		"KEEP":               "profile",
-		"GH_CONFIG_DIR":      "/tmp/gh",
+		"OPENAI_BASE_URL":      "http://127.0.0.1:43210/cloudflare/prod/openai",
+		"ANTHROPIC_BASE_URL":   "http://example.test/v1",
+		"OPENAI_API_KEY":       "session-token",
+		"ANTHROPIC_API_KEY":    "session-token",
+		"GH_TOKEN":             "session-token",
+		"AGENTBOX_PROXY_URL":   "http://127.0.0.1:43210",
+		"AGENTBOX_PROXY_TOKEN": "session-token",
+		"KEEP":                 "profile",
+		"GH_CONFIG_DIR":        "/tmp/gh",
 	} {
 		if got := envValue(env, name); got != want {
 			t.Errorf("%s=%q, want %q", name, got, want)
@@ -369,7 +373,7 @@ func TestRunForwardsCommandRequestAndCleansSession(t *testing.T) {
 		Environment: map[string]string{"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787/cloudflare/prod/anthropic"},
 	}
 	err := Run(context.Background(), control, Options{
-		Profile: profile, Agent: AgentCommand, AgentBin: fakeTool, AgentArgs: []string{"--flag"}, GitBin: makeFakeGit(t, root), SocketDir: control.dir,
+		Profile: profile, Agent: AgentRun, AgentBin: fakeTool, AgentArgs: []string{"--flag"}, GitBin: makeFakeGit(t, root), SocketDir: control.dir,
 		Environment: append(os.Environ(), "ANTHROPIC_API_KEY=user-key"), Stdout: io.Discard, Stderr: io.Discard,
 	})
 	if err != nil {
@@ -391,27 +395,82 @@ func TestRunForwardsCommandRequestAndCleansSession(t *testing.T) {
 	}
 }
 
-func TestRunCommandRequiresProgramAndReportsExitStatus(t *testing.T) {
-	control := &controlFake{dir: t.TempDir()}
+func TestRunValidatesProgramBeforeSessionAndPropagatesExitStatus(t *testing.T) {
 	profile := domain.UserProfile{Name: "prod", Environment: map[string]string{}}
-	err := Run(context.Background(), control, Options{
-		Profile: profile, Agent: AgentCommand, GitBin: makeFakeGit(t, t.TempDir()), SocketDir: control.dir,
-	})
-	if err == nil || !strings.Contains(err.Error(), "requires a command") {
-		t.Fatalf("unexpected error: %v", err)
+	for _, tc := range []struct{ bin, want string }{{"", "requires a program"}, {"/nonexistent/agentbox-tool", "find program"}} {
+		control := &controlFake{dir: t.TempDir()}
+		err := Run(context.Background(), control, Options{
+			Profile: profile, Agent: AgentRun, AgentBin: tc.bin, GitBin: makeFakeGit(t, t.TempDir()), SocketDir: control.dir,
+		})
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("AgentBin=%q: unexpected error: %v", tc.bin, err)
+		}
+		if control.added != "" {
+			t.Fatalf("AgentBin=%q: a host session was created before the program was validated", tc.bin)
+		}
 	}
-	if control.added != "" {
-		t.Fatal("a host session was created before the command was validated")
+	for _, tc := range []struct {
+		script string
+		code   int
+	}{{"#!/bin/sh\nexit 3\n", 3}, {"#!/bin/sh\nkill -TERM $$\n", 128 + int(syscall.SIGTERM)}} {
+		control := &controlFake{dir: t.TempDir()}
+		fakeTool := filepath.Join(t.TempDir(), "tool")
+		writeExecutable(t, fakeTool, tc.script)
+		err := Run(context.Background(), control, Options{
+			Profile: profile, Agent: AgentRun, AgentBin: fakeTool, GitBin: makeFakeGit(t, t.TempDir()), SocketDir: control.dir,
+			Stdout: io.Discard, Stderr: io.Discard,
+		})
+		var exit *ExitError
+		if !errors.As(err, &exit) || exit.Code != tc.code {
+			t.Fatalf("script %q: unexpected error: %v", tc.script, err)
+		}
+		if control.added == "" || control.deleted != control.added {
+			t.Fatalf("session lifecycle added=%q deleted=%q", control.added, control.deleted)
+		}
 	}
-	fakeTool := filepath.Join(t.TempDir(), "tool")
-	writeExecutable(t, fakeTool, "#!/bin/sh\nexit 3\n")
-	err = Run(context.Background(), control, Options{
-		Profile: profile, Agent: AgentCommand, AgentBin: fakeTool, GitBin: makeFakeGit(t, t.TempDir()), SocketDir: control.dir,
-		Stdout: io.Discard, Stderr: io.Discard,
-	})
-	var exit *ExitError
-	if !errors.As(err, &exit) || exit.Code != 3 {
-		t.Fatalf("unexpected error: %v", err)
+}
+
+func TestRunRelaysTerminationSignalToProgram(t *testing.T) {
+	// Registering a handler first keeps the test binary alive should the
+	// signal arrive before Run has installed its relay.
+	guard := make(chan os.Signal, 1)
+	signal.Notify(guard, syscall.SIGTERM)
+	defer signal.Stop(guard)
+
+	control := &controlFake{dir: t.TempDir()}
+	root := t.TempDir()
+	ready := filepath.Join(root, "ready")
+	fakeTool := filepath.Join(root, "tool")
+	writeExecutable(t, fakeTool, "#!/bin/sh\ntrap 'exit 0' TERM\n: > "+shellQuote(ready)+"\nwhile :; do sleep 0.05; done\n")
+	gitBin := makeFakeGit(t, root)
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(context.Background(), control, Options{
+			Profile: domain.UserProfile{Name: "prod", Environment: map[string]string{}},
+			Agent:   AgentRun, AgentBin: fakeTool, GitBin: gitBin, SocketDir: control.dir,
+			Stdout: io.Discard, Stderr: io.Discard,
+		})
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("program did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("program kept running after the launcher received SIGTERM")
 	}
 	if control.added == "" || control.deleted != control.added {
 		t.Fatalf("session lifecycle added=%q deleted=%q", control.added, control.deleted)

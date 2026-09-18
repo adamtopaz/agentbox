@@ -340,8 +340,8 @@ being repaired implicitly.
 
 ## Host coding-agent sessions
 
-Grant an existing profile, then launch Claude Code, Codex, or Pi as the regular
-user—without `sudo` and without Incus access:
+Grant an existing profile, then launch Claude Code, Codex, Pi, or any other
+program as the regular user—without `sudo` and without Incus access:
 
 ```sh
 sudo agentbox user grant alice production
@@ -364,11 +364,13 @@ upstream API key. `gh` points directly at the UID-protected session socket.
 
 Codex uses command-line provider overrides, Claude Code uses a temporary gateway
 token, and Pi uses a temporary overlay of its provider and auth configuration.
-The launcher deletes its daemon identity and temporary files when the agent
-exits. Host identities are not persisted, so restarting `agentboxd` also
-revokes any identity left behind by an uncatchable process termination. A live
-host session prevents deletion of its selected profile. GitHub SSH remotes and
-arbitrary process traffic are not redirected.
+`host run` applies none of these and hands the program only the session
+environment, including `AGENTBOX_PROXY_URL` and `AGENTBOX_PROXY_TOKEN`. The
+launcher relays `SIGTERM` to the program and deletes its daemon identity and
+temporary files when the program exits. Host identities are not persisted, so
+restarting `agentboxd` also revokes any identity left behind by an uncatchable
+process termination. A live host session prevents deletion of its selected
+profile. GitHub SSH remotes and arbitrary process traffic are not redirected.
 
 Soft containment changes the live snapshot so new requests return 403:
 

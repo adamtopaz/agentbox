@@ -1,5 +1,5 @@
-// Package hostrun launches host-side coding agents whose model and GitHub
-// traffic use an ephemeral Agentbox data-plane identity.
+// Package hostrun launches host-side coding agents, and other programs, whose
+// model and GitHub traffic use an ephemeral Agentbox data-plane identity.
 package hostrun
 
 import (
@@ -18,9 +18,11 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"agentbox/internal/domain"
@@ -31,19 +33,21 @@ type Control interface {
 	DeleteHostSession(context.Context, string) error
 }
 
+// Agent selects launcher behaviour. The named agents receive agent-specific
+// configuration; AgentRun launches any program with the shared environment.
 type Agent string
 
 const (
 	AgentClaude Agent = "claude"
 	AgentCodex  Agent = "codex"
 	AgentPi     Agent = "pi"
-	// AgentCommand launches an arbitrary program with the shared host-session
+	// AgentRun launches an arbitrary program with the shared host-session
 	// environment and no agent-specific configuration.
-	AgentCommand Agent = "run"
+	AgentRun Agent = "run"
 )
 
 func (a Agent) Valid() bool {
-	return a == AgentClaude || a == AgentCodex || a == AgentPi || a == AgentCommand
+	return a == AgentClaude || a == AgentCodex || a == AgentPi || a == AgentRun
 }
 
 func (a Agent) DisplayName() string {
@@ -54,8 +58,8 @@ func (a Agent) DisplayName() string {
 		return "Codex"
 	case AgentPi:
 		return "Pi"
-	case AgentCommand:
-		return "command"
+	case AgentRun:
+		return "program"
 	default:
 		return string(a)
 	}
@@ -77,7 +81,7 @@ type Options struct {
 	SocketWait    time.Duration
 }
 
-// ExitError reports the launched agent process's exit status without asking
+// ExitError reports the launched process's exit status without asking
 // the CLI entry point to print a second, misleading Agentbox error.
 type ExitError struct {
 	Agent Agent
@@ -102,15 +106,15 @@ func Run(ctx context.Context, control Control, options Options) (retErr error) {
 		return fmt.Errorf("unsupported host agent %q", options.Agent)
 	}
 	if options.AgentBin == "" {
-		if options.Agent == AgentCommand {
-			return errors.New("host run requires a command")
+		if options.Agent == AgentRun {
+			return errors.New("host run requires a program")
 		}
 		options.AgentBin = string(options.Agent)
 	}
 	agentPath, err := exec.LookPath(options.AgentBin)
 	if err != nil {
-		if options.Agent == AgentCommand {
-			return fmt.Errorf("find command %q: %w", options.AgentBin, err)
+		if options.Agent == AgentRun {
+			return fmt.Errorf("find program %q: %w", options.AgentBin, err)
 		}
 		return fmt.Errorf("find %s executable %q: %w", options.Agent.DisplayName(), options.AgentBin, err)
 	}
@@ -164,8 +168,6 @@ func Run(ctx context.Context, control Control, options Options) (retErr error) {
 
 	env := hostEnvironment(options.Environment, options.Profile.Environment, bridge.URL(), token, map[string]string{
 		"AGENTBOX_HOST_SESSION": name,
-		"AGENTBOX_PROXY_URL":    bridge.URL(),
-		"AGENTBOX_PROXY_TOKEN":  token,
 		"AGENTBOX_SOCKET":       options.ControlSocket,
 		"GH_CONFIG_DIR":         ghConfig,
 		"GIT_EXEC_PATH":         gitExec,
@@ -173,10 +175,10 @@ func Run(ctx context.Context, control Control, options Options) (retErr error) {
 	})
 	args := options.AgentArgs
 	switch options.Agent {
-	case AgentCommand:
-		// Generic programs receive the shared host environment unchanged: the
-		// profile base URLs, the session token, and AGENTBOX_PROXY_URL for routes
-		// that have no profile-provided base URL.
+	case AgentRun:
+		// Generic programs receive the shared host environment unchanged and no
+		// credential scrubbing, so the named launchers remain the right choice for
+		// the agents they know.
 	case AgentCodex:
 		openAIBase := envValue(env, "OPENAI_BASE_URL")
 		if openAIBase == "" {
@@ -216,19 +218,48 @@ func Run(ctx context.Context, control Control, options Options) (retErr error) {
 	// context must not turn every Ctrl-C into an unconditional child kill. The
 	// terminal delivers the signal to the agent directly; Agentbox waits so it
 	// can still remove the host identity when the agent eventually exits.
+	// SIGTERM is different: it is how a supervisor or `kill` stops the launcher
+	// and carries no terminal semantics, so it is relayed to the child.
+	// Otherwise the program, its session, and the bridge would outlive the
+	// launcher's own shutdown.
 	command := exec.Command(agentPath, args...)
 	command.Env = env
 	command.Stdin = options.Stdin
 	command.Stdout = options.Stdout
 	command.Stderr = options.Stderr
-	if err := command.Run(); err != nil {
+	if err := command.Start(); err != nil {
+		return fmt.Errorf("run %s: %w", options.Agent.DisplayName(), err)
+	}
+	terminate := make(chan os.Signal, 1)
+	signal.Notify(terminate, syscall.SIGTERM)
+	relayed := make(chan struct{})
+	go func() {
+		defer close(relayed)
+		for sig := range terminate {
+			_ = command.Process.Signal(sig)
+		}
+	}()
+	err = command.Wait()
+	signal.Stop(terminate)
+	close(terminate)
+	<-relayed
+	if err != nil {
 		var exit *exec.ExitError
 		if errors.As(err, &exit) {
-			return &ExitError{Agent: options.Agent, Code: exit.ExitCode()}
+			return &ExitError{Agent: options.Agent, Code: exitCode(exit)}
 		}
 		return fmt.Errorf("run %s: %w", options.Agent.DisplayName(), err)
 	}
 	return nil
+}
+
+// exitCode maps death by signal to the conventional 128+signal status instead
+// of the -1 that ExitCode reports, so wrappers observe e.g. 143 for SIGTERM.
+func exitCode(exit *exec.ExitError) int {
+	if status, ok := exit.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+		return 128 + int(status.Signal())
+	}
+	return exit.ExitCode()
 }
 
 func codexArgs(openAIBase string, user []string) []string {
@@ -264,6 +295,10 @@ func hostEnvironment(base []string, profile map[string]string, proxyURL, token s
 	set("OPENAI_API_KEY", token)
 	set("ANTHROPIC_API_KEY", token)
 	set("GH_TOKEN", token)
+	// Named so that a program without a profile-provided base URL can still
+	// reach every route in the profile through the bridge.
+	set("AGENTBOX_PROXY_URL", proxyURL)
+	set("AGENTBOX_PROXY_TOKEN", token)
 	for name, value := range extra {
 		if value != "" {
 			set(name, value)
