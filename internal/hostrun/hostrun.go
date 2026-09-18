@@ -37,10 +37,13 @@ const (
 	AgentClaude Agent = "claude"
 	AgentCodex  Agent = "codex"
 	AgentPi     Agent = "pi"
+	// AgentCommand launches an arbitrary program with the shared host-session
+	// environment and no agent-specific configuration.
+	AgentCommand Agent = "run"
 )
 
 func (a Agent) Valid() bool {
-	return a == AgentClaude || a == AgentCodex || a == AgentPi
+	return a == AgentClaude || a == AgentCodex || a == AgentPi || a == AgentCommand
 }
 
 func (a Agent) DisplayName() string {
@@ -51,6 +54,8 @@ func (a Agent) DisplayName() string {
 		return "Codex"
 	case AgentPi:
 		return "Pi"
+	case AgentCommand:
+		return "command"
 	default:
 		return string(a)
 	}
@@ -97,10 +102,16 @@ func Run(ctx context.Context, control Control, options Options) (retErr error) {
 		return fmt.Errorf("unsupported host agent %q", options.Agent)
 	}
 	if options.AgentBin == "" {
+		if options.Agent == AgentCommand {
+			return errors.New("host run requires a command")
+		}
 		options.AgentBin = string(options.Agent)
 	}
 	agentPath, err := exec.LookPath(options.AgentBin)
 	if err != nil {
+		if options.Agent == AgentCommand {
+			return fmt.Errorf("find command %q: %w", options.AgentBin, err)
+		}
 		return fmt.Errorf("find %s executable %q: %w", options.Agent.DisplayName(), options.AgentBin, err)
 	}
 	if options.GitBin == "" {
@@ -153,6 +164,8 @@ func Run(ctx context.Context, control Control, options Options) (retErr error) {
 
 	env := hostEnvironment(options.Environment, options.Profile.Environment, bridge.URL(), token, map[string]string{
 		"AGENTBOX_HOST_SESSION": name,
+		"AGENTBOX_PROXY_URL":    bridge.URL(),
+		"AGENTBOX_PROXY_TOKEN":  token,
 		"AGENTBOX_SOCKET":       options.ControlSocket,
 		"GH_CONFIG_DIR":         ghConfig,
 		"GIT_EXEC_PATH":         gitExec,
@@ -160,6 +173,10 @@ func Run(ctx context.Context, control Control, options Options) (retErr error) {
 	})
 	args := options.AgentArgs
 	switch options.Agent {
+	case AgentCommand:
+		// Generic programs receive the shared host environment unchanged: the
+		// profile base URLs, the session token, and AGENTBOX_PROXY_URL for routes
+		// that have no profile-provided base URL.
 	case AgentCodex:
 		openAIBase := envValue(env, "OPENAI_BASE_URL")
 		if openAIBase == "" {

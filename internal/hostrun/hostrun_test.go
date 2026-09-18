@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -345,6 +346,72 @@ func TestRunForwardsPiRequestAndCleansSession(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Pi request did not reach the host-session socket")
+	}
+	if control.added == "" || control.deleted != control.added {
+		t.Fatalf("session lifecycle added=%q deleted=%q", control.added, control.deleted)
+	}
+}
+
+func TestRunForwardsCommandRequestAndCleansSession(t *testing.T) {
+	requestSeen := make(chan *http.Request, 1)
+	control := &controlFake{dir: t.TempDir(), handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestSeen <- r.Clone(context.Background())
+		_, _ = io.WriteString(w, "ok")
+	})}
+	root := t.TempDir()
+	fakeTool := filepath.Join(root, "tool")
+	// The program sees the profile base URL rewritten onto the bridge, the
+	// session token in place of the user's real key, and explicit bridge
+	// coordinates for routes the profile environment does not name.
+	writeExecutable(t, fakeTool, "#!/bin/sh\nset -eu\ntest \"$1\" = --flag\ntest \"$ANTHROPIC_BASE_URL\" = \"$AGENTBOX_PROXY_URL/cloudflare/prod/anthropic\"\ntest \"$ANTHROPIC_API_KEY\" = \"$AGENTBOX_PROXY_TOKEN\"\ncurl -fsS -H \"Authorization: Bearer $AGENTBOX_PROXY_TOKEN\" \"$AGENTBOX_PROXY_URL/example/v1/items\" >/dev/null\n")
+	profile := domain.UserProfile{
+		Name:        "prod",
+		Environment: map[string]string{"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787/cloudflare/prod/anthropic"},
+	}
+	err := Run(context.Background(), control, Options{
+		Profile: profile, Agent: AgentCommand, AgentBin: fakeTool, AgentArgs: []string{"--flag"}, GitBin: makeFakeGit(t, root), SocketDir: control.dir,
+		Environment: append(os.Environ(), "ANTHROPIC_API_KEY=user-key"), Stdout: io.Discard, Stderr: io.Discard,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case request := <-requestSeen:
+		if request.URL.Path != "/example/v1/items" {
+			t.Fatalf("path=%q", request.URL.Path)
+		}
+		if request.Header.Get("Authorization") != "" {
+			t.Fatal("session authorization reached the Agentbox data plane")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("command request did not reach the host-session socket")
+	}
+	if control.added == "" || control.deleted != control.added {
+		t.Fatalf("session lifecycle added=%q deleted=%q", control.added, control.deleted)
+	}
+}
+
+func TestRunCommandRequiresProgramAndReportsExitStatus(t *testing.T) {
+	control := &controlFake{dir: t.TempDir()}
+	profile := domain.UserProfile{Name: "prod", Environment: map[string]string{}}
+	err := Run(context.Background(), control, Options{
+		Profile: profile, Agent: AgentCommand, GitBin: makeFakeGit(t, t.TempDir()), SocketDir: control.dir,
+	})
+	if err == nil || !strings.Contains(err.Error(), "requires a command") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if control.added != "" {
+		t.Fatal("a host session was created before the command was validated")
+	}
+	fakeTool := filepath.Join(t.TempDir(), "tool")
+	writeExecutable(t, fakeTool, "#!/bin/sh\nexit 3\n")
+	err = Run(context.Background(), control, Options{
+		Profile: profile, Agent: AgentCommand, AgentBin: fakeTool, GitBin: makeFakeGit(t, t.TempDir()), SocketDir: control.dir,
+		Stdout: io.Discard, Stderr: io.Discard,
+	})
+	var exit *ExitError
+	if !errors.As(err, &exit) || exit.Code != 3 {
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if control.added == "" || control.deleted != control.added {
 		t.Fatalf("session lifecycle added=%q deleted=%q", control.added, control.deleted)

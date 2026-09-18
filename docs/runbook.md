@@ -351,6 +351,7 @@ agentbox host claude --profile production
 agentbox host codex --profile production
 agentbox host codex --profile production -- exec "run the test suite"
 agentbox host pi --profile production
+agentbox host run --profile production -- python3 my_agent.py
 ```
 
 Agentbox derives the caller's UID from the user control socket and ignores any

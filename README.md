@@ -225,10 +225,14 @@ agentbox host pi --profile production
 agentbox host claude --profile production -- -p "inspect this repository"
 agentbox host codex --profile production -- exec "inspect this repository"
 agentbox host pi --profile production -- -p "inspect this repository"
+# Run any other program with the same session and environment:
+agentbox host run --profile production -- python3 my_agent.py
 ```
 
 The command creates a non-persistent host identity in `agentboxd`, starts an
 authenticated random-port loopback bridge, and launches the selected agent.
+`host run` launches an arbitrary program the same way and performs no
+agent-specific configuration.
 Codex receives per-run custom-provider arguments. Claude Code receives a
 session-only gateway token. Pi receives a temporary configuration that merges
 its existing providers and credentials while overriding the built-in OpenAI and
@@ -238,8 +242,12 @@ files, and daemon identity are removed; a daemon restart also revokes all host
 identities because they are never written to `state.json`.
 
 Within the agent process, `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` use the
-selected Agentbox profile. GitHub CLI API traffic uses the session's protected
-Unix socket. A temporary Git HTTPS transport helper sends only canonical
+selected Agentbox profile. `AGENTBOX_PROXY_URL` and `AGENTBOX_PROXY_TOKEN` name
+the bridge and its session token directly, so a program can reach any route in
+the profile even when the profile environment provides no base URL for it;
+`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GH_TOKEN` carry the same token.
+GitHub CLI API traffic uses the session's protected Unix socket. A temporary
+Git HTTPS transport helper sends only canonical
 `https://github.com/...` clone/fetch/push operations through `/github-git/`, so
 repository remotes remain unchanged; other Git HTTPS hosts are delegated to
 Git's normal helper. As in the container image, GitHub SSH remotes are not

@@ -21,3 +21,12 @@ func TestHostRejectsUnknownAgent(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestHostRunUsage(t *testing.T) {
+	for _, args := range [][]string{{"run"}, {"run", "--profile", "prod"}} {
+		err := cmdHost(context.Background(), nil, "", args)
+		if err == nil || !strings.Contains(err.Error(), "COMMAND [ARGS...]") {
+			t.Errorf("%v usage error = %v", args, err)
+		}
+	}
+}

@@ -17,9 +17,11 @@ import (
 	"agentbox/internal/paths"
 )
 
+const hostUsage = "usage: agentbox host profiles | <claude|codex|pi> --profile PROFILE [agent options] | run --profile PROFILE [--] COMMAND [ARGS...]"
+
 func cmdHost(ctx context.Context, client *control.Client, controlSocket string, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: agentbox host profiles | <claude|codex|pi> --profile PROFILE [agent options]")
+		return errors.New(hostUsage)
 	}
 	if args[0] == "profiles" {
 		if len(args) != 1 {
@@ -36,19 +38,36 @@ func cmdHost(ctx context.Context, client *control.Client, controlSocket string, 
 	}
 	agent := hostrun.Agent(args[0])
 	if !agent.Valid() {
-		return fmt.Errorf("unknown host agent %q (want claude, codex, or pi)", args[0])
+		return fmt.Errorf("unknown host agent %q (want claude, codex, pi, or run)", args[0])
 	}
 	command := "host " + string(agent)
-	usage := "usage: agentbox " + command + " --profile PROFILE [--" + string(agent) + "-bin PATH] [--git-bin PATH] [--] [" + strings.ToUpper(string(agent)) + "_ARGS...]"
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	profileName := fs.String("profile", "", "Agentbox profile")
-	agentBin := fs.String(string(agent)+"-bin", string(agent), agent.DisplayName()+" executable")
 	gitBin := fs.String("git-bin", "git", "Git executable")
+	var usage string
+	var agentBin *string
+	if agent == hostrun.AgentCommand {
+		// The program is positional. Flag parsing stops at the first non-flag
+		// argument, so the program's own options need no `--` separator.
+		usage = "usage: agentbox host run --profile PROFILE [--git-bin PATH] [--] COMMAND [ARGS...]"
+	} else {
+		usage = "usage: agentbox " + command + " --profile PROFILE [--" + string(agent) + "-bin PATH] [--git-bin PATH] [--] [" + strings.ToUpper(string(agent)) + "_ARGS...]"
+		agentBin = fs.String(string(agent)+"-bin", string(agent), agent.DisplayName()+" executable")
+	}
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 	if *profileName == "" {
 		return errors.New(usage)
+	}
+	executable, agentArgs := "", fs.Args()
+	if agentBin != nil {
+		executable = *agentBin
+	} else {
+		if len(agentArgs) == 0 {
+			return errors.New(usage)
+		}
+		executable, agentArgs = agentArgs[0], agentArgs[1:]
 	}
 	profiles, err := client.UserProfiles(ctx)
 	if err != nil {
@@ -65,7 +84,7 @@ func cmdHost(ctx context.Context, client *control.Client, controlSocket string, 
 		return fmt.Errorf("profile %q is not assigned to this user", *profileName)
 	}
 	return hostrun.Run(ctx, client, hostrun.Options{
-		Profile: *current, Agent: agent, AgentBin: *agentBin, AgentArgs: fs.Args(), GitBin: *gitBin,
+		Profile: *current, Agent: agent, AgentBin: executable, AgentArgs: agentArgs, GitBin: *gitBin,
 		ControlSocket: controlSocket, SocketDir: paths.HostSocketsDir,
 		Environment: os.Environ(), Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr,
 	})
