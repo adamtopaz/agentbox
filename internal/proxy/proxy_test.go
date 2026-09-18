@@ -83,8 +83,14 @@ func TestDefaultTransportHasProductionBounds(t *testing.T) {
 	if defaultTransport.TLSClientConfig == nil || defaultTransport.TLSClientConfig.MinVersion < tls.VersionTLS12 {
 		t.Fatal("default transport permits TLS older than 1.2")
 	}
-	if defaultTransport.ResponseHeaderTimeout <= 0 || defaultTransport.MaxResponseHeaderBytes <= 0 || defaultTransport.MaxConnsPerHost <= 0 {
+	if defaultTransport.TLSHandshakeTimeout <= 0 || defaultTransport.MaxResponseHeaderBytes <= 0 || defaultTransport.MaxConnsPerHost <= 0 {
 		t.Fatalf("default transport is unbounded: %+v", defaultTransport)
+	}
+	// Non-streaming model responses legitimately hold headers for minutes, so the
+	// transport must not cut them off; liveness is covered by the dial and TLS
+	// timeouts and request duration is the client's to bound.
+	if defaultTransport.ResponseHeaderTimeout != 0 {
+		t.Fatalf("default transport imposes a response header timeout: %s", defaultTransport.ResponseHeaderTimeout)
 	}
 	if defaultMaxConnections <= 0 {
 		t.Fatal("per-container connection limit is disabled")

@@ -142,6 +142,12 @@ func (s *Server) transport() http.RoundTripper {
 	return defaultTransport
 }
 
+// defaultTransport deliberately sets no ResponseHeaderTimeout. Upstreams are model
+// APIs whose non-streaming responses legitimately withhold headers for minutes
+// while a completion is generated. Liveness is bounded by the dial and TLS
+// handshake timeouts, request duration belongs to the client (whose
+// cancellation propagates through the request context), and per-container
+// resource use is bounded by the connection cap on the listener.
 var defaultTransport = &http.Transport{
 	Proxy:                  nil,
 	DialContext:            (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -152,7 +158,6 @@ var defaultTransport = &http.Transport{
 	MaxConnsPerHost:        256,
 	IdleConnTimeout:        90 * time.Second,
 	TLSHandshakeTimeout:    10 * time.Second,
-	ResponseHeaderTimeout:  30 * time.Second,
 	ExpectContinueTimeout:  time.Second,
 	MaxResponseHeaderBytes: 1 << 20,
 }
