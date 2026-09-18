@@ -586,9 +586,8 @@ func startBridge(socket, token string) (*bridge, error) {
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, "unix", socket)
 		},
-		ForceAttemptHTTP2:     false,
-		ResponseHeaderTimeout: 30 * time.Second,
-		IdleConnTimeout:       90 * time.Second,
+		ForceAttemptHTTP2: false,
+		IdleConnTimeout:   90 * time.Second,
 	}
 	proxy := &httputil.ReverseProxy{
 		Transport:     transport,
