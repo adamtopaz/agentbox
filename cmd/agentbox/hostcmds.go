@@ -17,9 +17,62 @@ import (
 	"agentbox/internal/paths"
 )
 
+const hostUsage = "usage: agentbox host profiles | <claude|codex|pi> --profile PROFILE [agent options] | run --profile PROFILE [--] COMMAND [ARGS...]"
+
+// hostInvocation is the parsed form of `agentbox host <claude|codex|pi|run>`.
+type hostInvocation struct {
+	agent   hostrun.Agent
+	profile string
+	program string
+	args    []string
+	gitBin  string
+}
+
+func parseHostArgs(args []string) (hostInvocation, error) {
+	agent := hostrun.Agent(args[0])
+	if !agent.Valid() {
+		return hostInvocation{}, fmt.Errorf("unknown host agent %q (want claude, codex, pi, or run)", args[0])
+	}
+	command := "host " + string(agent)
+	fs := flag.NewFlagSet(command, flag.ContinueOnError)
+	profileName := fs.String("profile", "", "Agentbox profile")
+	gitBin := fs.String("git-bin", "git", "Git executable")
+	var usage string
+	var agentBin *string
+	if agent == hostrun.AgentRun {
+		// The program is positional. Flag parsing stops at the first non-flag
+		// argument, so the program's own options need no `--` separator; only a
+		// program whose name itself begins with `-` must follow one.
+		usage = "usage: agentbox host run --profile PROFILE [--git-bin PATH] [--] COMMAND [ARGS...]"
+	} else {
+		usage = "usage: agentbox " + command + " --profile PROFILE [--" + string(agent) + "-bin PATH] [--git-bin PATH] [--] [" + strings.ToUpper(string(agent)) + "_ARGS...]"
+		agentBin = fs.String(string(agent)+"-bin", string(agent), agent.DisplayName()+" executable")
+	}
+	fs.Usage = func() { fmt.Fprintln(fs.Output(), usage) }
+	if err := fs.Parse(args[1:]); err != nil {
+		if agent == hostrun.AgentRun && !errors.Is(err, flag.ErrHelp) {
+			return hostInvocation{}, fmt.Errorf("%w (a program whose name begins with '-' must follow '--')", err)
+		}
+		return hostInvocation{}, err
+	}
+	if *profileName == "" {
+		return hostInvocation{}, errors.New(usage)
+	}
+	invocation := hostInvocation{agent: agent, profile: *profileName, args: fs.Args(), gitBin: *gitBin}
+	if agentBin != nil {
+		invocation.program = *agentBin
+		return invocation, nil
+	}
+	if len(invocation.args) == 0 || invocation.args[0] == "" {
+		return hostInvocation{}, errors.New(usage)
+	}
+	invocation.program, invocation.args = invocation.args[0], invocation.args[1:]
+	return invocation, nil
+}
+
 func cmdHost(ctx context.Context, client *control.Client, controlSocket string, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: agentbox host profiles | <claude|codex|pi> --profile PROFILE [agent options]")
+		return errors.New(hostUsage)
 	}
 	if args[0] == "profiles" {
 		if len(args) != 1 {
@@ -34,21 +87,9 @@ func cmdHost(ctx context.Context, client *control.Client, controlSocket string, 
 		}
 		return nil
 	}
-	agent := hostrun.Agent(args[0])
-	if !agent.Valid() {
-		return fmt.Errorf("unknown host agent %q (want claude, codex, or pi)", args[0])
-	}
-	command := "host " + string(agent)
-	usage := "usage: agentbox " + command + " --profile PROFILE [--" + string(agent) + "-bin PATH] [--git-bin PATH] [--] [" + strings.ToUpper(string(agent)) + "_ARGS...]"
-	fs := flag.NewFlagSet(command, flag.ContinueOnError)
-	profileName := fs.String("profile", "", "Agentbox profile")
-	agentBin := fs.String(string(agent)+"-bin", string(agent), agent.DisplayName()+" executable")
-	gitBin := fs.String("git-bin", "git", "Git executable")
-	if err := fs.Parse(args[1:]); err != nil {
+	invocation, err := parseHostArgs(args)
+	if err != nil {
 		return err
-	}
-	if *profileName == "" {
-		return errors.New(usage)
 	}
 	profiles, err := client.UserProfiles(ctx)
 	if err != nil {
@@ -56,16 +97,16 @@ func cmdHost(ctx context.Context, client *control.Client, controlSocket string, 
 	}
 	var current *domain.UserProfile
 	for i := range profiles {
-		if profiles[i].Name == *profileName {
+		if profiles[i].Name == invocation.profile {
 			current = &profiles[i]
 			break
 		}
 	}
 	if current == nil {
-		return fmt.Errorf("profile %q is not assigned to this user", *profileName)
+		return fmt.Errorf("profile %q is not assigned to this user", invocation.profile)
 	}
 	return hostrun.Run(ctx, client, hostrun.Options{
-		Profile: *current, Agent: agent, AgentBin: *agentBin, AgentArgs: fs.Args(), GitBin: *gitBin,
+		Profile: *current, Agent: invocation.agent, AgentBin: invocation.program, AgentArgs: invocation.args, GitBin: invocation.gitBin,
 		ControlSocket: controlSocket, SocketDir: paths.HostSocketsDir,
 		Environment: os.Environ(), Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr,
 	})

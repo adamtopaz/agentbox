@@ -225,6 +225,8 @@ agentbox host pi --profile production
 agentbox host claude --profile production -- -p "inspect this repository"
 agentbox host codex --profile production -- exec "inspect this repository"
 agentbox host pi --profile production -- -p "inspect this repository"
+# Run any other program with the same session and environment:
+agentbox host run --profile production -- python3 my_agent.py
 ```
 
 The command creates a non-persistent host identity in `agentboxd`, starts an
@@ -235,11 +237,27 @@ its existing providers and credentials while overriding the built-in OpenAI and
 Anthropic providers. Agentbox does not replace or edit the user's persistent
 agent configuration. On normal exit or a handled signal, the bridge, temporary
 files, and daemon identity are removed; a daemon restart also revokes all host
-identities because they are never written to `state.json`.
+identities because they are never written to `state.json`. A `SIGTERM` sent to
+`agentbox` is relayed to the launched process, while Ctrl-C reaches it directly
+from the terminal; a process killed by a signal yields exit status 128 plus the
+signal number.
 
-Within the agent process, `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` use the
-selected Agentbox profile. GitHub CLI API traffic uses the session's protected
-Unix socket. A temporary Git HTTPS transport helper sends only canonical
+`host run` launches an arbitrary program through the same session and performs
+no agent-specific configuration. It sets only the variables described below and
+does not remove or remap other credentials the program may prefer, so use the
+named launchers for Claude Code, Codex, and Pi. The session lasts exactly as
+long as the program.
+
+Within the launched process, `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` use the
+selected Agentbox profile. `AGENTBOX_PROXY_URL` and `AGENTBOX_PROXY_TOKEN` name
+the bridge and its session token directly, so a program can reach any route in
+the profile even when the profile environment provides no base URL for it. The
+bridge accepts the token as `Authorization: Bearer`, `Authorization: token`,
+HTTP Basic with the token as the password, or `X-Api-Key`. `OPENAI_API_KEY`
+and `GH_TOKEN` carry the same token, as does `ANTHROPIC_API_KEY` except under
+`host claude`, which removes it and supplies `ANTHROPIC_AUTH_TOKEN` instead.
+GitHub CLI API traffic uses the session's protected Unix socket. A temporary
+Git HTTPS transport helper sends only canonical
 `https://github.com/...` clone/fetch/push operations through `/github-git/`, so
 repository remotes remain unchanged; other Git HTTPS hosts are delegated to
 Git's normal helper. As in the container image, GitHub SSH remotes are not
@@ -247,10 +265,10 @@ rewritten. Direct `curl`, MCP-server, connector/app, web-search, SSH, and other
 unrecognized network traffic is outside this routing mechanism.
 
 The host user must belong to `agentbox`, have an explicit grant for the selected
-profile, and have the selected agent and `git` installed. The user API returns
-only assigned profile names and public launch environment—not routes, key names,
-or credential-source bindings. Use `--claude-bin`, `--codex-bin`, `--pi-bin`,
-or `--git-bin` when an executable is not on `PATH`.
+profile, and have the selected agent or program and `git` installed. The user
+API returns only assigned profile names and public launch environment—not
+routes, key names, or credential-source bindings. Use `--claude-bin`,
+`--codex-bin`, `--pi-bin`, or `--git-bin` when an executable is not on `PATH`.
 
 ## Generic routes
 

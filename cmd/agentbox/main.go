@@ -25,6 +25,8 @@ regular user:
   host claude --profile PROFILE run Claude Code on the host through Agentbox
   host codex --profile PROFILE  run Codex on the host through Agentbox
   host pi --profile PROFILE     run Pi on the host through Agentbox
+  host run --profile PROFILE [--] COMMAND [ARGS...]
+                                run any program on the host through Agentbox
 
 administrator (run with sudo):
   setup                         install agentboxd and its systemd unit
