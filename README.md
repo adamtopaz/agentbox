@@ -267,8 +267,8 @@ unrecognized network traffic is outside this routing mechanism.
 The host user must belong to `agentbox`, have an explicit grant for the selected
 profile, and have the selected agent or program and `git` installed. The user
 API returns only assigned profile names and public launch environment—not
-routes, key names, or credential-source bindings. Use `--claude-bin`, `--codex-bin`, `--pi-bin`,
-or `--git-bin` when an executable is not on `PATH`.
+routes, key names, or credential-source bindings. Use `--claude-bin`,
+`--codex-bin`, `--pi-bin`, or `--git-bin` when an executable is not on `PATH`.
 
 ## Generic routes
 
